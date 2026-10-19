@@ -42,10 +42,14 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 type Args struct {
-	// IPs are ip/prefix strings. Besides plain ips and CIDRs, *ray geoip
-	// expressions are supported: geoip:CODE (loads CODE from geoip.dat in the
-	// working directory), ext:FILE:CODE (loads CODE from FILE). ext-ip: is an
-	// alias of ext:.
+	// IPs are ip/prefix strings. Besides plain ips and CIDRs, *ray style
+	// expressions are supported: geoip:CODE (loads CODE from the first
+	// existing of geoip.dat, geoip.metadb, Country.mmdb, geoip.mmdb in the
+	// working directory; dat and maxmind formats are auto-detected),
+	// asn:AS_NUMBER (maxmind asn db, tried among ASN.mmdb, GeoLite2-ASN.mmdb,
+	// asn.mmdb; AS_NUMBER is digits with an optional "AS" prefix), and
+	// ext:FILE:CODE (auto-detects the format from the file content). ext-ip:
+	// is an alias of ext:.
 	IPs   []string `yaml:"ips"`
 	Sets  []string `yaml:"sets"`
 	Files []string `yaml:"files"`
@@ -64,14 +68,12 @@ func (d *IPSet) GetIPMatcher() netlist.Matcher {
 func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
 	p := &IPSet{}
 
-	l := netlist.NewList()
-	if err := LoadFromIPsAndFiles(args.IPs, args.Files, l); err != nil {
+	loader := NewListLoader()
+	if err := loader.LoadFromIPsAndFiles(args.IPs, args.Files); err != nil {
 		return nil, err
 	}
-	l.Sort()
-	if l.Len() > 0 {
-		p.mg = append(p.mg, l)
-	}
+	p.mg = append(p.mg, loader.Matchers()...)
+
 	for _, tag := range args.Sets {
 		provider, _ := bp.M().GetPlugin(tag).(data_provider.IPMatcherProvider)
 		if provider == nil {
@@ -93,53 +95,76 @@ func parseNetipPrefix(s string) (netip.Prefix, error) {
 	return addr.Prefix(addr.BitLen())
 }
 
-func LoadFromIPsAndFiles(ips []string, fs []string, l *netlist.List) error {
-	if err := LoadFromIPs(ips, l); err != nil {
-		return err
-	}
-	if err := LoadFromFiles(fs, l); err != nil {
-		return err
-	}
-	return nil
+// ListLoader loads plain ips and files into a private list, and geoip/asn
+// expressions into shared, cached matchers.
+type ListLoader struct {
+	own    *netlist.List
+	shared []netlist.Matcher
 }
 
-func LoadFromIPs(ips []string, l *netlist.List) error {
+func NewListLoader() *ListLoader {
+	return &ListLoader{own: netlist.NewList()}
+}
+
+func (l *ListLoader) LoadFromIPsAndFiles(ips []string, fs []string) error {
+	if err := l.LoadFromIPs(ips); err != nil {
+		return err
+	}
+	return l.LoadFromFiles(fs)
+}
+
+func (l *ListLoader) LoadFromIPs(ips []string) error {
 	for i, s := range ips {
-		if err := loadIP(s, l); err != nil {
+		if err := l.loadIP(s); err != nil {
 			return fmt.Errorf("invalid ip #%d %s, %w", i, s, err)
 		}
 	}
 	return nil
 }
 
-// loadIP appends s to l. s can either be a plain ip/prefix, or an *ray style
-// geoip expression referring to an entry in a geoip dat file, i.e. geoip:CODE,
-// ext:FILE:CODE, ext-ip: (see geodata.ParseIPExp). geoip.dat is looked up in
-// the working directory unless the ext syntax gives a path.
-func loadIP(s string, l *netlist.List) error {
-	file, code, ok, err := geodata.ParseIPExp(s)
+// loadIP appends s. s can either be a plain ip/prefix, or an ip expression
+// referring to a geoip entry or an as number (see geodata.ParseIPExp),
+// which is loaded as a shared matcher.
+func (l *ListLoader) loadIP(s string) error {
+	file, kind, code, ok, err := geodata.ParseIPExp(s)
 	if err != nil {
 		return err
 	}
 	if ok {
-		prefixes, err := geodata.LoadIP(file, code)
+		var m netlist.Matcher
+		if kind == geodata.IPExpASN {
+			m, err = geodata.GetASNMatcher(file, code)
+		} else {
+			m, err = geodata.GetGeoIPMatcher(file, code)
+		}
 		if err != nil {
 			return err
 		}
-		l.Append(prefixes...)
+		if !containsMatcher(l.shared, m) {
+			l.shared = append(l.shared, m)
+		}
 		return nil
 	}
 	p, err := parseNetipPrefix(s)
 	if err != nil {
 		return err
 	}
-	l.Append(p)
+	l.own.Append(p)
 	return nil
 }
 
-func LoadFromFiles(fs []string, l *netlist.List) error {
+func containsMatcher(ms []netlist.Matcher, m netlist.Matcher) bool {
+	for _, e := range ms {
+		if e == m {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *ListLoader) LoadFromFiles(fs []string) error {
 	for i, f := range fs {
-		if err := LoadFromFile(f, l); err != nil {
+		if err := LoadFromFile(f, l.own); err != nil {
 			return fmt.Errorf("failed to load file #%d %s, %w", i, f, err)
 		}
 	}
@@ -157,6 +182,17 @@ func LoadFromFile(f string, l *netlist.List) error {
 		}
 	}
 	return nil
+}
+
+// Matchers returns the loaded matchers, shared geoip/asn matchers first.
+func (l *ListLoader) Matchers() []netlist.Matcher {
+	l.own.Sort()
+	var ms []netlist.Matcher
+	ms = append(ms, l.shared...)
+	if l.own.Len() > 0 {
+		ms = append(ms, l.own)
+	}
+	return ms
 }
 
 type MatcherGroup []netlist.Matcher

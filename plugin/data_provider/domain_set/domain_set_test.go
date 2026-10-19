@@ -25,7 +25,6 @@ import (
 	"testing"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
-	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -53,6 +52,16 @@ func appendSiteEntry(b []byte, code string, domains []byte) []byte {
 	return protowire.AppendBytes(b, e)
 }
 
+// loadExps loads exps and returns a matcher matching them.
+func loadExps(t *testing.T, exps []string) MatcherGroup {
+	t.Helper()
+	loader := NewMixLoader()
+	if err := loader.LoadExpsAndFiles(exps, nil); err != nil {
+		t.Fatal(err)
+	}
+	return MatcherGroup(loader.Matchers())
+}
+
 func TestLoadExpsGeosite(t *testing.T) {
 	var cn, ads []byte
 	cn = appendDomain(cn, geodata.TypeFull, "example.com")
@@ -70,15 +79,11 @@ func TestLoadExpsGeosite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := domain.NewDomainMixMatcher()
-	exps := []string{
+	mg := loadExps(t, []string{
 		"ext:" + datPath + ":cn", // the code is compared case-insensitively
 		"ext:" + datPath + ":ads@cn",
 		"full:mixed.example",
-	}
-	if err := LoadExpsAndFiles(exps, nil, m); err != nil {
-		t.Fatal(err)
-	}
+	})
 
 	tests := []struct {
 		qname string
@@ -102,7 +107,7 @@ func TestLoadExpsGeosite(t *testing.T) {
 		{"www.mixed.example", false},
 	}
 	for _, tt := range tests {
-		if _, got := m.Match(tt.qname); got != tt.want {
+		if _, got := mg.Match(tt.qname); got != tt.want {
 			t.Errorf("Match(%s) = %v, want %v", tt.qname, got, tt.want)
 		}
 	}
@@ -118,14 +123,46 @@ func TestLoadExpsGeositeWithoutAttrFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := domain.NewDomainMixMatcher()
-	if err := LoadExpsAndFiles([]string{"ext:" + datPath + ":ads"}, nil, m); err != nil {
-		t.Fatal(err)
-	}
+	mg := loadExps(t, []string{"ext:" + datPath + ":ads"})
 	for _, qname := range []string{"with-attr.com", "without-attr.com"} {
-		if _, ok := m.Match(qname); !ok {
+		if _, ok := mg.Match(qname); !ok {
 			t.Errorf("Match(%s) = false, want true", qname)
 		}
+	}
+}
+
+// TestLoadExpsGeositeSharedMatcher verifies that duplicate geosite
+// expressions reuse one shared matcher instance.
+func TestLoadExpsGeositeSharedMatcher(t *testing.T) {
+	var cn []byte
+	cn = appendDomain(cn, geodata.TypeDomain, "qq.com")
+	list := appendSiteEntry(nil, "CN", cn)
+	datPath := filepath.Join(t.TempDir(), "geosite.dat")
+	if err := os.WriteFile(datPath, list, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := NewMixLoader()
+	if err := loader.LoadExpsAndFiles([]string{
+		"ext:" + datPath + ":cn",
+		"ext:" + datPath + ":CN", // same entry, different case
+		"ext:" + datPath + ":cn", // duplicate
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ms := loader.Matchers()
+	if len(ms) != 1 {
+		t.Fatalf("got %d matchers, want 1 shared", len(ms))
+	}
+
+	// Another loader for the same entry gets the same instance.
+	loader2 := NewMixLoader()
+	if err := loader2.LoadExpsAndFiles([]string{"ext:" + datPath + ":cn"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ms2 := loader2.Matchers()
+	if len(ms2) != 1 || ms2[0] != ms[0] {
+		t.Fatal("expected the same shared matcher instance")
 	}
 }
 
@@ -141,8 +178,8 @@ func TestLoadExpsGeositeErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := domain.NewDomainMixMatcher()
-			if err := LoadExpsAndFiles([]string{tt.exp}, nil, m); err == nil {
+			loader := NewMixLoader()
+			if err := loader.LoadExpsAndFiles([]string{tt.exp}, nil); err == nil {
 				t.Fatal("expected error")
 			}
 		})

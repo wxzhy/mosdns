@@ -384,7 +384,7 @@ func TestParseIPExp(t *testing.T) {
 		ok   bool
 		err  bool
 	}{
-		{name: "geoip", s: "geoip:cn", file: "geoip.dat", code: "cn", ok: true},
+		{name: "geoip", s: "geoip:cn", code: "cn", ok: true},
 		{name: "ext", s: "ext:geoip.dat:telegram", file: "geoip.dat", code: "telegram", ok: true},
 		{name: "ext-ip", s: "ext-ip:a.dat:t", file: "a.dat", code: "t", ok: true},
 		{name: "windows path", s: `ext:C:\rule\geoip.dat:cn`, file: `C:\rule\geoip.dat`, code: "cn", ok: true},
@@ -402,7 +402,7 @@ func TestParseIPExp(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			file, code, ok, err := ParseIPExp(tt.s)
+			file, _, code, ok, err := ParseIPExp(tt.s)
 			if tt.err {
 				if ok != true || err == nil {
 					t.Fatalf("expected error, got ok=%v err=%v", ok, err)

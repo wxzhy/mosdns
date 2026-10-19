@@ -25,8 +25,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
-
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -39,12 +37,26 @@ func appendCIDR(b []byte, ip []byte, prefix uint64) []byte {
 	return protowire.AppendBytes(b, c)
 }
 
-func appendIPEntry(b []byte, code string, cidrs []byte) []byte {
+func appendIPEntry(b []byte, code string, cidrs []byte, reverseMatch bool) []byte {
 	e := protowire.AppendTag(nil, 1, protowire.BytesType)
 	e = protowire.AppendString(e, code)
 	e = append(e, cidrs...)
+	if reverseMatch {
+		e = protowire.AppendTag(e, 3, protowire.VarintType)
+		e = protowire.AppendVarint(e, 1)
+	}
 	b = protowire.AppendTag(b, 1, protowire.BytesType)
 	return protowire.AppendBytes(b, e)
+}
+
+// loadIPs loads ips and returns a matcher matching them.
+func loadIPs(t *testing.T, ips []string) MatcherGroup {
+	t.Helper()
+	loader := NewListLoader()
+	if err := loader.LoadFromIPsAndFiles(ips, nil); err != nil {
+		t.Fatal(err)
+	}
+	return MatcherGroup(loader.Matchers())
 }
 
 func TestLoadFromIPsGeoip(t *testing.T) {
@@ -54,22 +66,17 @@ func TestLoadFromIPsGeoip(t *testing.T) {
 	other = appendCIDR(other, []byte{9, 9, 9, 9}, 32)
 
 	var list []byte
-	list = appendIPEntry(list, "CN", cn)
-	list = appendIPEntry(list, "OTHER", other)
+	list = appendIPEntry(list, "CN", cn, false)
+	list = appendIPEntry(list, "OTHER", other, false)
 	datPath := filepath.Join(t.TempDir(), "geoip.dat")
 	if err := os.WriteFile(datPath, list, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	l := netlist.NewList()
-	ips := []string{
+	mg := loadIPs(t, []string{
 		"ext:" + datPath + ":cn", // the code is compared case-insensitively
 		"1.1.1.1",                // plain ip mixed with geoip exps
-	}
-	if err := LoadFromIPsAndFiles(ips, nil, l); err != nil {
-		t.Fatal(err)
-	}
-	l.Sort()
+	})
 
 	tests := []struct {
 		ip   string
@@ -85,9 +92,44 @@ func TestLoadFromIPsGeoip(t *testing.T) {
 		{"1.1.1.2", false},
 	}
 	for _, tt := range tests {
-		if got := l.Match(netip.MustParseAddr(tt.ip)); got != tt.want {
+		if got := mg.Match(netip.MustParseAddr(tt.ip)); got != tt.want {
 			t.Errorf("Match(%s) = %v, want %v", tt.ip, got, tt.want)
 		}
+	}
+}
+
+// TestLoadFromIPsGeoipSharedMatcher verifies that duplicate geoip
+// expressions reuse one shared matcher instance.
+func TestLoadFromIPsGeoipSharedMatcher(t *testing.T) {
+	var cn []byte
+	cn = appendCIDR(cn, []byte{1, 2, 3, 0}, 24)
+	list := appendIPEntry(nil, "CN", cn, false)
+	datPath := filepath.Join(t.TempDir(), "geoip.dat")
+	if err := os.WriteFile(datPath, list, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := NewListLoader()
+	if err := loader.LoadFromIPsAndFiles([]string{
+		"ext:" + datPath + ":cn",
+		"ext:" + datPath + ":CN", // same entry, different case
+		"ext:" + datPath + ":cn", // duplicate
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ms := loader.Matchers()
+	if len(ms) != 1 {
+		t.Fatalf("got %d matchers, want 1 shared", len(ms))
+	}
+
+	// Another loader for the same entry gets the same instance.
+	loader2 := NewListLoader()
+	if err := loader2.LoadFromIPsAndFiles([]string{"ext:" + datPath + ":cn"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ms2 := loader2.Matchers()
+	if len(ms2) != 1 || ms2[0] != ms[0] {
+		t.Fatal("expected the same shared matcher instance")
 	}
 }
 
@@ -100,11 +142,14 @@ func TestLoadFromIPsGeoipErrors(t *testing.T) {
 		{"code not found", "ext:" + writeEmptyDat(t) + ":no-such-code"},
 		{"reverse match", "!geoip:cn"},
 		{"reverse match in code", "geoip:!cn"},
+		{"invalid asn", "asn:google"},
+		{"no default asn db", "asn:13335"}, // no ASN.mmdb in the test working dir
+		{"no default geoip db", "geoip:cn"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			l := netlist.NewList()
-			if err := LoadFromIPsAndFiles([]string{tt.ip}, nil, l); err == nil {
+			loader := NewListLoader()
+			if err := loader.LoadFromIPsAndFiles([]string{tt.ip}, nil); err == nil {
 				t.Fatal("expected error")
 			}
 		})
@@ -114,7 +159,7 @@ func TestLoadFromIPsGeoipErrors(t *testing.T) {
 func writeEmptyDat(t *testing.T) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "empty.dat")
-	if err := os.WriteFile(p, appendIPEntry(nil, "CN", nil), 0644); err != nil {
+	if err := os.WriteFile(p, appendIPEntry(nil, "CN", nil, false), 0644); err != nil {
 		t.Fatal(err)
 	}
 	return p

@@ -67,13 +67,11 @@ func NewMatcher(bq sequence.BQ, args *Args, f MatchFunc) (m *Matcher, err error)
 
 	// Anonymous set from plugin's args and files.
 	if len(args.Exps)+len(args.Files) > 0 {
-		anonymousSet := domain.NewDomainMixMatcher()
-		if err := domain_set.LoadExpsAndFiles(args.Exps, args.Files, anonymousSet); err != nil {
+		loader := domain_set.NewMixLoader()
+		if err := loader.LoadExpsAndFiles(args.Exps, args.Files); err != nil {
 			return nil, err
 		}
-		if anonymousSet.Len() > 0 {
-			m.mg = append(m.mg, anonymousSet)
-		}
+		m.mg = append(m.mg, loader.Matchers()...)
 	}
 
 	return m, nil

@@ -21,12 +21,26 @@ package geodata
 
 import (
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 )
 
 const (
 	DefaultGeoSiteDat = "geosite.dat"
 	DefaultGeoIPDat   = "geoip.dat"
+)
+
+// IPExpKind indicates what an ip expression refers to.
+type IPExpKind int
+
+const (
+	// IPExpGeoIP refers to a geoip entry, in either a dat or a maxmind
+	// database file.
+	IPExpGeoIP IPExpKind = iota
+	// IPExpASN refers to an autonomous system number in a maxmind asn
+	// database.
+	IPExpASN
 )
 
 // ParseDomainExp parses an *ray style domain expression that refers to a
@@ -81,44 +95,75 @@ func ParseDomainExp(s string) (file, code string, attrs []string, ok bool, err e
 	return file, code, attrs, true, nil
 }
 
-// ParseIPExp parses an *ray style ip expression that refers to a geoip entry
-// in a dat file:
+// ParseIPExp parses an ip expression that refers to a geoip entry or an
+// autonomous system number:
 //
-//	geoip:CODE
-//	ext:FILE:CODE    (ext-ip: is an alias of ext:)
+//	geoip:CODE                     (dat or maxmind db, resolved among the
+//	                                 default geoip file candidates)
+//	asn:AS_NUMBER                  (maxmind asn db, resolved among the
+//	                                 default asn file candidates)
+//	ext:FILE:CODE                  (dat or maxmind db, auto-detected by the
+//	                                 file content; for an asn database CODE
+//	                                 must be an as number)
+//	ext-ip:FILE:CODE               (alias of ext:)
 //
-// If s is such an expression, ok is true and file/code describe the entry.
-// Otherwise ok is false and s should be treated as a plain ip expression.
+// If s is such an expression, ok is true and file/kind/code describe it.
+// file is empty for the default-file shortcuts (geoip:, asn:) and non-empty
+// for the ext syntax. AS_NUMBER is digits with an optional "AS" prefix, e.g.
+// 13335 or AS13335. Otherwise ok is false and s should be treated as a plain
+// ip expression.
 //
 // The separator between FILE and CODE is the last ':' of the expression, so
 // that file paths containing ':' (e.g. windows absolute paths) are accepted.
-func ParseIPExp(s string) (file, code string, ok bool, err error) {
+func ParseIPExp(s string) (file string, kind IPExpKind, code string, ok bool, err error) {
 	if strings.HasPrefix(s, "!") {
-		return "", "", true, errors.New(`reverse match prefix "!" is not supported`)
+		return "", 0, "", true, errors.New(`reverse match prefix "!" is not supported`)
 	}
 	var rest string
 	switch {
 	case strings.HasPrefix(s, "geoip:"):
-		rest = DefaultGeoIPDat + ":" + s[len("geoip:"):]
+		kind, rest = IPExpGeoIP, s[len("geoip:"):]
+	case strings.HasPrefix(s, "asn:"):
+		kind, rest = IPExpASN, s[len("asn:"):]
 	case strings.HasPrefix(s, "ext:"), strings.HasPrefix(s, "ext-ip:"):
+		kind = IPExpGeoIP
 		rest = s[strings.Index(s, ":")+1:]
+		i := strings.LastIndex(rest, ":")
+		if i < 0 {
+			return "", 0, "", true, errors.New("missing code, expect ext:\"file\":\"code\"")
+		}
+		file, rest = rest[:i], rest[i+1:]
+		if file == "" {
+			return "", 0, "", true, errors.New("empty file")
+		}
 	default:
-		return "", "", false, nil
+		return "", 0, "", false, nil
 	}
 
-	i := strings.LastIndex(rest, ":")
-	if i < 0 {
-		return "", "", true, errors.New("missing code, expect ext:\"file\":\"code\"")
-	}
-	file, code = rest[:i], rest[i+1:]
-	if file == "" {
-		return "", "", true, errors.New("empty file")
-	}
+	code = rest
 	if code == "" {
-		return "", "", true, errors.New("empty code")
+		return "", 0, "", true, errors.New("empty code")
 	}
 	if strings.HasPrefix(code, "!") {
-		return "", "", true, errors.New(`reverse match prefix "!" is not supported`)
+		return "", 0, "", true, errors.New(`reverse match prefix "!" is not supported`)
 	}
-	return file, code, true, nil
+	if kind == IPExpASN {
+		if _, perr := parseASNCode(code); perr != nil {
+			return "", 0, "", true, fmt.Errorf("invalid asn %q, expect an as number like 13335", code)
+		}
+	}
+	return file, kind, code, true, nil
+}
+
+// parseASNCode parses an as number with an optional "AS" prefix.
+func parseASNCode(code string) (uint32, error) {
+	c := code
+	if len(c) > 2 && strings.EqualFold(c[:2], "as") {
+		c = c[2:]
+	}
+	n, err := strconv.ParseUint(c, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid as number %q", code)
+	}
+	return uint32(n), nil
 }
