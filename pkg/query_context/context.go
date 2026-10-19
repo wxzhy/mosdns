@@ -30,7 +30,10 @@ import (
 )
 
 const (
-	edns0Size = 1200
+	// 1232 is the consensus value from DNS Flag Day 2020: the largest UDP
+	// payload that avoids IP fragmentation on common networks (1500 MTU minus
+	// IPv6 min headers). Same as Unbound/BIND/dnsproxy.
+	edns0Size = 1232
 )
 
 // Context is a query context that pass through plugins.

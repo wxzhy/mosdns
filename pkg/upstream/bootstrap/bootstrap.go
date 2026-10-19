@@ -153,7 +153,7 @@ func (sp *Bootstrap) updateAddr(ctx context.Context) (netip.Addr, uint32, error)
 }
 
 func (sp *Bootstrap) resolve(ctx context.Context, qt uint16) (netip.Addr, uint32, error) {
-	const edns0UdpSize = 1200
+	const edns0UdpSize = 1232
 
 	q := new(dns.Msg)
 	q.SetQuestion(sp.fqdn, qt)
