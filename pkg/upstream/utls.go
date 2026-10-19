@@ -220,7 +220,7 @@ var invalidECHConfigList = []byte{1, 1, 4, 5, 1, 4}
 //     dns_server (any mosdns upstream address, e.g.
 //     "example.com+https://1.1.1.1/dns-query"), and its ech param is
 //     used as the ECHConfigList. The result is cached respecting the
-//     record's TTL.
+//     record's TTL, with a minimum of 5 minutes.
 type echConfigResolver struct {
 	// static is the decoded base64 ECHConfigList. nil if s is the
 	// "domain+dns_server" query format.
@@ -238,7 +238,9 @@ type echConfigResolver struct {
 	nextRefresh time.Time
 }
 
-const echConfigCacheTTL = time.Minute * 5
+// minECHConfigTTL is the minimum cache duration for a queried
+// ECHConfigList, to avoid refreshing short TTL records too frequently.
+const minECHConfigTTL = time.Minute * 5
 
 func newECHConfigResolver(s string, logger *zap.Logger) (*echConfigResolver, error) {
 	if logger == nil {
@@ -272,7 +274,7 @@ func (r *echConfigResolver) getConfigList(ctx context.Context) []byte {
 	if time.Now().Before(r.nextRefresh) && r.config != nil {
 		return r.config
 	}
-	config, err := r.query(ctx)
+	config, ttl, err := r.query(ctx)
 	if err != nil {
 		r.logger.Warn("failed to query ech config list", zap.Error(err))
 		// Keep serving the stale config if we have one.
@@ -282,44 +284,51 @@ func (r *echConfigResolver) getConfigList(ctx context.Context) []byte {
 		return r.config
 	}
 	r.config = config
-	r.nextRefresh = time.Now().Add(echConfigCacheTTL)
+	refresh := time.Duration(ttl) * time.Second
+	if refresh < minECHConfigTTL {
+		refresh = minECHConfigTTL
+	}
+	r.nextRefresh = time.Now().Add(refresh)
 	return r.config
 }
 
 // query queries the HTTPS record of r.domain from r.dnsServer.
+// It returns the ech param of the record and the record's TTL.
 // It must be called with r.mu locked.
-func (r *echConfigResolver) query(ctx context.Context) ([]byte, error) {
+func (r *echConfigResolver) query(ctx context.Context) ([]byte, uint32, error) {
 	if r.u == nil {
 		u, err := NewUpstream(r.dnsServer, Opt{Logger: r.logger})
 		if err != nil {
-			return nil, fmt.Errorf("failed to init ech dns upstream, %w", err)
+			return nil, 0, fmt.Errorf("failed to init ech dns upstream, %w", err)
 		}
 		r.u = u
 	}
 
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(r.domain), dns.TypeHTTPS)
+	// HTTPS records with ech params are often larger than 512 bytes.
+	m.SetEdns0(4096, false)
 	payload, err := m.Pack()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	respPayload, err := r.u.ExchangeContext(ctx, payload)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query https record, %w", err)
+		return nil, 0, fmt.Errorf("failed to query https record, %w", err)
 	}
 	resp := new(dns.Msg)
 	if err := resp.Unpack(*respPayload); err != nil {
-		return nil, fmt.Errorf("failed to unpack https record resp, %w", err)
+		return nil, 0, fmt.Errorf("failed to unpack https record resp, %w", err)
 	}
 
 	for _, answer := range resp.Answer {
 		if https, ok := answer.(*dns.HTTPS); ok && https.Hdr.Name == dns.Fqdn(r.domain) {
 			for _, v := range https.Value {
 				if ech, ok := v.(*dns.SVCBECHConfig); ok {
-					return ech.ECH, nil
+					return ech.ECH, https.Hdr.Ttl, nil
 				}
 			}
 		}
 	}
-	return nil, fmt.Errorf("no ech config found in https record of [%s]", r.domain)
+	return nil, 0, fmt.Errorf("no ech config found in https record of [%s]", r.domain)
 }

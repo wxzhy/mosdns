@@ -20,6 +20,8 @@
 package upstream
 
 import (
+	"bytes"
+	"context"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -433,6 +435,7 @@ func Test_DoH_ech(t *testing.T) {
 // echDNSHandler answers HTTPS queries with an ech config.
 type echDNSHandler struct {
 	echConfigList []byte
+	ttl           uint32
 }
 
 func (h echDNSHandler) ServeDNS(w dns.ResponseWriter, q *dns.Msg) {
@@ -444,7 +447,7 @@ func (h echDNSHandler) ServeDNS(w dns.ResponseWriter, q *dns.Msg) {
 			Name:   q.Question[0].Name,
 			Rrtype: dns.TypeHTTPS,
 			Class:  dns.ClassINET,
-			Ttl:    300,
+			Ttl:    h.ttl,
 		}
 		https.Priority = 1
 		https.Target = "."
@@ -465,7 +468,7 @@ func Test_DoT_ech_dns_query(t *testing.T) {
 	defer shutdownDoT()
 
 	// The dns server that serves the ech config list.
-	dnsAddr, shutdownDNS := newUDPTestServer(t, echDNSHandler{echConfigList: echConfigList})
+	dnsAddr, shutdownDNS := newUDPTestServer(t, echDNSHandler{echConfigList: echConfigList, ttl: 60})
 	defer shutdownDNS()
 
 	// The ech config is queried from the dns server at handshake time.
@@ -481,6 +484,33 @@ func Test_DoT_ech_dns_query(t *testing.T) {
 	}
 	if err := testUpstream(u); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func Test_echConfigResolver_queryTTL(t *testing.T) {
+	echConfigList, _, _, err := generateECHConfig("cloudflare-ech.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dnsAddr, shutdownDNS := newUDPTestServer(t, echDNSHandler{echConfigList: echConfigList, ttl: 60})
+	defer shutdownDNS()
+
+	r, err := newECHConfigResolver("test.example.com+udp://"+dnsAddr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	got, ttl, err := r.query(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, echConfigList) {
+		t.Fatal("queried ech config list mismatch")
+	}
+	if ttl != 60 {
+		t.Fatalf("unexpected record ttl %d, want 60", ttl)
 	}
 }
 
