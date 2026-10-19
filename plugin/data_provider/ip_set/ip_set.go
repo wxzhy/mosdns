@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"net/netip"
@@ -41,6 +42,10 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 type Args struct {
+	// IPs are ip/prefix strings. Besides plain ips and CIDRs, *ray geoip
+	// expressions are supported: geoip:CODE (loads CODE from geoip.dat in the
+	// working directory), ext:FILE:CODE (loads CODE from FILE). ext-ip: is an
+	// alias of ext:.
 	IPs   []string `yaml:"ips"`
 	Sets  []string `yaml:"sets"`
 	Files []string `yaml:"files"`
@@ -100,12 +105,35 @@ func LoadFromIPsAndFiles(ips []string, fs []string, l *netlist.List) error {
 
 func LoadFromIPs(ips []string, l *netlist.List) error {
 	for i, s := range ips {
-		p, err := parseNetipPrefix(s)
-		if err != nil {
+		if err := loadIP(s, l); err != nil {
 			return fmt.Errorf("invalid ip #%d %s, %w", i, s, err)
 		}
-		l.Append(p)
 	}
+	return nil
+}
+
+// loadIP appends s to l. s can either be a plain ip/prefix, or an *ray style
+// geoip expression referring to an entry in a geoip dat file, i.e. geoip:CODE,
+// ext:FILE:CODE, ext-ip: (see geodata.ParseIPExp). geoip.dat is looked up in
+// the working directory unless the ext syntax gives a path.
+func loadIP(s string, l *netlist.List) error {
+	file, code, ok, err := geodata.ParseIPExp(s)
+	if err != nil {
+		return err
+	}
+	if ok {
+		prefixes, err := geodata.LoadIP(file, code)
+		if err != nil {
+			return err
+		}
+		l.Append(prefixes...)
+		return nil
+	}
+	p, err := parseNetipPrefix(s)
+	if err != nil {
+		return err
+	}
+	l.Append(p)
 	return nil
 }
 

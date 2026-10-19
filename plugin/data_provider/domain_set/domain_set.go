@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"os"
@@ -43,6 +44,11 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 type Args struct {
+	// Exps are domain expressions. Besides the plain "type:pattern" syntax,
+	// *ray geosite expressions are supported: geosite:CODE (loads CODE from
+	// geosite.dat in the working directory), ext:FILE:CODE[@attr...] (loads
+	// CODE from FILE, attrs have AND semantics). ext-domain: and ext-site:
+	// are aliases of ext:.
 	Exps  []string `yaml:"exps"`
 	Sets  []string `yaml:"sets"`
 	Files []string `yaml:"files"`
@@ -93,11 +99,50 @@ func LoadExpsAndFiles(exps []string, fs []string, m *domain.MixMatcher[struct{}]
 
 func LoadExps(exps []string, m *domain.MixMatcher[struct{}]) error {
 	for i, exp := range exps {
-		if err := m.Add(exp, struct{}{}); err != nil {
+		if err := loadExp(exp, m); err != nil {
 			return fmt.Errorf("failed to load expression #%d %s, %w", i, exp, err)
 		}
 	}
 	return nil
+}
+
+// loadExp adds exp to m. exp can either be a plain domain expression accepted
+// by domain.MixMatcher, or an *ray style geosite expression referring to an
+// entry in a geosite dat file, i.e. geosite:CODE, ext:FILE:CODE[@attr...],
+// ext-domain: and ext-site: (see geodata.ParseDomainExp). geosite.dat is
+// looked up in the working directory unless the ext syntax gives a path.
+func loadExp(exp string, m *domain.MixMatcher[struct{}]) error {
+	file, code, attrs, ok, err := geodata.ParseDomainExp(exp)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return geodata.LoadSite(file, code, attrs, func(t geodata.DomainType, value string) error {
+			typ, err := matcherTypePrefix(t)
+			if err != nil {
+				return err
+			}
+			return m.Add(typ+":"+value, struct{}{})
+		})
+	}
+	return m.Add(exp, struct{}{})
+}
+
+// matcherTypePrefix maps a geosite domain rule type to the domain.MixMatcher
+// type prefix of the matcher with the same semantics.
+func matcherTypePrefix(t geodata.DomainType) (string, error) {
+	switch t {
+	case geodata.TypeFull:
+		return domain.MatcherFull, nil
+	case geodata.TypeDomain:
+		return domain.MatcherDomain, nil
+	case geodata.TypeRegex:
+		return domain.MatcherRegexp, nil
+	case geodata.TypeSubstr:
+		return domain.MatcherKeyword, nil
+	default:
+		return "", fmt.Errorf("unknown geodata domain type %d", t)
+	}
 }
 
 func LoadFiles(fs []string, m *domain.MixMatcher[struct{}]) error {
