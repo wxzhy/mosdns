@@ -42,10 +42,12 @@ var _ DnsConn = (*TraditionalDnsConn)(nil)
 // TraditionalDnsConn is a low-level connection for traditional dns protocol, where
 // dns frames transport in a single and simple connection. (e.g. udp, tcp, tls)
 type TraditionalDnsConn struct {
-	c           NetConn
-	isTcp       bool
-	idleTimeout time.Duration
-	maxCq       int
+	c               NetConn
+	isTcp           bool
+	idleTimeout     time.Duration
+	maxCq           int
+	repeat          int
+	dropSpoofedResp bool
 
 	closeOnce   sync.Once
 	closeNotify chan struct{}
@@ -75,14 +77,33 @@ type TraditionalDnsConnOpts struct {
 	// MaxConcurrentQuery limits the number of maximum concurrent queries
 	// in the connection. Default is defaultTdcMaxConcurrentQuery.
 	MaxConcurrentQuery int
+
+	// Repeat is the number of additional copies sent for each written
+	// query, to improve the reliability against packet loss.
+	// Only meaningful for udp connection. Default 0 (send once).
+	// (smartdns's "repeat" option)
+	Repeat int
+
+	// DropSpoofedResp, if true, drops udp responses that fail a simple
+	// spoofing heuristic: The response must be longer than 32 bytes and
+	// contain exactly one additional record, i.e. the EDNS0 OPT record
+	// echoed from the query. (smartdns's "use_tricks" udp trick)
+	// Note: Queries must carry EDNS0, otherwise all valid responses
+	// are dropped.
+	DropSpoofedResp bool
 }
 
 func NewDnsConn(opt TraditionalDnsConnOpts, conn NetConn) *TraditionalDnsConn {
 	dc := &TraditionalDnsConn{
-		c:           conn,
-		isTcp:       opt.WithLengthHeader,
-		closeNotify: make(chan struct{}),
-		queue:       make(map[uint32]chan *[]byte),
+		c:               conn,
+		isTcp:           opt.WithLengthHeader,
+		repeat:          opt.Repeat,
+		dropSpoofedResp: opt.DropSpoofedResp,
+		closeNotify:     make(chan struct{}),
+		queue:           make(map[uint32]chan *[]byte),
+	}
+	if dc.repeat < 0 {
+		dc.repeat = 0
 	}
 	setDefaultGZ(&dc.idleTimeout, opt.IdleTimeout, defaultIdleTimeout)
 	setDefaultGZ(&dc.maxCq, opt.MaxConcurrentQuery, defaultTdcMaxConcurrentQuery)
@@ -164,6 +185,16 @@ func (dc *TraditionalDnsConn) writeQuery(q []byte, assignedQid uint16) error {
 		payload = copyMsg(q)
 		binary.BigEndian.PutUint16(*payload, assignedQid)
 	}
+
+	// Send additional copies to improve the reliability against packet loss.
+	// Only for udp.
+	for i := 0; i < dc.repeat; i++ {
+		if _, err := dc.c.Write(*payload); err != nil {
+			pool.ReleaseBuf(payload)
+			return err
+		}
+	}
+
 	_, err := dc.c.Write(*payload)
 	pool.ReleaseBuf(payload)
 	return err
@@ -188,6 +219,13 @@ func (dc *TraditionalDnsConn) readLoop() {
 		}
 		dc.waitingResp.Store(false)
 
+		// Drop responses that fail the spoofing heuristic. (smartdns's
+		// "use_tricks" udp trick)
+		if dc.dropSpoofedResp && !dc.isTcp && likelySpoofedUdpResp(*r) {
+			pool.ReleaseBuf(r)
+			continue
+		}
+
 		rid := binary.BigEndian.Uint16(*r)
 		resChan := dc.getQueueC(rid)
 		if resChan != nil {
@@ -200,6 +238,14 @@ func (dc *TraditionalDnsConn) readLoop() {
 			pool.ReleaseBuf(r)
 		}
 	}
+}
+
+// likelySpoofedUdpResp reports whether the udp response fails a simple
+// spoofing heuristic. A valid response (of a query with EDNS0) is longer
+// than 32 bytes and has exactly one additional record (the OPT record).
+// b must be at least dnsHeaderLen bytes long.
+func likelySpoofedUdpResp(b []byte) bool {
+	return len(b) <= 32 || binary.BigEndian.Uint16(b[10:12]) != 1
 }
 
 func (dc *TraditionalDnsConn) IsClosed() bool {

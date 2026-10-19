@@ -84,6 +84,18 @@ type UpstreamConfig struct {
 	Fingerprint          string   `yaml:"fingerprint"`              // uTLS client fingerprint. e.g. "chrome". Names follow xray-core.
 	ECHConfigList        string   `yaml:"ech_config_list"`          // base64 ECHConfigList, or "domain+dns_server" to query the HTTPS record of domain from dns_server.
 
+	// Repeat is the number of additional copies sent for each udp query.
+	// Only available for udp upstream. (smartdns's "repeat" option)
+	Repeat int `yaml:"repeat"`
+
+	// UseTricks enables protocol specific best-effort tricks.
+	// Only available for udp and tcp upstream. (smartdns's "use_tricks" option)
+	//   - udp: responses that fail a simple spoofing heuristic are dropped.
+	//     Queries must carry EDNS0, otherwise all valid responses are dropped.
+	//   - tcp: the first 16 bytes of each dns frame are sent as TCP
+	//     out-of-band data.
+	UseTricks bool `yaml:"use_tricks"`
+
 	Socks5       string `yaml:"socks5"`
 	SoMark       int    `yaml:"so_mark"`
 	BindToDevice string `yaml:"bind_to_device"`
@@ -168,6 +180,8 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 			UTLSFingerprint:      c.Fingerprint,
 			ECHConfigList:        c.ECHConfigList,
 			VerifyPeerCertByName: parseCertNames(c.VerifyPeerCertByName),
+			Repeat:               c.Repeat,
+			UseTricks:            c.UseTricks,
 			Logger:               opt.Logger,
 			EventObserver:        uw,
 		}

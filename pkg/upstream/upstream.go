@@ -103,6 +103,25 @@ type Opt struct {
 	// Note: There is no fallback. Make sure the server supports it.
 	EnableHTTP3 bool
 
+	// Repeat is the number of additional copies sent for each udp query,
+	// to improve the reliability against packet loss. Default 0 (send once).
+	// Only available for udp upstream. (smartdns's "repeat" option)
+	// Note: The mosdns udp transport also resends the query every second
+	// while waiting for the reply. Every resend sends Repeat+1 copies.
+	Repeat int
+
+	// UseTricks enables protocol specific best-effort tricks.
+	// (smartdns's "use_tricks" option)
+	//   - udp upstream: Responses that fail a simple spoofing heuristic
+	//     are dropped: They must be longer than 32 bytes and contain
+	//     exactly one additional record, i.e. the EDNS0 OPT record echoed
+	//     from the query. Note: Queries must carry EDNS0, otherwise all
+	//     valid responses are dropped.
+	//   - tcp upstream: The first 16 bytes of each dns frame are sent as
+	//     TCP out-of-band data, so that middleboxes that don't process
+	//     urgent data can't reassemble the dns query.
+	UseTricks bool
+
 	// Bootstrap specifies a plain dns server to solve the
 	// upstream server domain address.
 	// It must be an IP address. Port is optional.
@@ -353,6 +372,8 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 				WithLengthHeader:   false,
 				IdleTimeout:        time.Minute * 5,
 				MaxConcurrentQuery: maxConcurrentQueryPreConn,
+				Repeat:             opt.Repeat,
+				DropSpoofedResp:    opt.UseTricks,
 			}
 			return transport.NewDnsConn(to, wrapConn(c, opt.EventObserver)), nil
 		}
@@ -387,6 +408,9 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			c, err := tcpDialer(ctx)
 			if err != nil {
 				return nil, err
+			}
+			if opt.UseTricks {
+				c = transport.NewTcpTrickConn(c)
 			}
 			return wrapConn(c, opt.EventObserver), nil
 		}
