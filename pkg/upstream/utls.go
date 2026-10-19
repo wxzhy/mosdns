@@ -307,7 +307,8 @@ func (r *echConfigResolver) query(ctx context.Context) ([]byte, uint32, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(r.domain), dns.TypeHTTPS)
 	// HTTPS records with ech params are often larger than 512 bytes.
-	m.SetEdns0(4096, false)
+	// 1232 is the recommended edns0 udp size. (DNS flag day 2020)
+	m.SetEdns0(1232, false)
 	payload, err := m.Pack()
 	if err != nil {
 		return nil, 0, err
