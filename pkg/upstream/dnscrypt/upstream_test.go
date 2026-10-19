@@ -200,7 +200,7 @@ func TestNewUpstream_InvalidStamp(t *testing.T) {
 
 	// A plain stamp is not a dnscrypt stamp.
 	plainStamp := (&dnsstamps.ServerStamp{
-		Proto:        dnsstamps.StampProtoTypePlain,
+		Proto:         dnsstamps.StampProtoTypePlain,
 		ServerAddrStr: "127.0.0.1:53",
 	}).String()
 	if _, err := NewUpstream(plainStamp, Opt{}); err == nil {

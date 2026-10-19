@@ -34,8 +34,8 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/dnscrypt"
-	"github.com/ameshkov/dnsstamps"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/ameshkov/dnsstamps"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
@@ -56,12 +56,12 @@ type Opt struct {
 // Upstream is a DNSCrypt upstream. It implements the
 // github.com/IrineSistiana/mosdns/v5/pkg/upstream.Upstream interface.
 type Upstream struct {
-	stamp    dnsstamps.ServerStamp
-	logger   *zap.Logger // non-nil
-	udpClt   *dnscrypt.Client
-	tcpClt   *dnscrypt.Client
-	dialUDP  func(ctx context.Context) (net.Conn, error)
-	dialTCP  func(ctx context.Context) (net.Conn, error)
+	stamp   dnsstamps.ServerStamp
+	logger  *zap.Logger // non-nil
+	udpClt  *dnscrypt.Client
+	tcpClt  *dnscrypt.Client
+	dialUDP func(ctx context.Context) (net.Conn, error)
+	dialTCP func(ctx context.Context) (net.Conn, error)
 
 	// mu protects ri.
 	mu sync.RWMutex

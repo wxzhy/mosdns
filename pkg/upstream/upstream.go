@@ -43,6 +43,7 @@ import (
 	"github.com/ameshkov/dnsstamps"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	utls "github.com/refraction-networking/utls"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
@@ -114,6 +115,32 @@ type Opt struct {
 	// TLSConfig specifies the tls.Config that the TLS client will use.
 	// Available for DoT, DoH, DoQ upstream.
 	TLSConfig *tls.Config
+
+	// UTLSFingerprint enables the uTLS client with the given client
+	// fingerprint, e.g. "chrome". Names follow xray-core's "fingerprint"
+	// tls option. See getFingerprint for accepted names.
+	// Available for DoT and DoH (http/2, http/1.1) upstream.
+	// Note: This option changes the whole TLS client implementation
+	// (crypto/tls -> uTLS) for that upstream.
+	UTLSFingerprint string
+
+	// ECHConfigList enables TLS Encrypted Client Hello (ECH).
+	// It has one of the following formats:
+	//   - A base64 encoded ECHConfigList. (i.e. the value of a DNS
+	// HTTPS record's ech param)
+	//   - "domain+dns_server": the HTTPS record of domain is queried
+	//     from dns_server (any upstream address supported by NewUpstream),
+	//     e.g. "example.com+https://1.1.1.1/dns-query".
+	// Available for DoT and DoH (http/2, http/1.1) upstream.
+	// The server must support TLS 1.3. The handshake fails instead of
+	// falling back to a plaintext (non-ECH) connection.
+	ECHConfigList string
+
+	// VerifyPeerCertByName, if not empty, skips the standard certificate
+	// verification and verifies the peer certificate chain against these
+	// names instead. (xray-core's "verifyPeerCertByName" semantics)
+	// Available for all TLS based upstreams.
+	VerifyPeerCertByName []string
 
 	// Logger specifies the logger that the upstream will use.
 	Logger *zap.Logger
@@ -276,6 +303,34 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		}
 	}
 
+	// uTLS (fingerprint and ECH) setup.
+	useUTLS := len(opt.UTLSFingerprint) > 0 || len(opt.ECHConfigList) > 0
+	var fp *utls.ClientHelloID
+	var echResolver *echConfigResolver
+	if useUTLS {
+		fp, err = getFingerprint(opt.UTLSFingerprint)
+		if err != nil {
+			return nil, err
+		}
+		if len(opt.ECHConfigList) > 0 {
+			echResolver, err = newECHConfigResolver(opt.ECHConfigList, opt.Logger)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Verify peer certificate by given names instead of ServerName.
+	if len(opt.VerifyPeerCertByName) > 0 {
+		if opt.TLSConfig == nil {
+			opt.TLSConfig = new(tls.Config)
+		}
+		c := opt.TLSConfig.Clone()
+		c.InsecureSkipVerify = true
+		c.VerifyPeerCertificate = newVerifyPeerCertByNameFunc(opt.VerifyPeerCertByName, c.RootCAs)
+		opt.TLSConfig = c
+	}
+
 	switch addrURL.Scheme {
 	case "", "udp":
 		const defaultPort = 53
@@ -383,6 +438,13 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 				return nil, err
 			}
 			conn = wrapConn(conn, opt.EventObserver)
+			if useUTLS {
+				uconn, err := utlsClientHandshake(ctx, conn, tlsConfig, fp, echResolver)
+				if err != nil {
+					return nil, err
+				}
+				return wrapConn(uconn, opt.EventObserver), nil
+			}
 			tlsConn := tls.Client(conn, tlsConfig)
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				tlsConn.Close()
@@ -422,6 +484,9 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		var t http.RoundTripper
 		var addonCloser io.Closer
 		if opt.EnableHTTP3 {
+			if useUTLS {
+				return nil, errors.New("fingerprint and ech_config_list are not supported for http/3 upstream")
+			}
 			udpBootstrap, err := newUdpAddrResolveFunc(defaultPort)
 			if err != nil {
 				return nil, fmt.Errorf("failed to init udp addr bootstrap, %w", err)
@@ -471,6 +536,31 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 				// MaxConnsPerHost:     2,
 				// MaxIdleConnsPerHost: 2,
 			}
+			if useUTLS {
+				// uTLS performs the TLS handshake itself.
+				t1.TLSClientConfig = nil
+				tlsCfg := opt.TLSConfig
+				if tlsCfg == nil {
+					tlsCfg = new(tls.Config)
+				}
+				if len(tlsCfg.NextProtos) == 0 {
+					c := tlsCfg.Clone()
+					c.NextProtos = []string{"h2", "http/1.1"}
+					tlsCfg = c
+				}
+				t1.DialTLSContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+					conn, err := tcpDialer(ctx)
+					if err != nil {
+						return nil, err
+					}
+					conn = wrapConn(conn, opt.EventObserver)
+					uconn, err := utlsClientHandshake(ctx, conn, tlsCfg, fp, echResolver)
+					if err != nil {
+						return nil, err
+					}
+					return &utlsConn{uconn}, nil
+				}
+			}
 
 			t2, err := http2.ConfigureTransports(t1)
 			if err != nil {
@@ -493,6 +583,9 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			closer: addonCloser,
 		}, nil
 	case "quic", "doq":
+		if useUTLS {
+			return nil, errors.New("fingerprint and ech_config_list are not supported for quic upstream")
+		}
 		const defaultPort = 853
 		tlsConfig := opt.TLSConfig.Clone()
 		if tlsConfig == nil {
@@ -504,7 +597,9 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		// "doq" is the ALPN token required by RFC 9250. The others are
 		// obsolete draft tokens, kept for compatibility with early DoQ
 		// implementations.
-		tlsConfig.NextProtos = []string{"doq", "doq-i00", "dq", "doq-i02"}
+		if len(tlsConfig.NextProtos) == 0 {
+			tlsConfig.NextProtos = []string{"doq", "doq-i00", "dq", "doq-i02"}
+		}
 
 		quicConfig := newDefaultClientQuicConfig()
 		if opt.IdleTimeout > 0 {

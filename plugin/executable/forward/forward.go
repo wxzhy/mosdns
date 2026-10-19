@@ -76,6 +76,14 @@ type UpstreamConfig struct {
 	EnableHTTP3        bool `yaml:"enable_http3"`
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
 
+	// TLS options. Available for TLS based upstreams (tls, https).
+	// Note fingerprint and ech_config_list are not available for
+	// quic based upstreams (h3, quic).
+	ALPN                 []string `yaml:"alpn"`                     // ALPN protocols. e.g. ["dot"].
+	VerifyPeerCertByName string   `yaml:"verify_peer_cert_by_name"` // Comma separated names. Verifies the peer certificate against these names instead of the server name.
+	Fingerprint          string   `yaml:"fingerprint"`              // uTLS client fingerprint. e.g. "chrome". Names follow xray-core.
+	ECHConfigList        string   `yaml:"ech_config_list"`          // base64 ECHConfigList, or "domain+dns_server" to query the HTTPS record of domain from dns_server.
+
 	Socks5       string `yaml:"socks5"`
 	SoMark       int    `yaml:"so_mark"`
 	BindToDevice string `yaml:"bind_to_device"`
@@ -155,9 +163,13 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 			TLSConfig: &tls.Config{
 				InsecureSkipVerify: c.InsecureSkipVerify,
 				ClientSessionCache: tls.NewLRUClientSessionCache(4),
+				NextProtos:         c.ALPN,
 			},
-			Logger:        opt.Logger,
-			EventObserver: uw,
+			UTLSFingerprint:      c.Fingerprint,
+			ECHConfigList:        c.ECHConfigList,
+			VerifyPeerCertByName: parseCertNames(c.VerifyPeerCertByName),
+			Logger:               opt.Logger,
+			EventObserver:        uw,
 		}
 
 		u, err := upstream.NewUpstream(c.Addr, uOpt)
@@ -326,4 +338,15 @@ func quickSetup(bq sequence.BQ, s string) (any, error) {
 		args.Upstreams = append(args.Upstreams, UpstreamConfig{Addr: u})
 	}
 	return NewForward(args, Opts{Logger: bq.L()})
+}
+
+// parseCertNames splits a comma separated name list.
+func parseCertNames(s string) []string {
+	var names []string
+	for _, name := range strings.Split(s, ",") {
+		if name = strings.TrimSpace(name); len(name) > 0 {
+			names = append(names, name)
+		}
+	}
+	return names
 }
