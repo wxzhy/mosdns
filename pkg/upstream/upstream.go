@@ -36,9 +36,11 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/bootstrap"
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/dnscrypt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/doh"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/transport"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"github.com/ameshkov/dnsstamps"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
@@ -123,11 +125,14 @@ type Opt struct {
 
 // NewUpstream creates a upstream.
 // addr has the format of: [protocol://]host[:port][/path].
-// Supported protocol: udp/tcp/tls/https/quic. Default protocol is udp.
+// Supported protocol: udp/tcp/tls/https/quic/sdns. Default protocol is udp.
 //
 // Helper protocol:
 //   - tcp+pipeline/tls+pipeline: Automatically set opt.EnablePipeline to true.
 //   - h3: Automatically set opt.EnableHTTP3 to true.
+//
+// sdns protocol parses a DNS stamp (sdns://...) which can express
+// plain/DNSCrypt/DoH/DoQ/DoT upstreams.
 func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 	if opt.Logger == nil {
 		opt.Logger = mlog.Nop()
@@ -359,6 +364,13 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		if len(tlsConfig.ServerName) == 0 {
 			tlsConfig.ServerName = tryRemovePort(addrUrlHost)
 		}
+		if len(tlsConfig.NextProtos) == 0 {
+			// Despite it is not strictly required by both RFC 8932 and
+			// RFC 9461, some DoT providers (e.g., NextDNS on non-standard
+			// port 443) rely on ALPN to differentiate DoT from DoH traffic.
+			// See https://github.com/AdguardTeam/dnsproxy/issues/510.
+			tlsConfig.NextProtos = []string{"dot"}
+		}
 
 		tcpDialer, err := newTcpDialer(false, defaultPort)
 		if err != nil {
@@ -489,7 +501,10 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		if len(tlsConfig.ServerName) == 0 {
 			tlsConfig.ServerName = tryRemovePort(addrUrlHost)
 		}
-		tlsConfig.NextProtos = []string{"doq"}
+		// "doq" is the ALPN token required by RFC 9250. The others are
+		// obsolete draft tokens, kept for compatibility with early DoQ
+		// implementations.
+		tlsConfig.NextProtos = []string{"doq", "doq-i00", "dq", "doq-i02"}
 
 		quicConfig := newDefaultClientQuicConfig()
 		if opt.IdleTimeout > 0 {
@@ -548,6 +563,59 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			MaxConcurrentQueryWhileDialing: 90,
 			Logger:                         opt.Logger,
 		}), nil
+	case "sdns":
+		// Parse the stamp from the original address string.
+		// The round-tripped url string may not preserve the base64 encoding.
+		stamp, err := dnsstamps.NewServerStampFromString(addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse dns stamp, %w", err)
+		}
+
+		// If the stamp has a server ip, dial to it directly.
+		// High layer addresses (SNI, HTTP Host) are not affected.
+		if s := stamp.ServerAddrStr; len(s) > 0 {
+			if _, err := netip.ParseAddr(tryRemovePort(s)); err == nil {
+				opt.DialAddr = s
+			}
+		}
+
+		switch stamp.Proto {
+		case dnsstamps.StampProtoTypePlain:
+			return NewUpstream("udp://"+stamp.ServerAddrStr, opt)
+		case dnsstamps.StampProtoTypeDNSCrypt:
+			// DNSCrypt always dials the stamp server address.
+			opt.DialAddr = stamp.ServerAddrStr
+
+			const defaultPort = 443
+			udpAddrResolve, err := newUdpAddrResolveFunc(defaultPort)
+			if err != nil {
+				return nil, fmt.Errorf("failed to init udp dialer, %w", err)
+			}
+			dialUdpConn := func(ctx context.Context) (net.Conn, error) {
+				ua, err := udpAddrResolve(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return dialer.DialContext(ctx, "udp", ua.String())
+			}
+			dialTcpConn, err := newTcpDialer(false, defaultPort)
+			if err != nil {
+				return nil, fmt.Errorf("failed to init tcp dialer, %w", err)
+			}
+			return dnscrypt.NewUpstream(addr, dnscrypt.Opt{
+				UDPDialContext: dialUdpConn,
+				TCPDialContext: dialTcpConn,
+				Logger:         opt.Logger,
+			})
+		case dnsstamps.StampProtoTypeDoH:
+			return NewUpstream("https://"+stamp.ProviderName+stamp.Path, opt)
+		case dnsstamps.StampProtoTypeDoQ:
+			return NewUpstream("quic://"+stamp.ProviderName, opt)
+		case dnsstamps.StampProtoTypeTLS:
+			return NewUpstream("tls://"+stamp.ProviderName, opt)
+		default:
+			return nil, fmt.Errorf("unsupported dns stamp protocol [%d]", stamp.Proto)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported protocol [%s]", addrURL.Scheme)
 	}

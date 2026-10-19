@@ -22,14 +22,18 @@ package upstream
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/dnscrypt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"github.com/ameshkov/dnsstamps"
 	"github.com/miekg/dns"
 )
 
@@ -147,6 +151,108 @@ func Test_fastUpstream(t *testing.T) {
 		}
 
 	}
+}
+
+// startDNSCryptTestServer starts a DNSCrypt test server (udp + tcp)
+// and returns its stamp string.
+func startDNSCryptTestServer(t testing.TB, h dnscrypt.Handler) (stampStr string) {
+	t.Helper()
+
+	rc, err := dnscrypt.GenerateResolverConfig("example.com", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := rc.NewCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	startServer := func(proto dnscrypt.Proto, addr netip.AddrPort) *dnscrypt.Server {
+		t.Helper()
+		s, err := dnscrypt.NewServer(&dnscrypt.ServerConfig{
+			Handler:      h,
+			ResolverCert: cert,
+			ProviderName: rc.ProviderName,
+			Addr:         addr,
+			Proto:        proto,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	srvUDP := startServer(dnscrypt.ProtoUDP, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0))
+	t.Cleanup(func() { _ = srvUDP.Shutdown(context.Background()) })
+
+	addrStr := srvUDP.LocalAddr().String()
+	stamp, err := rc.CreateStamp(addrStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srvTCP := startServer(dnscrypt.ProtoTCP, netip.MustParseAddrPort(addrStr))
+	t.Cleanup(func() { _ = srvTCP.Shutdown(context.Background()) })
+
+	return stamp.String()
+}
+
+type dnscryptTestHandler struct{}
+
+func (dnscryptTestHandler) ServeDNS(_ context.Context, w dnscrypt.ResponseWriter, r *dns.Msg) error {
+	res := (&dns.Msg{}).SetReply(r)
+	res.Answer = append(res.Answer, &dns.A{
+		Hdr: dns.RR_Header{
+			Name:   r.Question[0].Name,
+			Rrtype: dns.TypeA,
+			Class:  dns.ClassINET,
+			Ttl:    300,
+		},
+		A: net.IPv4(1, 2, 3, 4).To4(),
+	})
+	return w.WriteMsg(context.Background(), res)
+}
+
+func Test_sdnsUpstream(t *testing.T) {
+	t.Run("plain", func(t *testing.T) {
+		addr, shutdownServer := newUDPTestServer(t, &vServer{})
+		defer shutdownServer()
+		stampStr := (&dnsstamps.ServerStamp{
+			Proto:        dnsstamps.StampProtoTypePlain,
+			ServerAddrStr: addr,
+		}).String()
+
+		u, err := NewUpstream(stampStr, Opt{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := testUpstream(u); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("dnscrypt", func(t *testing.T) {
+		stampStr := startDNSCryptTestServer(t, dnscryptTestHandler{})
+
+		u, err := NewUpstream(stampStr, Opt{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := testUpstream(u); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("unsupported-stamp-proto", func(t *testing.T) {
+		// Stamp with an unknown protocol id (0x05).
+		stampStr := "sdns://" + base64.RawURLEncoding.EncodeToString([]byte{0x05})
+		if _, err := NewUpstream(stampStr, Opt{}); err == nil {
+			t.Fatal("expected error")
+		}
+	})
 }
 
 func testUpstream(u Upstream) error {
