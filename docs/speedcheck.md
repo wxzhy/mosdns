@@ -131,7 +131,7 @@ bounded 在收集窗口、首正答上限、总预算、全部工作完成中最
       exec: drop_resp
 ```
 
-这里 `resp_ip` 检查 Answer 内的 A/AAAA；选择器自身的 `candidate_filter` 仅检查 CNAME 终点地址，范围不同。一个 `matches` 列表中多个条件为 AND，单个 matcher 内的多个取值一般为 OR。慢过滤也会推迟此来源开始测速，因此只把提交候选必需的处理放在来源中；写 ipset/nftset 等副作用放在最终选择后。
+这里 `resp_ip` 检查 Answer 内的 A/AAAA；选择器自身的 `candidate_filter` 仅检查 CNAME 终点地址，范围不同。HTTPS/SVCB 查询还可用 `resp_ip` 匹配合法终点 ServiceMode 的 hint，在 [`https_record`](https-record.md) 清理前丢弃不合格来源；hint 不作为 speedcheck 的测速地址。一个 `matches` 列表中多个条件为 AND，单个 matcher 内的多个取值一般为 OR。慢过滤也会推迟此来源开始测速，因此只把提交候选必需的处理放在来源中；写 ipset/nftset 等副作用放在最终选择后。
 
 若需替换 CDN IP，先声明 [`ip_replace`](ip-replace.md)，再在每个来源的查询和必需过滤之后调用；不能放在最终 speedcheck 选址之后：
 

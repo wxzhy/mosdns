@@ -190,7 +190,7 @@ plugins: []
 | `qname` | `qname full:example.com domain:example.org $local_domains &./rules/domains.txt` | 首个 Question 的名称；多个表达式/集合/文件 OR。支持上述数据库表达式。 |
 | `cname` | `cname domain:cdn.example $local_domains` | 响应 Answer 中任一 CNAME 的 Target。 |
 | `client_ip` | `client_ip 192.168.0.0/16 ::1 $local_ips &./rules/ips.txt` | 服务端识别的客户端地址。 |
-| `resp_ip` | `resp_ip 203.0.113.0/24 $local_ips` | Answer 中任一 A/AAAA，**不只是 CNAME 终点**。 |
+| `resp_ip` | `resp_ip 203.0.113.0/24 $local_ips` | Answer 中任一 A/AAAA，**不只是 CNAME 终点**；HTTPS/SVCB 查询额外匹配有效 CNAME 终点 ServiceMode 的 hint。 |
 | `ptr_ip` | `ptr_ip 192.168.0.0/16 $local_ips` | 从 PTR 查询名还原出的地址。 |
 | `qtype` | `qtype 1 28` | 整数 DNS 类型，A=1、AAAA=28、PTR=12、HTTPS=65；不接受 `A`/`AAAA` 名称。 |
 | `qclass` | `qclass 1` | 整数 DNS 类，IN=1。 |
@@ -384,6 +384,48 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
 ```
 
 默认不把缺少测速统计或关闭测速判为失败；若明确希望禁测时也静态回退，配置 `no_rtt`。已有成功 RTT（包括 0）不触发。无响应、NXDOMAIN/SERVFAIL、截断、opaque 或 DO=1 保留，不做静态伪造。重建只输出配置地址及必要 CNAME；静态 TTL 可重设地址期限，有链时保守受其既存有效期限约束。完整说明与无公网演示见 [ip_fallback](ip-fallback.md)。
+
+### https_record：HTTPS/SVCB 的 ECH、hint 与 ALPN
+
+处理客户端收到的 DNS 记录，与上游 TLS 连接的 ECH/ALPN 配置不同。完整参数、逐 Target 门控、子查询和离线示例见 [https_record](https-record.md)。
+
+| `args` 字段 | 默认值与行为 |
+| --- | --- |
+| `remove_hint` | `true`；移除 ServiceMode 的 ipv4hint/ipv6hint。 |
+| `remove_h3` | `true`；删除精确 ALPN `h3`。 |
+| `remove_alpn` | 空列表；额外删除的精确协议 ID，每项 1..255 字节。 |
+| `add_ech` | `true`；为符合条件且缺少 ECH 的 ServiceMode 补值，不覆盖已有 ECH。 |
+| `enable_subquery` | `true`；允许缺 hint 时用 A 判断，以及 NODATA 的 A 确认。 |
+| `ech_source` | 开启 ECH 时必填；此前定义的专用查询链 tag，不带 `$`。 |
+| `ech_domain` | `crypto.cloudflare.com`；生产环境须与目标服务/CDN 兼容。 |
+| `ip_source` | 开启 ECH 和子查询时必填；此前定义的完整 A 查询链 tag。 |
+| `match_name` | 省略不限；支持域名表达式、`$domain_set`、`&文件`、GeoSite；显式 `[]` 拒绝注入/辅助查询。 |
+| `match_ip` | 省略不限；IP/CIDR、`$ip_set`、`&文件`、GeoIP/ASN 表达式 OR；显式 `[]` 拒绝注入。 |
+| `exclude_ip` | 默认无排除；任一当前记录的 hint/A 地址命中就否决该条注入。 |
+| `timeout` | `500ms`；省略或 `0` 采用默认值，负值报错。全部辅助工作共用预算，受父截止限制，预留最多 25ms 回包时间。 |
+
+```yaml
+# 此前定义 ech_lookup、ip_lookup，分别返回ECH域名的HTTPS及目标域名的最终A响应。
+- tag: process_bindings
+  type: https_record
+  args:
+    remove_hint: true
+    remove_h3: true
+    remove_alpn: ["h3-29"]
+    add_ech: true
+    enable_subquery: true
+    ech_source: ech_lookup
+    ech_domain: compatible-ech.cdn.example
+    ip_source: ip_lookup
+    match_name: ["domain:example.org"]
+    match_ip: ["$cdn_networks"]
+    exclude_ip: []
+    timeout: 500ms
+```
+
+hint/ALPN 清理先执行；名称/IP 条件只控制 ECH 注入和辅助查询。正 ServiceMode 按各自 TargetName/hint 分别判定，A 查询按目标去重且最多 8 个并行，并与单次 ECH 查询重叠。NOERROR/NODATA 必须先得到合法匹配的 A，才合成短 TTL 的 ECH-only 记录；AliasMode 不改。DO=1 跳过，重建清理 AD/AA、失效证明并限制 TTL。成功 ECH 缓存最多 100 条、300 秒，不超过来源期限；TTL0、无 ECH 及异常不缓存。不提供跨请求在途合并。
+
+来源若需按原 hint 丢弃候选，在清理前使用 `resp_ip` 配合 `drop_resp`；该 matcher 已扩展到合法 HTTPS/SVCB 终点 ServiceMode 的 hint，不取无关记录和 Additional 的 hint。A/AAAA 的既有 Answer 匹配保持兼容；speedcheck 不探测 HTTPS hint。
 
 ### arbitrary
 
@@ -735,9 +777,9 @@ TCP/HTTP 监听地址以 `@` 开头时，代码会选择 Unix socket；这是面
 
 - 数据：`domain_set`、`ip_set`。
 - 匹配：`client_ip`、`cname`、`env`、`has_resp`、`has_wanted_ans`、`ptr_ip`、`qclass`、`qname`、`qtype`、`random`、`rcode`、`resp_ip`、`string_exp`、`mark`，及 `_true`/`_false`。
-- 执行：`arbitrary`、`black_hole`、`cache`、`debug_print`、`drop_resp`、`dual_selector` 的 `prefer_ipv4`/`prefer_ipv6`、`ecs_handler`/`ecs`、`forward`、`forward_edns0opt`、`hosts`、`ip_fallback`、`ip_replace`、`ipset`、`metrics_collector`、`nftset`、`query_summary`、`rate_limiter`（实际 matcher）、`redirect`、`reverse_lookup`、`sequence`/内置控制流、`fallback`、`sleep`、`ttl`。`speedcheck` 链接至专门参考和完整示例。
+- 执行：`arbitrary`、`black_hole`、`cache`、`debug_print`、`drop_resp`、`dual_selector` 的 `prefer_ipv4`/`prefer_ipv6`、`ecs_handler`/`ecs`、`forward`、`forward_edns0opt`、`hosts`、`https_record`、`ip_fallback`、`ip_replace`、`ipset`、`metrics_collector`、`nftset`、`query_summary`、`rate_limiter`（实际 matcher）、`redirect`、`reverse_lookup`、`sequence`/内置控制流、`fallback`、`sleep`、`ttl`。`speedcheck` 链接至专门参考和完整示例。
 - 服务：`http_server`、`quic_server`、`tcp_server`、`udp_server`。
 
 配置核对顺序：先检查顶层/插件字段名及依赖定义顺序，再检查单位和快速语法，最后在本机未占用端口启动并做真实查询。程序目前没有独立的“只解析、不启动插件”配置检查命令；`start` 会真实打开文件、数据库和监听 socket。不要把源码中未注册的结构字段或内部常量当成用户配置项。
 
-在仓库根目录运行 `go test . -run TestDocumentedExamplesUseKnownPluginParameters`，可严格解码示例，检查未知字段、插件类型及全部顶层注册类型的示例覆盖。全模块/全参数模板只做解码，不加载其外部资源；基础测速配置和 IP 替换演示另有无外网的初始化及 A/AAAA 主链测试。这些检查不代替目标环境中的数据库、证书和网络验证。
+在仓库根目录运行 `go test . -run TestDocumentedExamplesUseKnownPluginParameters`，可严格解码七份示例，检查未知字段、插件类型及全部顶层注册类型的示例覆盖。全模块/全参数模板只做解码，不加载其外部资源；基础测速、IP 替换和静态回退另有无外网的初始化及 A/AAAA 主链测试，HTTPS/SVCB 离线示例验证实际本机 UDP/TCP 回包。这些检查不代替目标环境中的数据库、证书和网络验证。

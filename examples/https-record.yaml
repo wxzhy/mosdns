@@ -1,0 +1,115 @@
+# Offline DNS transformation demonstration. No upstream query or probe leaves
+# this process: HTTPS/ECH data comes from arbitrary, A data from local hosts.
+# Run from repository root: mosdns start -c examples/https-record.yaml
+# The ECHConfigList below has the current 0xfe0d framing, X25519 public key
+# 09 followed by 31 zero bytes, HKDF-SHA256/AES-128-GCM, config_id=66 and
+# public_name=public.https-record.invalid. It is a fixed DNS test fixture.
+# It has no corresponding TLS service and is not a usable CDN configuration.
+log:
+  level: info
+  production: false
+include: []
+api:
+  http: "127.0.0.1:19091"
+plugins:
+  - tag: original_bindings
+    type: arbitrary
+    args:
+      rules:
+        - 'hint.https-record.invalid. 120 IN HTTPS 1 . mandatory=alpn,ipv4hint alpn=h2,h3 ipv4hint=192.0.2.10'
+        - 'hintless.https-record.invalid. 120 IN HTTPS 1 gate-target.https-record.invalid. alpn=h3 no-default-alpn'
+        - 'svcb.https-record.invalid. 120 IN SVCB 1 . alpn=h2,h3 ipv4hint=192.0.2.10'
+        - 'alias.https-record.invalid. 120 IN HTTPS 0 gate-target.https-record.invalid.'
+      files: []
+
+  - tag: binding_source
+    type: sequence
+    args:
+      - exec: $original_bindings
+      - matches: [has_resp]
+        exec: return
+      # Legal NOERROR/NODATA for names with no configured HTTPS/SVCB record.
+      - exec: reject 0
+
+  - tag: local_ech_records
+    type: arbitrary
+    args:
+      rules:
+        - 'ech-source.https-record.invalid. 180 IN HTTPS 1 . ech=AE7+DQBKQgAgACAJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAEAAQAbcHVibGljLmh0dHBzLXJlY29yZC5pbnZhbGlkAAA='
+      files: []
+  - tag: ech_lookup
+    type: sequence
+    args:
+      - exec: $local_ech_records
+
+  - tag: local_a_records
+    type: hosts
+    args:
+      entries:
+        - "gate-target.https-record.invalid 192.0.2.20"
+        - "nodata.https-record.invalid 192.0.2.30"
+      files: []
+  - tag: local_a_source
+    type: sequence
+    args:
+      - exec: $local_a_records
+  - tag: select_local_a
+    type: speedcheck
+    args:
+      sources: [local_a_source]
+      mode: wait_all
+      probe:
+        tcp_ports: []               # Documentation IPs must not be probed.
+        icmp: false
+        timeout: 300ms
+  - tag: ip_lookup
+    type: sequence
+    args:
+      # A lookups can reuse a complete address-processing route; this local
+      # route uses the existing selector with all actual probes disabled.
+      - exec: $select_local_a
+
+  - tag: process_bindings
+    type: https_record
+    args:
+      remove_hint: true
+      remove_h3: true
+      remove_alpn: ["h3-29"]       # Extra exact protocol IDs, independent of h3.
+      add_ech: true
+      enable_subquery: true
+      ech_source: ech_lookup       # Previously defined named sequence.
+      ech_domain: ech-source.https-record.invalid
+      ip_source: ip_lookup         # Previously defined complete A route.
+      match_name: ["domain:https-record.invalid"]
+      match_ip: ["192.0.2.0/24"]
+      exclude_ip: ["192.0.2.255"]
+      timeout: 500ms
+
+  - tag: main
+    type: sequence
+    args:
+      - matches: ["qtype 1"]
+        exec: $ip_lookup
+      - matches: [has_resp]
+        exec: accept
+      - exec: $binding_source
+      - exec: $process_bindings
+      - matches: [has_resp]
+        exec: accept
+  - tag: udp_listener
+    type: udp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+  - tag: tcp_listener
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+      idle_timeout: 10
+
+# Query hint.https-record.invalid HTTPS: h2 stays, h3/hints disappear, ECH added.
+# Query hintless.https-record.invalid HTTPS: A for gate-target gates injection.
+# Query nodata.https-record.invalid HTTPS: matching local A permits synthesis.
+# Query alias.https-record.invalid HTTPS: AliasMode stays unchanged.
+# Query svcb.https-record.invalid SVCB: the same ServiceMode policy is supported.

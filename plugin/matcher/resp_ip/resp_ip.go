@@ -22,11 +22,13 @@ package resp_ip
 import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/response"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/IrineSistiana/mosdns/v5/plugin/matcher/base_ip"
 	"github.com/miekg/dns"
 	"net"
 	"net/netip"
+	"time"
 )
 
 const PluginType = "resp_ip"
@@ -59,6 +61,26 @@ func matchRespAddr(qCtx *query_context.Context, m netlist.Matcher) (bool, error)
 		addr, ok := netip.AddrFromSlice(ip)
 		if ok && m.Match(addr) {
 			return true, nil
+		}
+	}
+	if qCtx.Q().Opcode != dns.OpcodeQuery || len(qCtx.Q().Question) != 1 {
+		return false, nil
+	}
+	question := qCtx.QQuestion()
+	if question.Qclass == dns.ClassINET && (question.Qtype == dns.TypeHTTPS || question.Qtype == dns.TypeSVCB) {
+		candidate, err := response.AnalyzeBindings(qCtx.Q(), qCtx.SnapshotResponse(), time.Now())
+		if err != nil {
+			return false, err
+		}
+		for _, record := range candidate.Records {
+			if record.Priority == 0 {
+				continue
+			}
+			for _, ip := range record.Hints {
+				if m.Match(ip) {
+					return true, nil
+				}
+			}
 		}
 	}
 	return false, nil

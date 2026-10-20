@@ -14,4 +14,6 @@ CDN 地址前缀替换：[ip_replace 参数与行为](docs/ip-replace.md) · [�
 
 测速失败与无 RTT 静态回退：[ip_fallback 配置说明](docs/ip-fallback.md) · [本地演示](examples/ip-fallback.yaml)
 
+HTTPS/SVCB 响应处理：[ECH、hint 与 ALPN](docs/https-record.md) · [离线完整示例](examples/https-record.yaml) · [SmartDNS 响应功能迁移对照](docs/response-migration.md)
+
 Windows：[运行与配置](docs/speedcheck-windows.md) · [UDP/TCP 完整示例](examples/speedcheck-windows.yaml)

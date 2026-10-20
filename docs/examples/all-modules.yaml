@@ -199,6 +199,25 @@ plugins:
         labels_exclude: [no_probe]
         asn_include: [13335]
         asn_exclude: [64512]
+  - tag: ech_lookup
+    type: sequence
+    args:
+      - exec: $upstream_b
+  - tag: process_bindings
+    type: https_record
+    args:
+      remove_hint: true
+      remove_h3: true
+      remove_alpn: ["h3-29"]
+      add_ech: true
+      enable_subquery: true
+      ech_source: ech_lookup              # 专用HTTPS查询来源，不继承marks/kv
+      ech_domain: crypto.cloudflare.com   # 必须换成与目标服务兼容的ECH来源
+      ip_source: select_fast_ip           # 完整A来源，可另包ip_fallback/缓存
+      match_name: ["domain:example.org"]  # 仅控制ECH/辅助查询；[]拒绝，省略不限
+      match_ip: ["$ips_database"]
+      exclude_ip: ["198.18.0.0/15"]
+      timeout: 500ms
   - tag: secondary_query
     type: sequence
     args:
@@ -261,6 +280,8 @@ plugins:
       - matches: ["!$rate_limit"]
         exec: reject 5
       - exec: $resolve_with_fallback
+      - matches: ["qtype 64 65", "qname domain:example.org"]
+        exec: $process_bindings
       - exec: accept
   - tag: cached_main
     type: sequence
