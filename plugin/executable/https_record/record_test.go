@@ -273,6 +273,52 @@ func TestSynthesisNeedsAAndHonorsNativeZeroTTL(t *testing.T) {
 	}
 }
 
+func TestNODATASynthesisDoesNotBorrowAnotherAliasTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mainAlias bool
+		aTerminal string
+		wantECH   bool
+	}{
+		{"matching terminal", true, "HTTPS-ONLY.test.", true},
+		{"different terminal", true, "a-only.test.", false},
+		{"complete A route without main alias", false, "a-only.test.", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := sequence.ExecutableFunc(func(_ context.Context, q *query_context.Context) error {
+				if q.QQuestion().Name != "example.test." {
+					return fmt.Errorf("A source bypassed original-name routing: %s", q.QQuestion().Name)
+				}
+				r := new(dns.Msg).SetReply(q.Q())
+				r.Answer = []dns.RR{
+					&dns.CNAME{Hdr: dns.RR_Header{Name: "example.test.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 10}, Target: tc.aTerminal},
+					&dns.A{Hdr: dns.RR_Header{Name: tc.aTerminal, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("192.0.2.1")},
+				}
+				q.SetResponse(r)
+				return nil
+			})
+			p := recordPlugin(t, Args{MatchIP: []string{"192.0.2.0/24"}}, echSource(30, nil), ip)
+			q := bindingContext(t, dns.TypeHTTPS)
+			if tc.mainAlias {
+				q = bindingContext(t, dns.TypeHTTPS, "example.test. 30 IN CNAME https-only.test.")
+			}
+			if err := p.Exec(context.Background(), q); err != nil {
+				t.Fatal(err)
+			}
+			injected := false
+			for _, rr := range q.R().Answer {
+				injected = injected || hasECH(rr)
+			}
+			if injected != tc.wantECH {
+				t.Fatalf("wrong canonical target authorization: injected=%v want=%v response=%s", injected, tc.wantECH, q.R())
+			}
+			if tc.wantECH && tc.mainAlias && q.R().Answer[len(q.R().Answer)-1].Header().Name != "https-only.test." {
+				t.Fatal("synthesized binding lost the main terminal")
+			}
+		})
+	}
+}
+
 func TestECHCacheViewIsolationExpiryAndNoErrorCaching(t *testing.T) {
 	var calls atomic.Int32
 	var current atomic.Int64

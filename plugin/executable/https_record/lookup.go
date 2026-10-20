@@ -36,6 +36,7 @@ type echCacheEntry struct {
 
 type ipData struct {
 	ips        []netip.Addr
+	terminal   string
 	ttl        uint32
 	validUntil time.Time
 }
@@ -251,7 +252,7 @@ func (p *Record) resolveIP(ctx context.Context, parent *query_context.Context, t
 	if !until.IsZero() && !now.Before(until) {
 		return ipData{}, errors.New("IP source expired")
 	}
-	data := ipData{validUntil: until}
+	data := ipData{validUntil: until, terminal: c.Terminal}
 	for _, address := range c.Addresses {
 		data.ips = append(data.ips, address.IP)
 	}

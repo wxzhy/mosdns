@@ -64,4 +64,20 @@ go vet -p 2 ./...
 | 静态检查与构建 | 快照上 `go vet -p 2 ./...` 通过；Windows amd64 可执行文件构建并运行 version；`CGO_ENABLED=0` 的 Linux ARM64、MIPSLE softfloat 全包交叉构建通过。 |
 | 文档与格式 | 新示例严格解码与注册插件覆盖通过；本批 Markdown 本地链接及 Go 格式检查通过。 |
 
-本批没有运行或宣称通过整仓 `go test ./...`，也未执行真实 CDN 或 TLS/ECH 端到端测试。
+上述首次迁移验证没有运行或宣称通过整仓 `go test ./...`，也未执行真实 CDN 或 TLS/ECH 端到端测试。
+
+## 二次检查与边界修复
+
+2026-10-20 再次检查并补充六组回归，修正以下边界：
+
+- CNAME-only NODATA 同样保存正 TTL 的绝对期限。Replay 将不足一秒的剩余 TTL 取整为零后，静态回退仍受原期限约束，过期时不提交替换。
+- speedcheck 在来源接收、候选名额计算、负答及其他类型完整回放时统一排除已过期快照。过期地址释放当前 64-IP 候选名额；实际探测的独立 64-IP 总预算仍保留，新入选但无探测名额的地址按“未测量”回退。
+- HTTPS/SVCB 的 NODATA 已有 CNAME 链时，辅助 A 的规范化终点必须与主终点一致，防止借其他端点的 IP 条件授权 ECH。主响应没有 CNAME 时仍可使用带 CNAME 的完整 A 路由。
+
+修复前，TTL 取整、过期静态回退、候选名额和跨终点 ECH 授权均有失败复现；修复后再对冻结暂存快照验证，避免测试编译期间继续修改 Go 源码。
+
+冻结快照的 11 个相关包（query_context、response、speedtest、ip_fallback、https_record、ip_replace、speedcheck、resp_ip、sequence/fallback、coremain 及根包）以 `-count=1` 运行 race 全部通过，随后 `go vet -p 2 ./...` 通过。Windows amd64、Linux ARM64、MIPSLE softfloat 全包构建通过。Linux WSL 的四个响应/选择包及根包配置和全部 TCP 场景通过普通测试；UDP 单例仍超时，运行验证限制未解除。
+
+随后保持 Go 源码冻结，在包含其他任务修改的当前工作区再次运行 speedcheck、https_record 和根包 race，三者也通过，含实际 Windows UDP/TCP 回包和完整配置接线；该工作区的 `go vet -p 2 ./...` 也通过。
+
+对包含其他任务修改的当前工作区还尝试了整仓 race，并将上游 UDP 大报文用例定向复跑三次，仍有一次 `Test_fastUpstream/test:_protocol:_udp,_bigMsg:_true,_latency:_0s,_getIdleTimeout:_1s` 在一秒截止处失败。干净 `9fdc39c` 的 `Test_fastUpstream` 单独运行通过；两者的代码及运行条件不同，本轮不据此归因。未修改或提交这些 upstream/GeoIP 文件，也不宣称整仓测试通过。

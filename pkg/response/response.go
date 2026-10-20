@@ -74,21 +74,21 @@ func Analyze(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Ti
 	// Capture the source lease before any Replay or rewrite can round a short
 	// positive TTL to zero. This also bounds an otherwise long-lived address
 	// by the nonzero lifetime of the aliases needed to reach it.
-	if len(c.Addresses) > 0 {
-		var bounds ttlBounds
-		bounds.includeValidity(c.Snapshot.ValidUntil)
-		for _, address := range c.Addresses {
-			if address.ExpiresAt.After(c.ReceivedAt) {
-				bounds.includeValidity(address.ExpiresAt)
-			}
+	// NODATA can still carry aliases. Capture their positive lease as well,
+	// before Replay can round a remaining fraction of a second to wire TTL 0.
+	var bounds ttlBounds
+	bounds.includeValidity(c.Snapshot.ValidUntil)
+	for _, address := range c.Addresses {
+		if address.ExpiresAt.After(c.ReceivedAt) {
+			bounds.includeValidity(address.ExpiresAt)
 		}
-		for _, link := range c.chain {
-			if link.expiresAt.After(c.ReceivedAt) {
-				bounds.includeValidity(link.expiresAt)
-			}
-		}
-		c.Snapshot.ValidUntil = bounds.validUntil
 	}
+	for _, link := range c.chain {
+		if link.expiresAt.After(c.ReceivedAt) {
+			bounds.includeValidity(link.expiresAt)
+		}
+	}
+	c.Snapshot.ValidUntil = bounds.validUntil
 	c.Negative = len(c.Addresses) == 0
 	c.Rewritable = !c.Negative && !opaque(r) && !c.queryDO
 	return c, nil

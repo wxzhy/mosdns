@@ -86,7 +86,7 @@ Windows 上可使用支持 HTTPS/SVCB 类型的本地 DNS 客户端；`nslookup`
 2. `match_name`、`match_ip`、`exclude_ip` 只控制 ECH 与辅助查询，不控制上一步清理。若要限制整个动作的域名范围，应在外层 sequence 调用时使用 `matches`。
 3. 当前记录已有 hint 时，用这条记录原本的全部 hint 判定；任一 exclude 否决该条，否则任一 include 命中即可。不使用其他 Target 的 hint。
 4. 缺 hint 且存在 IP 门控时，通过 ip_source 查询该记录 TargetName 的 A；根目标 `.` 表示 CNAME 终点 owner。相同规范化 Target 在本次请求内去重，最多 8 个 A 查询并行。
-5. 没有 IP 门控的现有 ServiceMode 可直接按名称授权，无需 A 查询。NODATA 始终需要先查询原问题名称的 A，并取得合法匹配地址后才能合成。
+5. 没有 IP 门控的现有 ServiceMode 可直接按名称授权，无需 A 查询。NODATA 始终需要先查询原问题名称的 A，并取得合法匹配地址后才能合成。若主 NODATA 已有 CNAME 链，A 路由的规范化终点必须与主终点一致；不一致时保留 NODATA，避免借用其他端点的 IP 授权。主响应没有 CNAME 时，仍允许完整 A 路由自身包含 CNAME。
 
 ECH 查询与所需 A 查询重叠运行，共用一个预算。辅助 A 是本插件自己调用的命名处理链；**不保证浏览器同时发出的 A 查询已经返回，也不会等待浏览器查询的缓存结果**。ip_source 可接入已有替换、过滤、speedcheck、ip_fallback 和响应缓存组成的完整 A 路由，返回的最终地址才用于判断。
 

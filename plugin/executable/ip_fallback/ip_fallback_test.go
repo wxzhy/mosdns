@@ -6,9 +6,11 @@ import (
 	"net"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/response"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 )
@@ -318,6 +320,43 @@ func TestEDNSOptionsAndExpiredAlias(t *testing.T) {
 	original := q.R()
 	if err := f.Exec(context.Background(), q); err == nil || q.R() != original {
 		t.Fatal("expired alias was reused or source state changed")
+	}
+}
+
+func TestFallbackRejectsReplayedExpiredNODATAAlias(t *testing.T) {
+	for _, delay := range []time.Duration{100 * time.Millisecond, 1100 * time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				q := fallbackContext(dns.TypeA)
+				q.R().Answer = []dns.RR{&dns.CNAME{Hdr: dns.RR_Header{Name: "fallback.example.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 1}, Target: "leaf.example."}}
+				start := time.Now()
+				candidate, err := response.Analyze(q.Q(), q.SnapshotResponse(), start)
+				if err != nil {
+					t.Fatal(err)
+				}
+				time.Sleep(100 * time.Millisecond)
+				q.CommitResponse(response.Replay(candidate, time.Now()))
+				time.Sleep(delay - 100*time.Millisecond)
+				original := q.R()
+				f := newFallback(t, Args{IPv4: []string{"203.0.113.42"}, TTL: ttlPointer(60)})
+				err = f.Exec(context.Background(), q)
+				if delay >= time.Second {
+					if err == nil || q.R() != original {
+						t.Fatal("replayed expired NODATA alias was accepted or modified")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !q.SnapshotResponse().ValidUntil.Equal(start.Add(time.Second)) {
+					t.Fatal("live NODATA alias gained a new deadline")
+				}
+				if len(q.R().Answer) != 2 || q.R().Answer[1].Header().Name != "leaf.example." {
+					t.Fatal("fallback lost NODATA alias or terminal")
+				}
+			})
+		})
 	}
 }
 

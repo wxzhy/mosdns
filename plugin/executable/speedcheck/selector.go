@@ -282,6 +282,8 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 			c := event.candidate
 			if r := c.Snapshot.Response.Rcode; r != dns.RcodeSuccess && r != dns.RcodeNameError {
 				result = "rcode"
+			} else if until := c.Snapshot.ValidUntil; !until.IsZero() && !time.Now().Before(until) {
+				result = "expired"
 			} else {
 				cs := &candidateState{source: event.index, readyAt: event.at, value: c, metadata: make(map[netip.Addr]ipMetadata)}
 				for _, address := range c.Addresses {
@@ -434,6 +436,13 @@ func freezeAtCutoff(states []*candidateState, probes map[netip.Addr]*probeState,
 	}
 }
 func validRTT(r speedtest.Result) bool { return r.Outcome == speedtest.Success && r.RTT >= 0 }
+func candidateCurrent(c *candidateState, now time.Time) bool {
+	if c == nil {
+		return false
+	}
+	until := c.value.Snapshot.ValidUntil
+	return until.IsZero() || now.Before(until)
+}
 func allProbesDone(probes map[netip.Addr]*probeState, admitted map[netip.Addr]bool) bool {
 	for ip := range admitted {
 		if p := probes[ip]; p != nil && !p.done {
@@ -449,8 +458,9 @@ func (s *Selector) refreshProbes(ctx context.Context, states []*candidateState, 
 	admitted := make(map[netip.Addr]bool)
 	allowed := make(map[netip.Addr]bool)
 	var ordered []netip.Addr
+	now := time.Now()
 	for _, c := range states {
-		if c == nil {
+		if !candidateCurrent(c, now) {
 			continue
 		}
 		addresses := slices.Clone(c.value.Addresses)
@@ -586,10 +596,7 @@ func (s *Selector) matches(f *IPFilter, c *candidateState) bool {
 func (s *Selector) selectResponse(states []*candidateState, probes map[netip.Addr]*probeState, admitted map[netip.Addr]bool, qCtx *query_context.Context, now time.Time) (query_context.ResponseSnapshot, string, error) {
 	var ranked []rankedAddress
 	for _, c := range states {
-		if c == nil {
-			continue
-		}
-		if until := c.value.Snapshot.ValidUntil; !until.IsZero() && !now.Before(until) {
+		if !candidateCurrent(c, now) {
 			continue
 		}
 		for _, a := range c.value.Addresses {
@@ -679,7 +686,7 @@ func (s *Selector) selectResponse(states []*candidateState, probes map[netip.Add
 		return snapshotWithProbeStatus(response.Replay(anchor, now), status), kind, nil
 	}
 	for _, c := range states {
-		if c != nil && c.value.Negative {
+		if candidateCurrent(c, now) && c.value.Negative {
 			s.metrics.fallbacks.WithLabelValues("negative").Inc()
 			return snapshotWithProbeStatus(response.Replay(c.value, now), query_context.ProbeUnknown), "negative", nil
 		}
@@ -688,7 +695,7 @@ func (s *Selector) selectResponse(states []*candidateState, probes map[netip.Add
 	q := qCtx.QQuestion()
 	if q.Qclass != dns.ClassINET || (q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA) {
 		for _, c := range states {
-			if c != nil {
+			if candidateCurrent(c, now) {
 				return snapshotWithProbeStatus(response.Replay(c.value, now), query_context.ProbeUnknown), "passthrough", nil
 			}
 		}

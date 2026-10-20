@@ -188,7 +188,10 @@ func (p *Record) Exec(ctx context.Context, qCtx *query_context.Context) error {
 					eligible[index] = true
 					ipBounds[index] = result.ip
 				}
-				if result.target == synthesisTarget {
+				// An explicit main alias must not borrow IP authorization from a
+				// different A endpoint. With no main alias, retain original-name
+				// routing, including ordinary CNAMEs in the complete A source.
+				if result.target == synthesisTarget && (candidate.ChainKey == "" || result.ip.terminal == candidate.Terminal) {
 					synthesis = result.ip
 				}
 			}

@@ -101,6 +101,105 @@ func answerIPs(q *query_context.Context) []string {
 }
 func floatptr(f float64) *float64 { return &f }
 
+func TestExpiredNODATAChainDoesNotWinNegativeSelection(t *testing.T) {
+	for _, freshNegative := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fresh_negative=%v", freshNegative), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				sources := []Source{{Tag: "expired", Exec: sequence.ExecutableFunc(func(_ context.Context, q *query_context.Context) error {
+					r := new(dns.Msg).SetReply(q.Q())
+					r.Answer = []dns.RR{&dns.CNAME{Hdr: dns.RR_Header{Name: q.QQuestion().Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 1}, Target: "leaf.test."}}
+					q.SetResponse(r)
+					snapshot := q.SnapshotResponse()
+					snapshot.ReceivedAt = time.Now().Add(-2 * time.Second)
+					q.CommitResponse(snapshot)
+					return nil
+				})}}
+				if freshNegative {
+					sources = append(sources, Source{Tag: "fresh", Exec: sequence.ExecutableFunc(func(_ context.Context, q *query_context.Context) error {
+						r := new(dns.Msg).SetReply(q.Q())
+						r.Rcode = dns.RcodeNameError
+						q.SetResponse(r)
+						return nil
+					})})
+				}
+				s := testSelector(t, Args{Mode: ModeWaitAll}, sources, Options{})
+				q := queryContext(false)
+				err := s.Exec(context.Background(), q)
+				if !freshNegative {
+					if !errors.Is(err, ErrNoCandidates) || q.R() != nil {
+						t.Fatalf("expired NODATA was returned: response=%v err=%v", q.R(), err)
+					}
+				} else if err != nil || q.R() == nil || q.R().Rcode != dns.RcodeNameError || len(q.R().Answer) != 0 {
+					t.Fatalf("expired source hid the fresh negative: response=%v err=%v", q.R(), err)
+				}
+			})
+		})
+	}
+}
+
+func TestExpiredPassthroughSourceDoesNotStopOtherSources(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		makeSource := func(tag string, delay time.Duration, priority uint16, expired bool) Source {
+			return Source{Tag: tag, Exec: sequence.ExecutableFunc(func(ctx context.Context, q *query_context.Context) error {
+				if !waitDelay(ctx, delay) {
+					return context.Cause(ctx)
+				}
+				r := new(dns.Msg).SetReply(q.Q())
+				r.Answer = []dns.RR{&dns.HTTPS{SVCB: dns.SVCB{Hdr: dns.RR_Header{Name: q.QQuestion().Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 60}, Priority: priority, Target: "."}}}
+				q.SetResponse(r)
+				if expired {
+					snapshot := q.SnapshotResponse()
+					snapshot.ValidUntil = time.Now().Add(-time.Second)
+					q.CommitResponse(snapshot)
+				}
+				return nil
+			})}
+		}
+		s := testSelector(t, Args{Mode: ModeWaitAll}, []Source{makeSource("expired", 0, 1, true), makeSource("fresh", 20*time.Millisecond, 2, false)}, Options{})
+		q := queryContext(false)
+		q.Q().Question[0].Qtype = dns.TypeHTTPS
+		start := time.Now()
+		if err := s.Exec(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+		if len(q.R().Answer) != 1 || q.R().Answer[0].(*dns.HTTPS).Priority != 2 || time.Since(start) != 20*time.Millisecond {
+			t.Fatalf("expired passthrough ended selection early: response=%v elapsed=%v", q.R(), time.Since(start))
+		}
+	})
+}
+
+func TestExpiredAddressesReleaseCandidateBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		oldIPs := make([]string, maxUniqueIPs)
+		for i := range oldIPs {
+			oldIPs[i] = fmt.Sprintf("192.0.2.%d", i+1)
+		}
+		old := delayedSource("old", 0, oldIPs...)
+		base := old.Exec
+		old.Exec = sequence.ExecutableFunc(func(ctx context.Context, q *query_context.Context) error {
+			if err := base.Exec(ctx, q); err != nil {
+				return err
+			}
+			for _, rr := range q.R().Answer {
+				rr.Header().Ttl = 1
+			}
+			return nil
+		})
+		var calls atomic.Int64
+		s := testSelector(t, Args{Mode: ModeWaitAll}, []Source{old, delayedSource("fresh", 1100*time.Millisecond, "198.51.100.1")}, Options{Probe: fakeProbe(time.Millisecond, nil, &calls)})
+		q := queryContext(false)
+		if err := s.Exec(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(answerIPs(q), []string{"198.51.100.1"}) || q.SnapshotResponse().ProbeStatus != query_context.ProbeUnmeasured {
+			t.Fatalf("expired addresses occupied the candidate budget: %v", q.R())
+		}
+		if calls.Load() != maxUniqueIPs {
+			t.Fatalf("probe budget changed: %d", calls.Load())
+		}
+	})
+}
+
 func TestStreamingOverlapsDNSAndProbe(t *testing.T) {
 	for _, mode := range []string{ModeBounded, ModeWaitAll} {
 		t.Run(mode, func(t *testing.T) {
