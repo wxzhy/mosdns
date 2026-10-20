@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math/rand"
 	"net"
 	"runtime"
@@ -247,4 +248,42 @@ func Test_dnsConn_exchange_race(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+type recordingConn struct {
+	writes [][]byte
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *recordingConn) Read([]byte) (int, error) { <-c.closed; return 0, io.EOF }
+func (c *recordingConn) Write(b []byte) (int, error) {
+	c.writes = append(c.writes, bytes.Clone(b))
+	return len(b), nil
+}
+func (c *recordingConn) Close() error                   { c.once.Do(func() { close(c.closed) }); return nil }
+func (*recordingConn) SetDeadline(time.Time) error      { return nil }
+func (*recordingConn) SetReadDeadline(time.Time) error  { return nil }
+func (*recordingConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestTraditionalRepeatOnlyUDP(t *testing.T) {
+	for _, tcp := range []bool{false, true} {
+		q := make([]byte, 12)
+		conn := &recordingConn{closed: make(chan struct{})}
+		dc := NewDnsConn(TraditionalDnsConnOpts{WithLengthHeader: tcp, Repeat: 2}, conn)
+		if err := dc.writeQuery(q, 42); err != nil {
+			t.Fatal(err)
+		}
+		dc.Close()
+		want := 3
+		if tcp {
+			want = 1
+		}
+		if len(conn.writes) != want {
+			t.Fatalf("tcp=%v wrote %d copies, want %d", tcp, len(conn.writes), want)
+		}
+		if !bytes.Equal(q, make([]byte, 12)) {
+			t.Fatal("query modified")
+		}
+	}
 }

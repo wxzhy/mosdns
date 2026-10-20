@@ -21,7 +21,9 @@ package transport
 
 import (
 	"errors"
+	"io"
 	"net"
+	"sync"
 )
 
 var errPartialOOBPrefix = errors.New("tcp trick: partial out-of-band prefix was sent, the dns frame is corrupted")
@@ -36,6 +38,7 @@ var errPartialOOBPrefix = errors.New("tcp trick: partial out-of-band prefix was 
 // failed without sending anything, the whole frame is sent normally.
 type TcpTrickConn struct {
 	net.Conn
+	writeMu sync.Mutex
 }
 
 var _ net.Conn = (*TcpTrickConn)(nil)
@@ -46,6 +49,8 @@ func NewTcpTrickConn(c net.Conn) net.Conn {
 }
 
 func (c *TcpTrickConn) Write(b []byte) (n int, err error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if len(b) <= 32 {
 		return c.Conn.Write(b)
 	}
@@ -57,18 +62,19 @@ func (c *TcpTrickConn) Write(b []byte) (n int, err error) {
 	prefix := make([]byte, 17)
 	copy(prefix, b[:16])
 	sent, err := sendOOB(c.Conn, prefix)
-	if err != nil || sent == 0 {
+	if sent == 0 {
 		// Best effort. Nothing was sent, fall back to the normal send.
 		return c.Conn.Write(b)
 	}
-	if sent != len(prefix) {
+	if sent != len(prefix) || err != nil {
 		// A partial prefix is already in the stream. Sending the frame
 		// again would corrupt the length prefixed stream. Let this
 		// exchange fail. The caller should drop this connection.
 		return 0, errPartialOOBPrefix
 	}
-	if _, err := c.Conn.Write(b[16:]); err != nil {
-		return 0, err
+	sent, err = c.Conn.Write(b[16:])
+	if err == nil && sent != len(b)-16 {
+		err = io.ErrShortWrite
 	}
-	return len(b), nil
+	return 16 + sent, err
 }

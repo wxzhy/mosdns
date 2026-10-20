@@ -49,7 +49,7 @@ func sendOOB(c net.Conn, b []byte) (n int, err error) {
 	var serr error
 	if err := rc.Control(func(fd uintptr) {
 		ret, _, e := wsaSendProc.Call(fd, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), msgOOB)
-		if ret == ^uintptr(0) { // SOCKET_ERROR
+		if int32(ret) == -1 { // SOCKET_ERROR is a 32-bit int, even on amd64.
 			serr = e
 			n = 0
 		} else {

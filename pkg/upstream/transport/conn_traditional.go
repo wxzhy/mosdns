@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,6 +104,9 @@ func NewDnsConn(opt TraditionalDnsConnOpts, conn NetConn) *TraditionalDnsConn {
 		queue:           make(map[uint32]chan *[]byte),
 	}
 	if dc.repeat < 0 {
+		dc.repeat = 0
+	}
+	if dc.isTcp {
 		dc.repeat = 0
 	}
 	setDefaultGZ(&dc.idleTimeout, opt.IdleTimeout, defaultIdleTimeout)
@@ -189,13 +193,19 @@ func (dc *TraditionalDnsConn) writeQuery(q []byte, assignedQid uint16) error {
 	// Send additional copies to improve the reliability against packet loss.
 	// Only for udp.
 	for i := 0; i < dc.repeat; i++ {
-		if _, err := dc.c.Write(*payload); err != nil {
+		if n, err := dc.c.Write(*payload); err != nil || n != len(*payload) {
 			pool.ReleaseBuf(payload)
+			if err == nil {
+				err = io.ErrShortWrite
+			}
 			return err
 		}
 	}
 
-	_, err := dc.c.Write(*payload)
+	n, err := dc.c.Write(*payload)
+	if err == nil && n != len(*payload) {
+		err = io.ErrShortWrite
+	}
 	pool.ReleaseBuf(payload)
 	return err
 }
