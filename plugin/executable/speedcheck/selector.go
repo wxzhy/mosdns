@@ -640,13 +640,19 @@ func (s *Selector) selectResponse(states []*candidateState, probes map[netip.Add
 		best := ranked[0]
 		anchor := best.candidate.value
 		kind := "weighted"
+		status := query_context.ProbeUnmeasured
 		if best.valid {
 			kind = "rtt"
+			status = query_context.ProbeSucceeded
 		} else {
-			s.metrics.fallbacks.WithLabelValues(weightedReason(ranked)).Inc()
+			reason := weightedReason(ranked)
+			s.metrics.fallbacks.WithLabelValues(reason).Inc()
+			if reason == "all_probes_failed" {
+				status = query_context.ProbeFailed
+			}
 		}
 		if (qCtx.ClientOpt() != nil && qCtx.ClientOpt().Do()) || !anchor.Rewritable {
-			return response.Replay(anchor, now), kind, nil
+			return snapshotWithProbeStatus(response.Replay(anchor, now), status), kind, nil
 		}
 		selected := make([]response.SelectedAddress, 0, s.args.MaxNum)
 		seen := make(map[netip.Addr]bool)
@@ -666,16 +672,16 @@ func (s *Selector) selectResponse(states []*candidateState, probes map[netip.Add
 		if len(selected) > 0 {
 			snapshot, err := response.Rebuild(anchor, selected, now)
 			if err == nil {
-				return snapshot, kind, nil
+				return snapshotWithProbeStatus(snapshot, status), kind, nil
 			}
 			return query_context.ResponseSnapshot{}, "error", fmt.Errorf("speedcheck: rebuild: %w", err)
 		}
-		return response.Replay(anchor, now), kind, nil
+		return snapshotWithProbeStatus(response.Replay(anchor, now), status), kind, nil
 	}
 	for _, c := range states {
 		if c != nil && c.value.Negative {
 			s.metrics.fallbacks.WithLabelValues("negative").Inc()
-			return response.Replay(c.value, now), "negative", nil
+			return snapshotWithProbeStatus(response.Replay(c.value, now), query_context.ProbeUnknown), "negative", nil
 		}
 	}
 	// Non-address queries remain whole messages; no synthetic response is made.
@@ -683,12 +689,17 @@ func (s *Selector) selectResponse(states []*candidateState, probes map[netip.Add
 	if q.Qclass != dns.ClassINET || (q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA) {
 		for _, c := range states {
 			if c != nil {
-				return response.Replay(c.value, now), "passthrough", nil
+				return snapshotWithProbeStatus(response.Replay(c.value, now), query_context.ProbeUnknown), "passthrough", nil
 			}
 		}
 	}
 	s.metrics.fallbacks.WithLabelValues("no_candidates").Inc()
 	return query_context.ResponseSnapshot{}, "error", ErrNoCandidates
+}
+
+func snapshotWithProbeStatus(snapshot query_context.ResponseSnapshot, status query_context.ProbeStatus) query_context.ResponseSnapshot {
+	snapshot.ProbeStatus = status
+	return snapshot
 }
 
 func weightedReason(ranked []rankedAddress) string {

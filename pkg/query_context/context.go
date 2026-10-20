@@ -53,6 +53,7 @@ type Context struct {
 	upstreamOpt *dns.OPT // may be nil
 	receivedAt  time.Time
 	validUntil  time.Time
+	probeStatus ProbeStatus
 
 	// lazy init.
 	kv    map[uint32]any
@@ -133,6 +134,7 @@ func (ctx *Context) ClientOpt() *dns.OPT {
 func (ctx *Context) SetResponse(m *dns.Msg) {
 	ctx.resp = m
 	ctx.validUntil = time.Time{}
+	ctx.probeStatus = ProbeUnknown
 	if m == nil {
 		ctx.upstreamOpt = nil
 		ctx.receivedAt = time.Time{}
@@ -177,6 +179,9 @@ type ResponseSnapshot struct {
 	// response selection and rewriting. It prevents a positive TTL rounded to
 	// zero from being mistaken for an original zero TTL by a later selector.
 	ValidUntil time.Time
+	// ProbeStatus describes the eligible address set evaluated by a selector.
+	// It is response state, so branch commits retain it and new responses reset it.
+	ProbeStatus ProbeStatus
 }
 
 // Clone returns an independently mutable snapshot.
@@ -194,7 +199,7 @@ func (s ResponseSnapshot) Clone() ResponseSnapshot {
 }
 
 func (ctx *Context) SnapshotResponse() ResponseSnapshot {
-	return (ResponseSnapshot{Response: ctx.resp, UpstreamOpt: ctx.upstreamOpt, RespOpt: ctx.respOpt, ReceivedAt: ctx.receivedAt, ValidUntil: ctx.validUntil}).Clone()
+	return (ResponseSnapshot{Response: ctx.resp, UpstreamOpt: ctx.upstreamOpt, RespOpt: ctx.respOpt, ReceivedAt: ctx.receivedAt, ValidUntil: ctx.validUntil, ProbeStatus: ctx.probeStatus}).Clone()
 }
 
 // ResponseReceivedAt is the time SetResponse accepted the current DNS response,
@@ -217,9 +222,11 @@ func (ctx *Context) CommitResponse(s ResponseSnapshot) {
 	ctx.resp, ctx.upstreamOpt = s.Response, s.UpstreamOpt
 	ctx.receivedAt = s.ReceivedAt
 	ctx.validUntil = s.ValidUntil
+	ctx.probeStatus = s.ProbeStatus
 	if s.Response == nil {
 		ctx.receivedAt = time.Time{}
 		ctx.validUntil = time.Time{}
+		ctx.probeStatus = ProbeUnknown
 	} else if ctx.receivedAt.IsZero() {
 		ctx.receivedAt = time.Now()
 	}
@@ -270,6 +277,7 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	d.upstreamOpt = ctx.upstreamOpt
 	d.receivedAt = ctx.receivedAt
 	d.validUntil = ctx.validUntil
+	d.probeStatus = ctx.probeStatus
 
 	d.kv = copyMap(ctx.kv)
 	d.marks = copyMap(ctx.marks)
