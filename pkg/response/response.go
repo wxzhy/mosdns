@@ -38,6 +38,7 @@ type Candidate struct {
 	chain    []chainLink
 	ecs      *ecsView
 	queryHdr dns.MsgHdr
+	queryDO  bool
 }
 
 type chainLink struct {
@@ -50,40 +51,12 @@ type chainLink struct {
 // A recorded response time takes precedence over at, which is only a fallback
 // for snapshots without timing metadata (for example, manually built snapshots).
 func Analyze(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Time) (*Candidate, error) {
-	if !snapshot.ReceivedAt.IsZero() {
-		at = snapshot.ReceivedAt
-	}
-	if query == nil || query.Response || len(query.Question) != 1 {
-		return nil, fmt.Errorf("response: expected a query with one question")
-	}
-	r := snapshot.Response
-	if r == nil || !r.Response || r.Opcode != query.Opcode || len(r.Question) != 1 {
-		return nil, fmt.Errorf("response: invalid response header or question count")
-	}
-	question := query.Question[0]
-	if !sameQuestion(question, r.Question[0]) {
-		return nil, fmt.Errorf("response: question does not match query")
-	}
-	if r.Id != query.Id {
-		return nil, fmt.Errorf("response: ID does not match query")
-	}
-	for _, rr := range r.Extra {
-		if rr.Header().Rrtype == dns.TypeOPT {
-			return nil, fmt.Errorf("response: OPT must be separated from the response")
-		}
-	}
-	view, err := analyzeECS(query.IsEdns0(), snapshot.UpstreamOpt, snapshot.RespOpt)
+	c, err := analyzeEnvelope(query, snapshot, at)
 	if err != nil {
 		return nil, err
 	}
-	c := &Candidate{
-		Snapshot: snapshot.Clone(), ReceivedAt: at, Question: question,
-		Terminal: canonical(question.Name), ViewKey: view.key(), ecs: view,
-		Negative: r.Rcode == dns.RcodeNameError,
-		queryHdr: query.MsgHdr,
-	}
-	c.Snapshot.ReceivedAt = at
-	r = c.Snapshot.Response
+	r := c.Snapshot.Response
+	question := c.Question
 	addressQuery := query.Opcode == dns.OpcodeQuery && question.Qclass == dns.ClassINET &&
 		(question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA)
 	if !addressQuery {
@@ -117,9 +90,48 @@ func Analyze(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Ti
 		c.Snapshot.ValidUntil = bounds.validUntil
 	}
 	c.Negative = len(c.Addresses) == 0
-	c.Rewritable = !c.Negative && !opaque(r)
-	if opt := query.IsEdns0(); opt != nil && opt.Do() {
-		c.Rewritable = false
+	c.Rewritable = !c.Negative && !opaque(r) && !c.queryDO
+	return c, nil
+}
+
+// analyzeEnvelope shares correlation, independent ownership and EDNS-view
+// validation between address responses and service-binding responses.
+func analyzeEnvelope(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Time) (*Candidate, error) {
+	if !snapshot.ReceivedAt.IsZero() {
+		at = snapshot.ReceivedAt
+	}
+	if query == nil || query.Response || len(query.Question) != 1 {
+		return nil, fmt.Errorf("response: expected a query with one question")
+	}
+	r := snapshot.Response
+	if r == nil || !r.Response || r.Opcode != query.Opcode || len(r.Question) != 1 {
+		return nil, fmt.Errorf("response: invalid response header or question count")
+	}
+	question := query.Question[0]
+	if !sameQuestion(question, r.Question[0]) {
+		return nil, fmt.Errorf("response: question does not match query")
+	}
+	if r.Id != query.Id {
+		return nil, fmt.Errorf("response: ID does not match query")
+	}
+	for _, rr := range r.Extra {
+		if rr.Header().Rrtype == dns.TypeOPT {
+			return nil, fmt.Errorf("response: OPT must be separated from the response")
+		}
+	}
+	view, err := analyzeECS(query.IsEdns0(), snapshot.UpstreamOpt, snapshot.RespOpt)
+	if err != nil {
+		return nil, err
+	}
+	c := &Candidate{
+		Snapshot: snapshot.Clone(), ReceivedAt: at, Question: question,
+		Terminal: canonical(question.Name), ViewKey: view.key(), ecs: view,
+		Negative: r.Rcode == dns.RcodeNameError,
+		queryHdr: query.MsgHdr,
+	}
+	c.Snapshot.ReceivedAt = at
+	if opt := query.IsEdns0(); opt != nil {
+		c.queryDO = opt.Do()
 	}
 	return c, nil
 }
@@ -283,7 +295,7 @@ func Rebuild(anchor *Candidate, selected []SelectedAddress, now time.Time) (quer
 		copyRR.Header().Name = anchor.Terminal
 		records = append(records, copyRR)
 	}
-	return rebuildRecords(anchor, records, contributors, bounds, now), nil
+	return rebuildRecords(anchor, records, contributors, bounds, now, true), nil
 }
 
 // ReplaceAddresses creates a policy response with new terminal addresses rather
@@ -299,24 +311,9 @@ func ReplaceAddresses(anchor *Candidate, ips []netip.Addr, now time.Time) (query
 		len(anchor.Addresses) == 0 || len(ips) == 0 {
 		return query_context.ResponseSnapshot{}, fmt.Errorf("response: no rewritable address replacement")
 	}
-	var records []dns.RR
-	seen := make(map[netip.Addr]bool)
-	for _, ip := range ips {
-		if !ip.IsValid() || ip.Zone() != "" ||
-			(anchor.Question.Qtype == dns.TypeA && !ip.Is4()) ||
-			(anchor.Question.Qtype == dns.TypeAAAA && !ip.Is6()) {
-			return query_context.ResponseSnapshot{}, fmt.Errorf("response: invalid replacement address %s for %s", ip, dns.TypeToString[anchor.Question.Qtype])
-		}
-		if seen[ip] {
-			continue
-		}
-		seen[ip] = true
-		hdr := dns.RR_Header{Name: anchor.Terminal, Rrtype: anchor.Question.Qtype, Class: anchor.Question.Qclass}
-		if ip.Is4() {
-			records = append(records, &dns.A{Hdr: hdr, A: ip.AsSlice()})
-		} else {
-			records = append(records, &dns.AAAA{Hdr: hdr, AAAA: ip.AsSlice()})
-		}
+	records, err := makeAddressRecords(anchor.Question, anchor.Terminal, ips)
+	if err != nil {
+		return query_context.ResponseSnapshot{}, err
 	}
 	var bounds ttlBounds
 	for _, address := range anchor.Addresses {
@@ -326,7 +323,55 @@ func ReplaceAddresses(anchor *Candidate, ips []netip.Addr, now time.Time) (query
 			bounds.includeValidity(address.ExpiresAt)
 		}
 	}
-	return rebuildRecords(anchor, records, map[*Candidate]bool{anchor: true}, bounds, now), nil
+	return rebuildRecords(anchor, records, map[*Candidate]bool{anchor: true}, bounds, now, true), nil
+}
+
+// StaticAddresses replaces an address response or fills NOERROR/NODATA with
+// configured addresses. Its explicit TTL may reset the address lease, but never
+// the alias chain needed to reach the terminal owner. With a chain, an inherited
+// lease is conservatively retained even if prior aging rounded its TTL to zero.
+func StaticAddresses(anchor *Candidate, ips []netip.Addr, ttl uint32, now time.Time) (query_context.ResponseSnapshot, error) {
+	if anchor == nil || anchor.Snapshot.Response == nil || anchor.queryDO ||
+		anchor.queryHdr.Opcode != dns.OpcodeQuery || anchor.Question.Qclass != dns.ClassINET ||
+		(anchor.Question.Qtype != dns.TypeA && anchor.Question.Qtype != dns.TypeAAAA) ||
+		anchor.Snapshot.Response.Rcode != dns.RcodeSuccess || anchor.Snapshot.Response.Truncated ||
+		opaque(anchor.Snapshot.Response) || len(ips) == 0 {
+		return query_context.ResponseSnapshot{}, fmt.Errorf("response: no safe static address response")
+	}
+	records, err := makeAddressRecords(anchor.Question, anchor.Terminal, ips)
+	if err != nil {
+		return query_context.ResponseSnapshot{}, err
+	}
+	var bounds ttlBounds
+	expiry := now.Add(time.Duration(ttl) * time.Second)
+	bounds.include(expiry, ttl)
+	if ttl > 0 {
+		bounds.includeValidity(expiry)
+	}
+	return rebuildRecords(anchor, records, map[*Candidate]bool{anchor: true}, bounds, now, len(anchor.chain) > 0), nil
+}
+
+func makeAddressRecords(question dns.Question, terminal string, ips []netip.Addr) ([]dns.RR, error) {
+	var records []dns.RR
+	seen := make(map[netip.Addr]bool)
+	for _, ip := range ips {
+		if !ip.IsValid() || ip.Zone() != "" ||
+			(question.Qtype == dns.TypeA && !ip.Is4()) ||
+			(question.Qtype == dns.TypeAAAA && !ip.Is6()) {
+			return nil, fmt.Errorf("response: invalid replacement address %s for %s", ip, dns.TypeToString[question.Qtype])
+		}
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		hdr := dns.RR_Header{Name: terminal, Rrtype: question.Qtype, Class: question.Qclass}
+		if ip.Is4() {
+			records = append(records, &dns.A{Hdr: hdr, A: ip.AsSlice()})
+		} else {
+			records = append(records, &dns.AAAA{Hdr: hdr, AAAA: ip.AsSlice()})
+		}
+	}
+	return records, nil
 }
 
 type ttlBounds struct {
@@ -355,12 +400,14 @@ func (b *ttlBounds) includeValidity(deadline time.Time) {
 // records are already independent of all candidates. Both selection and address
 // replacement use this path so aliases, authentication flags and EDNS policy
 // cannot drift between the two kinds of synthesized response.
-func rebuildRecords(anchor *Candidate, records []dns.RR, contributors map[*Candidate]bool, bounds ttlBounds, now time.Time) query_context.ResponseSnapshot {
+func rebuildRecords(anchor *Candidate, records []dns.RR, contributors map[*Candidate]bool, bounds ttlBounds, now time.Time, inheritValidity bool) query_context.ResponseSnapshot {
 	// The anchor supplies the aliases even when all selected records came from
 	// another compatible candidate.
 	contributors[anchor] = true
 	for c := range contributors {
-		bounds.includeValidity(c.Snapshot.ValidUntil)
+		if inheritValidity {
+			bounds.includeValidity(c.Snapshot.ValidUntil)
+		}
 		for _, link := range c.chain {
 			bounds.include(link.expiresAt, link.rr.Hdr.Ttl)
 			if link.expiresAt.After(c.ReceivedAt) {

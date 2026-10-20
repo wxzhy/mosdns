@@ -359,6 +359,32 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
 
 在 speedcheck 的每个来源中，放在 forward 和必需过滤之后、来源 sequence 返回之前，保证测速的是替换地址。DO=1 跳过；重建保留 CNAME 和剩余 TTL，清理 AD/AA 及失效证明记录。HTTPS/SVCB hint 与 ECS 不改写。示例使用文档地址，不应对它们运行真实探测；实际使用需换成目标 CDN 网段。
 
+### ip_fallback：无地址或测速失败后的静态 IP
+
+此插件处理当前合法 A/AAAA 响应，与主次查询链的 `fallback` 分工不同。放在 speedcheck 之后、`accept` 之前，域名/CNAME 范围继续由 sequence 的 `matches` 控制。
+
+| `args` 字段 | 默认值与行为 |
+| --- | --- |
+| `ipv4`、`ipv6` | 默认空；对应地址族的静态地址列表，按配置顺序去重；不带 CIDR。 |
+| `ttl` | 默认 `86400` 整数秒；允许 `0..4294967295`，显式 `0` 有效。 |
+| `on` | 默认 `[all_probes_failed, nodata]`；显式 `[]` 关闭。`all_probes_failed` 要求全部合格地址真实探测失败；`nodata` 为 NOERROR 无终点地址；可选 `no_rtt` 还包含已执行选择但未测量、禁测或尚未完成的情况。 |
+
+```yaml
+- tag: static_cdn_ip
+  type: ip_fallback
+  args:
+    ipv4: ["203.0.113.42"]
+    ipv6: ["2001:db8:ffff::42"]
+    ttl: 60
+    on: [all_probes_failed, nodata]
+# 在已经定义的主链中：
+# - exec: $select_fast_ip
+# - matches: ["qname domain:cdn.example"]
+#   exec: $static_cdn_ip
+```
+
+默认不把缺少测速统计或关闭测速判为失败；若明确希望禁测时也静态回退，配置 `no_rtt`。已有成功 RTT（包括 0）不触发。无响应、NXDOMAIN/SERVFAIL、截断、opaque 或 DO=1 保留，不做静态伪造。重建只输出配置地址及必要 CNAME；静态 TTL 可重设地址期限，有链时保守受其既存有效期限约束。完整说明与无公网演示见 [ip_fallback](ip-fallback.md)。
+
 ### arbitrary
 
 全部参数：`rules`（DNS zone 格式 RR 字符串列表，默认空）、`files`（zone 文本文件列表，默认空）。可生成 A/AAAA/TXT/MX 等任意资源记录；未匹配时继续。
@@ -709,7 +735,7 @@ TCP/HTTP 监听地址以 `@` 开头时，代码会选择 Unix socket；这是面
 
 - 数据：`domain_set`、`ip_set`。
 - 匹配：`client_ip`、`cname`、`env`、`has_resp`、`has_wanted_ans`、`ptr_ip`、`qclass`、`qname`、`qtype`、`random`、`rcode`、`resp_ip`、`string_exp`、`mark`，及 `_true`/`_false`。
-- 执行：`arbitrary`、`black_hole`、`cache`、`debug_print`、`drop_resp`、`dual_selector` 的 `prefer_ipv4`/`prefer_ipv6`、`ecs_handler`/`ecs`、`forward`、`forward_edns0opt`、`hosts`、`ip_replace`、`ipset`、`metrics_collector`、`nftset`、`query_summary`、`rate_limiter`（实际 matcher）、`redirect`、`reverse_lookup`、`sequence`/内置控制流、`fallback`、`sleep`、`ttl`。`speedcheck` 链接至专门参考和完整示例。
+- 执行：`arbitrary`、`black_hole`、`cache`、`debug_print`、`drop_resp`、`dual_selector` 的 `prefer_ipv4`/`prefer_ipv6`、`ecs_handler`/`ecs`、`forward`、`forward_edns0opt`、`hosts`、`ip_fallback`、`ip_replace`、`ipset`、`metrics_collector`、`nftset`、`query_summary`、`rate_limiter`（实际 matcher）、`redirect`、`reverse_lookup`、`sequence`/内置控制流、`fallback`、`sleep`、`ttl`。`speedcheck` 链接至专门参考和完整示例。
 - 服务：`http_server`、`quic_server`、`tcp_server`、`udp_server`。
 
 配置核对顺序：先检查顶层/插件字段名及依赖定义顺序，再检查单位和快速语法，最后在本机未占用端口启动并做真实查询。程序目前没有独立的“只解析、不启动插件”配置检查命令；`start` 会真实打开文件、数据库和监听 socket。不要把源码中未注册的结构字段或内部常量当成用户配置项。

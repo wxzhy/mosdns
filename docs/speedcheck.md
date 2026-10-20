@@ -106,7 +106,9 @@ bounded 在收集窗口、首正答上限、总预算、全部工作完成中最
 
 过滤以每份完整来源响应为单位：任一终点地址命中 exclude 即拒绝该来源；include 的标签和 ASN 两类为 OR，任一地址命中即保留。省略两类 include 不限范围；显式 `labels_include: []` 且没有其他 include 命中时拒绝所有正答。`probe_match` 使用同样的整份来源规则：任一地址命中其 exclude，该来源的所有地址都不启动新探测；include 命中一个地址则该来源全部地址可启动探测。未匹配来源仍是有效候选，同 IP 已由其他合格来源取得的共享 RTT 也可以复用。域名/CNAME 过滤放在来源 sequence 中。来源应返回同一个问题的响应，不能通过修改查询名称提交另一域名的答案。
 
-有有效 RTT 时优先按 `RTT_ms × multiplier` 排序，0 RTT 有效；同分按来源、原记录顺序和 IP 排序。多地址要求与最佳地址完整标签集合一致且分差不超过阈值。全部探测失败或未完成时仍可使用合格 DNS 地址，按倍率稳定排序，不受标签同组和分差限制。若所有来源错误、非法或被过滤，返回错误交外层 `fallback`；NXDOMAIN/NODATA 保留完整来源语义。静态兜底仍在外层配置。
+有有效 RTT 时优先按 `RTT_ms × multiplier` 排序，0 RTT 有效；同分按来源、原记录顺序和 IP 排序。多地址要求与最佳地址完整标签集合一致且分差不超过阈值。全部探测失败或未完成时仍可使用合格 DNS 地址，按倍率稳定排序，不受标签同组和分差限制。若所有来源错误、非法或被过滤，返回错误交外层 `fallback`；NXDOMAIN/NODATA 保留完整来源语义。
+
+若需将测速失败结果改为静态 IP，在选择器之后、`accept` 之前显式调用 [`ip_fallback`](ip-fallback.md)。它默认只处理全部真实探测失败或 NOERROR/NODATA，不把关闭测速、队列不足或未完成当作失败；`on: [no_rtt, nodata]` 可额外选择在没有成功 RTT 时回退。无响应/来源错误继续使用已有外层 `fallback` 执行链；DNSSEC DO=1 跳过静态重建。可直接运行的无公网、无主动测速示例见 [ip-fallback.yaml](../examples/ip-fallback.yaml)。
 
 ## 来源过滤、fallback、监听和缓存的接线
 

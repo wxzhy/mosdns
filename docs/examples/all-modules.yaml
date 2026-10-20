@@ -53,6 +53,14 @@ plugins:
           ipv6: ["2001:db8:100::99"]
           # 基址按prefix掩码规范化。目标是文档地址，下面no_probe禁止探测。
           # 正式使用需替换为实际CDN网段；不带CIDR，prefix由上面字段指定。
+  # 在speedcheck后用sequence matches限制适用域名，再调用本模块。
+  - tag: fallback_cdn_ip
+    type: ip_fallback
+    args:
+      ipv4: ["203.0.113.42", "198.51.100.42"]
+      ipv6: ["2001:db8:ffff::42"]
+      ttl: 86400                         # 整数秒0..4294967295，0不缓存
+      on: [all_probes_failed, nodata]     # 默认；[]关闭；no_rtt另含未测量
   - tag: hosts_local
     type: hosts
     args:

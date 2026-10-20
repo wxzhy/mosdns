@@ -1,0 +1,71 @@
+# Local-only demonstration: all DNS answers come from hosts below.
+# No external resolver, database, ping, TCP probe, or response cache is used.
+# Run from the repository directory: mosdns start -c examples/ip-fallback.yaml
+log:
+  level: info
+  production: false
+include: []
+api:
+  http: "127.0.0.1:19091"
+plugins:
+  - tag: demo_hosts
+    type: hosts
+    args:
+      entries:
+        - "no-rtt.ip-fallback.invalid 192.0.2.1 2001:db8:1::1"
+        # An AAAA query for this entry produces valid NOERROR/NODATA.
+        - "nodata.ip-fallback.invalid 192.0.2.2"
+      files: []
+
+  - tag: local_source
+    type: sequence
+    args:
+      - exec: $demo_hosts
+
+  - tag: select_local
+    type: speedcheck
+    args:
+      sources: [local_source]
+      mode: wait_all
+      total_timeout: 5s
+      probe:
+        tcp_ports: []              # Explicitly disable TCP and ICMP probes.
+        icmp: false
+        timeout: 300ms
+      max_num: 1
+
+  - tag: static_fallback
+    type: ip_fallback
+    args:
+      ipv4: ["203.0.113.42", "198.51.100.42"]
+      ipv6: ["2001:db8:ffff::42"]
+      ttl: 60                     # Default 86400; explicit 0 is supported.
+      # Default: [all_probes_failed, nodata]. Disabled probes are unmeasured,
+      # so this example explicitly opts into no_rtt as well as NODATA.
+      on: [no_rtt, nodata]
+
+  - tag: main
+    type: sequence
+    args:
+      - exec: $select_local
+      - exec: $static_fallback
+      - matches: [has_resp]
+        exec: accept
+
+  - tag: udp_listener
+    type: udp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+  - tag: tcp_listener
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+      idle_timeout: 10
+
+# Queries to demonstrate (documentation addresses only):
+# nslookup -port=15353 -type=A no-rtt.ip-fallback.invalid 127.0.0.1
+# nslookup -port=15353 -type=AAAA no-rtt.ip-fallback.invalid 127.0.0.1
+# nslookup -port=15353 -type=AAAA nodata.ip-fallback.invalid 127.0.0.1
+# Other names have no local entry and no configured external upstream.
