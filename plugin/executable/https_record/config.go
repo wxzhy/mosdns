@@ -6,14 +6,13 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/lru"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
-	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/domain_set"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
@@ -55,14 +54,13 @@ type Record struct {
 	ipMatch, ipExclude                     netlist.Matcher
 	includeConfigured, ipGate              bool
 
-	life       context.Context
-	cancel     context.CancelFunc
-	mu         sync.Mutex
-	closed     bool
-	active     sync.WaitGroup
-	cache      map[echCacheKey]echCacheEntry
-	cacheOrder uint64
-	now        func() time.Time
+	life   context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	closed bool
+	active sync.WaitGroup
+	cache  *lru.LRU[echCacheKey, echCacheEntry]
+	now    func() time.Time
 }
 
 var _ sequence.Executable = (*Record)(nil)
@@ -85,7 +83,7 @@ func New(bp *coremain.BP, args *Args) (*Record, error) {
 		matchName:         args.MatchName != nil,
 		includeConfigured: args.MatchIP != nil,
 		ipGate:            args.MatchIP != nil || len(args.ExcludeIP) > 0,
-		cache:             make(map[echCacheKey]echCacheEntry), now: time.Now,
+		cache:             lru.NewLRU[echCacheKey, echCacheEntry](maxECHCacheEntries, nil), now: time.Now,
 	}
 	if p.echDomain == "" {
 		p.echDomain = "crypto.cloudflare.com"
@@ -106,13 +104,13 @@ func New(bp *coremain.BP, args *Args) (*Record, error) {
 		}
 	}
 	var err error
-	if p.nameMatch, err = compileDomains(bp, args.MatchName); err != nil {
+	if p.nameMatch, err = domain_set.CompileExpressions(bp, args.MatchName); err != nil {
 		return nil, fmt.Errorf("https_record: match_name: %w", err)
 	}
-	if p.ipMatch, err = compileIPs(bp, args.MatchIP); err != nil {
+	if p.ipMatch, err = ip_set.CompileExpressions(bp, args.MatchIP); err != nil {
 		return nil, fmt.Errorf("https_record: match_ip: %w", err)
 	}
-	if p.ipExclude, err = compileIPs(bp, args.ExcludeIP); err != nil {
+	if p.ipExclude, err = ip_set.CompileExpressions(bp, args.ExcludeIP); err != nil {
 		return nil, fmt.Errorf("https_record: exclude_ip: %w", err)
 	}
 	if p.addECH {
@@ -140,82 +138,6 @@ func source(bp *coremain.BP, tag string) (sequence.Executable, error) {
 		return nil, fmt.Errorf("%q is not an executable", tag)
 	}
 	return s, nil
-}
-
-func compileDomains(bp *coremain.BP, expressions []string) (domain.Matcher[struct{}], error) {
-	l := domain_set.NewMixLoader()
-	var group domain_set.MatcherGroup
-	for i, exp := range expressions {
-		exp = strings.TrimSpace(exp)
-		if exp == "" {
-			return nil, fmt.Errorf("empty expression #%d", i)
-		}
-		switch exp[0] {
-		case '$':
-			if bp == nil {
-				return nil, fmt.Errorf("cannot resolve domain set %q", exp)
-			}
-			provider, ok := bp.M().GetPlugin(exp[1:]).(data_provider.DomainMatcherProvider)
-			if !ok {
-				return nil, fmt.Errorf("%q is not a DomainMatcherProvider", exp)
-			}
-			m := provider.GetDomainMatcher()
-			if m == nil {
-				return nil, fmt.Errorf("%q returned a nil domain matcher", exp)
-			}
-			group = append(group, m)
-		case '&':
-			if exp[1:] == "" {
-				return nil, fmt.Errorf("empty file expression")
-			}
-			if err := l.LoadFiles([]string{exp[1:]}); err != nil {
-				return nil, err
-			}
-		default:
-			if err := l.LoadExps([]string{exp}); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return append(group, l.Matchers()...), nil
-}
-
-func compileIPs(bp *coremain.BP, expressions []string) (netlist.Matcher, error) {
-	l := ip_set.NewListLoader()
-	var group ip_set.MatcherGroup
-	for i, exp := range expressions {
-		exp = strings.TrimSpace(exp)
-		if exp == "" {
-			return nil, fmt.Errorf("empty expression #%d", i)
-		}
-		switch exp[0] {
-		case '$':
-			if bp == nil {
-				return nil, fmt.Errorf("cannot resolve IP set %q", exp)
-			}
-			provider, ok := bp.M().GetPlugin(exp[1:]).(data_provider.IPMatcherProvider)
-			if !ok {
-				return nil, fmt.Errorf("%q is not an IPMatcherProvider", exp)
-			}
-			m := provider.GetIPMatcher()
-			if m == nil {
-				return nil, fmt.Errorf("%q returned a nil IP matcher", exp)
-			}
-			group = append(group, m)
-		case '&':
-			if exp[1:] == "" {
-				return nil, fmt.Errorf("empty file expression")
-			}
-			if err := l.LoadFromFiles([]string{exp[1:]}); err != nil {
-				return nil, err
-			}
-		default:
-			if err := l.LoadFromIPs([]string{exp}); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return append(group, l.Matchers()...), nil
 }
 
 // allowedIPs applies a policy to one complete ServiceMode record or A result.
@@ -250,7 +172,7 @@ func (p *Record) Close() error {
 	p.mu.Unlock()
 	p.active.Wait()
 	p.mu.Lock()
-	clear(p.cache)
+	p.cache.Flush()
 	p.mu.Unlock()
 	return nil
 }

@@ -5,10 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net/netip"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +17,6 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/pkg/speedtest"
-	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/prometheus/client_golang/prometheus"
@@ -123,27 +122,10 @@ func compileLabels(bp *coremain.BP, labels map[string][]string) (map[string]netl
 		if strings.TrimSpace(name) == "" {
 			return nil, errors.New("speedcheck: label name is empty")
 		}
-		loader := ip_set.NewListLoader()
-		var group ip_set.MatcherGroup
-		for _, exp := range expressions {
-			switch {
-			case strings.HasPrefix(exp, "$"):
-				p, _ := bp.M().GetPlugin(strings.TrimPrefix(exp, "$")).(data_provider.IPMatcherProvider)
-				if p == nil {
-					return nil, fmt.Errorf("speedcheck: label %q: missing IPMatcherProvider %q", name, exp)
-				}
-				group = append(group, p.GetIPMatcher())
-			case strings.HasPrefix(exp, "&"):
-				if err := loader.LoadFromFiles([]string{strings.TrimPrefix(exp, "&")}); err != nil {
-					return nil, fmt.Errorf("speedcheck: label %q: %w", name, err)
-				}
-			default:
-				if err := loader.LoadFromIPs([]string{exp}); err != nil {
-					return nil, fmt.Errorf("speedcheck: label %q: %w", name, err)
-				}
-			}
+		group, err := ip_set.CompileExpressions(bp, expressions)
+		if err != nil {
+			return nil, fmt.Errorf("speedcheck: label %q: %w", name, err)
 		}
-		group = append(group, loader.Matchers()...)
 		result[name] = group
 	}
 	return result, nil
@@ -224,19 +206,12 @@ func normalize(a Args) (Args, error) {
 	a.Probe.TCPPorts = slices.Compact(a.Probe.TCPPorts)
 	a.Sources = slices.Clone(a.Sources)
 	a.TagMultipliers = slices.Clone(a.TagMultipliers)
-	a.ASNMultipliers = cloneMultipliers(a.ASNMultipliers)
+	a.ASNMultipliers = maps.Clone(a.ASNMultipliers)
 	a.CandidateFilter = cloneFilter(a.CandidateFilter)
 	a.ProbeMatch = cloneFilter(a.ProbeMatch)
 	return a, nil
 }
 
-func cloneMultipliers(in map[uint32]float64) map[uint32]float64 {
-	r := make(map[uint32]float64, len(in))
-	for k, v := range in {
-		r[k] = v
-	}
-	return r
-}
 func cloneFilter(in *IPFilter) *IPFilter {
 	if in == nil {
 		return nil
@@ -286,7 +261,7 @@ func (s *Selector) validateMatchers() error {
 	for label := range s.labels {
 		s.labelNames = append(s.labelNames, label)
 	}
-	sort.Strings(s.labelNames)
+	slices.Sort(s.labelNames)
 	return nil
 }
 

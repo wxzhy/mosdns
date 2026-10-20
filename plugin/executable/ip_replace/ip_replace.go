@@ -6,14 +6,12 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/response"
-	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
@@ -79,10 +77,10 @@ func compileRule(bp *coremain.BP, rule Rule) (compiledRule, error) {
 		return out, fmt.Errorf("match_ip must not be empty")
 	}
 	var err error
-	if out.match, err = compileMatcher(bp, rule.MatchIP); err != nil {
+	if out.match, err = ip_set.CompileExpressions(bp, rule.MatchIP); err != nil {
 		return out, fmt.Errorf("match_ip: %w", err)
 	}
-	if out.exclude, err = compileMatcher(bp, rule.ExcludeIP); err != nil {
+	if out.exclude, err = ip_set.CompileExpressions(bp, rule.ExcludeIP); err != nil {
 		return out, fmt.Errorf("exclude_ip: %w", err)
 	}
 	if out.prefix4, err = prefixLength(rule.IPv4PrefixLen, 32); err != nil {
@@ -98,45 +96,6 @@ func compileRule(bp *coremain.BP, rule Rule) (compiledRule, error) {
 		return out, fmt.Errorf("ipv6: %w", err)
 	}
 	return out, nil
-}
-
-func compileMatcher(bp *coremain.BP, expressions []string) (netlist.Matcher, error) {
-	loader := ip_set.NewListLoader()
-	var group ip_set.MatcherGroup
-	for i, expression := range expressions {
-		expression = strings.TrimSpace(expression)
-		if expression == "" {
-			return nil, fmt.Errorf("empty expression #%d", i)
-		}
-		switch expression[0] {
-		case '$':
-			tag := expression[1:]
-			if tag == "" || bp == nil {
-				return nil, fmt.Errorf("cannot resolve IPMatcherProvider %q without a plugin context and tag", expression)
-			}
-			provider, ok := bp.M().GetPlugin(tag).(data_provider.IPMatcherProvider)
-			if !ok {
-				return nil, fmt.Errorf("%q is not an IPMatcherProvider", tag)
-			}
-			matcher := provider.GetIPMatcher()
-			if matcher == nil {
-				return nil, fmt.Errorf("%q returned a nil IP matcher", tag)
-			}
-			group = append(group, matcher)
-		case '&':
-			if expression[1:] == "" {
-				return nil, fmt.Errorf("empty file expression #%d", i)
-			}
-			if err := loader.LoadFromFiles([]string{expression[1:]}); err != nil {
-				return nil, err
-			}
-		default:
-			if err := loader.LoadFromIPs([]string{expression}); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return append(group, loader.Matchers()...), nil
 }
 
 func prefixLength(value *int, bits int) (int, error) {

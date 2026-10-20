@@ -1,0 +1,459 @@
+{
+  "date": "2026-10-20",
+  "go_version": "go version go1.27.2 windows/amd64",
+  "goos": "windows",
+  "goarch": "amd64",
+  "cpu": "AMD Ryzen 7 H 255 w/ Radeon 780M Graphics",
+  "gomaxprocs": 4,
+  "baseline_commit": "33ba1fe",
+  "optimized_variant": "this change on codex/simplify-response-pipeline",
+  "benchmark_file_sha256": "8b9d951e4a26a42beb097324332ea6cb4606b5f39a2f5135f100882837b73132",
+  "benchtime": "500ms",
+  "pairs": 5,
+  "order": "baseline-first on odd pairs, optimized-first on even pairs",
+  "network_probes": false,
+  "summaries": [
+    {
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "baseline_ns_per_op": 17990.0,
+      "optimized_ns_per_op": 16249.0,
+      "time_change_percent": -9.68,
+      "baseline_bytes_per_op": 26040.0,
+      "optimized_bytes_per_op": 21808.0,
+      "baseline_allocs_per_op": 30.0,
+      "optimized_allocs_per_op": 26.0
+    },
+    {
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "baseline_ns_per_op": 73442.0,
+      "optimized_ns_per_op": 50023.0,
+      "time_change_percent": -31.89,
+      "baseline_bytes_per_op": 89520.0,
+      "optimized_bytes_per_op": 21808.0,
+      "baseline_allocs_per_op": 90.0,
+      "optimized_allocs_per_op": 26.0
+    },
+    {
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "baseline_ns_per_op": 29849.0,
+      "optimized_ns_per_op": 23285.0,
+      "time_change_percent": -21.99,
+      "baseline_bytes_per_op": 38736.0,
+      "optimized_bytes_per_op": 21808.0,
+      "baseline_allocs_per_op": 42.0,
+      "optimized_allocs_per_op": 26.0
+    },
+    {
+      "benchmark": "BenchmarkSelectorOverhead",
+      "baseline_ns_per_op": 17175.0,
+      "optimized_ns_per_op": 17023.0,
+      "time_change_percent": -0.89,
+      "baseline_bytes_per_op": 24636.0,
+      "optimized_bytes_per_op": 23932.0,
+      "baseline_allocs_per_op": 131.0,
+      "optimized_allocs_per_op": 118.0
+    }
+  ],
+  "samples": [
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 34464,
+      "ns_per_op": 17175.0,
+      "bytes_per_op": 24636.0,
+      "allocs_per_op": 131.0,
+      "cpu_ms_per_op": 0.02494
+    },
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 34168,
+      "ns_per_op": 18568.0,
+      "bytes_per_op": 26040.0,
+      "allocs_per_op": 30.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 18832,
+      "ns_per_op": 30425.0,
+      "bytes_per_op": 38736.0,
+      "allocs_per_op": 42.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 8785,
+      "ns_per_op": 73442.0,
+      "bytes_per_op": 89520.0,
+      "allocs_per_op": 90.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 1,
+      "variant": "optimized",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 34174,
+      "ns_per_op": 17148.0,
+      "bytes_per_op": 23932.0,
+      "allocs_per_op": 118.0,
+      "cpu_ms_per_op": 0.0224
+    },
+    {
+      "pair": 1,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 35698,
+      "ns_per_op": 16768.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 1,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 24606,
+      "ns_per_op": 23195.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 1,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 10000,
+      "ns_per_op": 50049.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 2,
+      "variant": "optimized",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 36722,
+      "ns_per_op": 17023.0,
+      "bytes_per_op": 23932.0,
+      "allocs_per_op": 118.0,
+      "cpu_ms_per_op": 0.0234
+    },
+    {
+      "pair": 2,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 39844,
+      "ns_per_op": 15729.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 2,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 26454,
+      "ns_per_op": 22963.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 2,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 12304,
+      "ns_per_op": 49164.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 33864,
+      "ns_per_op": 16941.0,
+      "bytes_per_op": 24636.0,
+      "allocs_per_op": 131.0,
+      "cpu_ms_per_op": 0.02861
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 34798,
+      "ns_per_op": 16688.0,
+      "bytes_per_op": 26040.0,
+      "allocs_per_op": 30.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 21781,
+      "ns_per_op": 28004.0,
+      "bytes_per_op": 38736.0,
+      "allocs_per_op": 42.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 8272,
+      "ns_per_op": 73989.0,
+      "bytes_per_op": 89520.0,
+      "allocs_per_op": 90.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 33831,
+      "ns_per_op": 17237.0,
+      "bytes_per_op": 24636.0,
+      "allocs_per_op": 131.0,
+      "cpu_ms_per_op": 0.02679
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 34102,
+      "ns_per_op": 17399.0,
+      "bytes_per_op": 26040.0,
+      "allocs_per_op": 30.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 21123,
+      "ns_per_op": 29024.0,
+      "bytes_per_op": 38736.0,
+      "allocs_per_op": 42.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 9298,
+      "ns_per_op": 72212.0,
+      "bytes_per_op": 89520.0,
+      "allocs_per_op": 90.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 3,
+      "variant": "optimized",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 35066,
+      "ns_per_op": 16751.0,
+      "bytes_per_op": 23932.0,
+      "allocs_per_op": 118.0,
+      "cpu_ms_per_op": 0.02629
+    },
+    {
+      "pair": 3,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 35948,
+      "ns_per_op": 16249.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 3,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 24864,
+      "ns_per_op": 24016.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 3,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 12049,
+      "ns_per_op": 49749.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 4,
+      "variant": "optimized",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 35000,
+      "ns_per_op": 16644.0,
+      "bytes_per_op": 23932.0,
+      "allocs_per_op": 118.0,
+      "cpu_ms_per_op": 0.02411
+    },
+    {
+      "pair": 4,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 34851,
+      "ns_per_op": 16107.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 4,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 27392,
+      "ns_per_op": 23285.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 4,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 10000,
+      "ns_per_op": 51181.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 4,
+      "variant": "baseline",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 34885,
+      "ns_per_op": 16973.0,
+      "bytes_per_op": 24636.0,
+      "allocs_per_op": 131.0,
+      "cpu_ms_per_op": 0.02419
+    },
+    {
+      "pair": 4,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 35452,
+      "ns_per_op": 17990.0,
+      "bytes_per_op": 26040.0,
+      "allocs_per_op": 30.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 4,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 19899,
+      "ns_per_op": 29849.0,
+      "bytes_per_op": 38736.0,
+      "allocs_per_op": 42.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 4,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 8937,
+      "ns_per_op": 72619.0,
+      "bytes_per_op": 89520.0,
+      "allocs_per_op": 90.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 5,
+      "variant": "baseline",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 34214,
+      "ns_per_op": 18308.0,
+      "bytes_per_op": 24636.0,
+      "allocs_per_op": 131.0,
+      "cpu_ms_per_op": 0.02557
+    },
+    {
+      "pair": 5,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 34652,
+      "ns_per_op": 18640.0,
+      "bytes_per_op": 26040.0,
+      "allocs_per_op": 30.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 5,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 19176,
+      "ns_per_op": 30727.0,
+      "bytes_per_op": 38736.0,
+      "allocs_per_op": 42.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 5,
+      "variant": "baseline",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 7408,
+      "ns_per_op": 75791.0,
+      "bytes_per_op": 89520.0,
+      "allocs_per_op": 90.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 5,
+      "variant": "optimized",
+      "benchmark": "BenchmarkSelectorOverhead",
+      "iterations": 34274,
+      "ns_per_op": 17185.0,
+      "bytes_per_op": 23932.0,
+      "allocs_per_op": 118.0,
+      "cpu_ms_per_op": 0.02462
+    },
+    {
+      "pair": 5,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_1",
+      "iterations": 36087,
+      "ns_per_op": 16320.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 5,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_4",
+      "iterations": 25030,
+      "ns_per_op": 24029.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    },
+    {
+      "pair": 5,
+      "variant": "optimized",
+      "benchmark": "BenchmarkRefreshProbes64IPs/sources_16",
+      "iterations": 10000,
+      "ns_per_op": 50023.0,
+      "bytes_per_op": 21808.0,
+      "allocs_per_op": 26.0,
+      "cpu_ms_per_op": null
+    }
+  ]
+}

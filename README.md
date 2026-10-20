@@ -17,3 +17,5 @@ CDN 地址前缀替换：[ip_replace 参数与行为](docs/ip-replace.md) · [�
 HTTPS/SVCB 响应处理：[ECH、hint 与 ALPN](docs/https-record.md) · [离线完整示例](examples/https-record.yaml) · [SmartDNS 响应功能迁移对照](docs/response-migration.md)
 
 Windows：[运行与配置](docs/speedcheck-windows.md) · [UDP/TCP 完整示例](examples/speedcheck-windows.yaml)
+
+代码简化与性能：[复用方案、验证与基准对照](docs/optimization.md)

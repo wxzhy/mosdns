@@ -403,7 +403,7 @@ func TestCleanupSurvivesOptionalTimeoutAndCancellation(t *testing.T) {
 			if !finished.Load() || hasECH(q.R().Answer[0]) || slices.Contains(bindingKeys(q.R().Answer[0]), dns.SVCB_IPV4HINT) {
 				t.Fatal("cleanup lost or source leaked")
 			}
-			if len(p.cache) != 0 {
+			if p.cache.Len() != 0 {
 				t.Fatal("cancelled ECH was cached")
 			}
 		})
@@ -518,8 +518,8 @@ func TestNativeZeroECHIsImmediateAndNotCached(t *testing.T) {
 			t.Fatalf("TTL0 ECH was dropped or extended: %s", q.R())
 		}
 	}
-	if calls.Load() != 2 || len(p.cache) != 0 {
-		t.Fatalf("native zero ECH cached: calls=%d entries=%d", calls.Load(), len(p.cache))
+	if calls.Load() != 2 || p.cache.Len() != 0 {
+		t.Fatalf("native zero ECH cached: calls=%d entries=%d", calls.Load(), p.cache.Len())
 	}
 }
 
@@ -541,13 +541,55 @@ func TestCacheCapacityAndSnapshotIsolation(t *testing.T) {
 			}
 		}
 	}
-	if len(p.cache) != maxECHCacheEntries {
-		t.Fatalf("cache size=%d", len(p.cache))
+	if p.cache.Len() != maxECHCacheEntries {
+		t.Fatalf("cache size=%d", p.cache.Len())
 	}
-	for _, entry := range p.cache {
+	p.cache.Clean(func(_ echCacheKey, entry echCacheEntry) bool {
 		if !validateECHConfigList(entry.value) {
 			t.Fatal("response shared mutable ECH with cache")
 		}
+		return false
+	})
+}
+
+func TestCacheRefreshAtCapacityAndLRUEviction(t *testing.T) {
+	for _, refresh := range []bool{false, true} {
+		t.Run(fmt.Sprintf("refresh=%t", refresh), func(t *testing.T) {
+			p := recordPlugin(t, Args{AddECH: boolValue(false)}, nil, nil)
+			now := time.Now()
+			until := now.Add(time.Minute)
+			key := func(i int) echCacheKey { return echCacheKey{wire: fmt.Sprint(i)} }
+			for i := 0; i < maxECHCacheEntries; i++ {
+				p.storeECH(context.Background(), key(i), testECH, until, now)
+			}
+			if refresh {
+				// Replacing an existing key at capacity must not evict another key.
+				p.storeECH(context.Background(), key(maxECHCacheEntries-1), testECH, until, now)
+				if p.cache.Len() != maxECHCacheEntries {
+					t.Fatalf("refresh changed cache size: %d", p.cache.Len())
+				}
+				for i := 0; i < maxECHCacheEntries; i++ {
+					if _, ok := p.cachedECH(key(i), now); !ok {
+						t.Fatalf("refresh evicted unrelated key %d", i)
+					}
+				}
+			}
+			if _, ok := p.cachedECH(key(0), now); !ok {
+				t.Fatal("oldest entry was missing before use")
+			}
+			p.storeECH(context.Background(), key(maxECHCacheEntries), testECH, until, now)
+			if p.cache.Len() != maxECHCacheEntries {
+				t.Fatalf("insert changed cache capacity: %d", p.cache.Len())
+			}
+			for _, i := range []int{0, maxECHCacheEntries} {
+				if _, ok := p.cachedECH(key(i), now); !ok {
+					t.Fatalf("recently used key %d was evicted", i)
+				}
+			}
+			if _, ok := p.cachedECH(key(1), now); ok {
+				t.Fatal("least recently used key was retained")
+			}
+		})
 	}
 }
 
@@ -567,7 +609,7 @@ func TestMalformedSourceCorrelationAndPanicsKeepCleanup(t *testing.T) {
 			if err := p.Exec(context.Background(), q); err != nil {
 				t.Fatal(err)
 			}
-			if len(bindingKeys(q.R().Answer[0])) != 0 || len(p.cache) != 0 {
+			if len(bindingKeys(q.R().Answer[0])) != 0 || p.cache.Len() != 0 {
 				t.Fatal("bad source injected, cached, or erased cleanup")
 			}
 		})
@@ -668,7 +710,7 @@ func TestSourceZeroTTLAliasesCapInjectionAndCaching(t *testing.T) {
 					t.Fatalf("zero alias lifetime extended: %s", q.R())
 				}
 			}
-			if zeroSource == "ECH" && (calls.Load() != 2 || len(p.cache) != 0) {
+			if zeroSource == "ECH" && (calls.Load() != 2 || p.cache.Len() != 0) {
 				t.Fatal("ECH source with zero alias cached")
 			}
 		})
@@ -768,7 +810,7 @@ func TestFreshECHLimitDoesNotSlideWhileWaitingForA(t *testing.T) {
 		// computed. Only then let this independent A source finish later.
 		for {
 			p.mu.Lock()
-			ready := len(p.cache) > 0
+			ready := p.cache.Len() > 0
 			p.mu.Unlock()
 			if ready {
 				break

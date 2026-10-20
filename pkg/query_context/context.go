@@ -20,6 +20,7 @@
 package query_context
 
 import (
+	"maps"
 	"sync/atomic"
 	"time"
 
@@ -279,8 +280,8 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	d.validUntil = ctx.validUntil
 	d.probeStatus = ctx.probeStatus
 
-	d.kv = copyMap(ctx.kv)
-	d.marks = copyMap(ctx.marks)
+	d.kv = maps.Clone(ctx.kv)
+	d.marks = maps.Clone(ctx.marks)
 	return d
 }
 
@@ -341,17 +342,6 @@ func (ctx *Context) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	}
 	encoder.AddDuration("elapsed", time.Since(ctx.startTime))
 	return nil
-}
-
-func copyMap[K comparable, V any](m map[K]V) map[K]V {
-	if m == nil {
-		return nil
-	}
-	cm := make(map[K]V, len(m))
-	for k, v := range m {
-		cm[k] = v
-	}
-	return cm
 }
 
 func addNewAndSwapOldOpt(m *dns.Msg) *dns.OPT {

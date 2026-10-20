@@ -31,7 +31,6 @@ type echData struct {
 type echCacheEntry struct {
 	value []byte
 	until time.Time
-	order uint64
 }
 
 type ipData struct {
@@ -185,17 +184,14 @@ func (p *Record) resolveECH(ctx context.Context, parent *query_context.Context) 
 func (p *Record) cachedECH(key echCacheKey, now time.Time) (echData, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	entry, ok := p.cache[key]
+	entry, ok := p.cache.Get(key)
 	if !ok {
 		return echData{}, false
 	}
 	if !now.Before(entry.until) {
-		delete(p.cache, key)
+		p.cache.Del(key)
 		return echData{}, false
 	}
-	p.cacheOrder++
-	entry.order = p.cacheOrder
-	p.cache[key] = entry
 	return echData{value: append([]byte(nil), entry.value...), ttl: remaining(entry.until, now), validUntil: entry.until}, true
 }
 
@@ -205,23 +201,10 @@ func (p *Record) storeECH(ctx context.Context, key echCacheKey, value []byte, un
 	if p.closed || ctx.Err() != nil || until.IsZero() || !now.Before(until) {
 		return
 	}
-	for oldKey, entry := range p.cache {
-		if !now.Before(entry.until) {
-			delete(p.cache, oldKey)
-		}
-	}
-	if len(p.cache) >= maxECHCacheEntries {
-		var oldest echCacheKey
-		order := ^uint64(0)
-		for oldKey, entry := range p.cache {
-			if entry.order < order {
-				oldest, order = oldKey, entry.order
-			}
-		}
-		delete(p.cache, oldest)
-	}
-	p.cacheOrder++
-	p.cache[key] = echCacheEntry{value: append([]byte(nil), value...), until: until, order: p.cacheOrder}
+	p.cache.Clean(func(_ echCacheKey, entry echCacheEntry) bool {
+		return !now.Before(entry.until)
+	})
+	p.cache.Add(key, echCacheEntry{value: append([]byte(nil), value...), until: until})
 }
 
 func (p *Record) resolveIP(ctx context.Context, parent *query_context.Context, target string) (ipData, error) {

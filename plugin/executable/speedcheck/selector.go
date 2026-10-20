@@ -1,13 +1,14 @@
 package speedcheck
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net/netip"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,27 +70,12 @@ func New(args Args, sources []Source, opts Options) (*Selector, error) {
 		}
 	}
 	life, cancel := context.WithCancel(context.Background())
-	s := &Selector{args: args, sources: slices.Clone(sources), probe: opts.Probe, labels: cloneMatchers(opts.Labels), asns: cloneASNMatchers(opts.ASNMatchers), metrics: newMetrics(opts.MetricsTag), lifetime: life, close: cancel, closeDone: make(chan struct{})}
+	s := &Selector{args: args, sources: slices.Clone(sources), probe: opts.Probe, labels: maps.Clone(opts.Labels), asns: maps.Clone(opts.ASNMatchers), metrics: newMetrics(opts.MetricsTag), lifetime: life, close: cancel, closeDone: make(chan struct{})}
 	if err := s.validateMatchers(); err != nil {
 		cancel()
 		return nil, err
 	}
 	return s, nil
-}
-
-func cloneMatchers(in map[string]netlist.Matcher) map[string]netlist.Matcher {
-	out := make(map[string]netlist.Matcher, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-func cloneASNMatchers(in map[uint32]netlist.Matcher) map[uint32]netlist.Matcher {
-	out := make(map[uint32]netlist.Matcher, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
 }
 
 // Close cancels queries and waits for their source/probe publishers. Exec itself
@@ -463,14 +449,8 @@ func (s *Selector) refreshProbes(ctx context.Context, states []*candidateState, 
 		if !candidateCurrent(c, now) {
 			continue
 		}
-		addresses := slices.Clone(c.value.Addresses)
-		sort.SliceStable(addresses, func(i, j int) bool {
-			if addresses[i].Index != addresses[j].Index {
-				return addresses[i].Index < addresses[j].Index
-			}
-			return addresses[i].IP.Less(addresses[j].IP)
-		})
-		for _, a := range addresses {
+		// Analyze retains each IP's first occurrence in Answer order.
+		for _, a := range c.value.Addresses {
 			if !admitted[a.IP] && len(admitted) >= maxUniqueIPs {
 				continue
 			}
@@ -627,21 +607,23 @@ func (s *Selector) selectResponse(states []*candidateState, probes map[netip.Add
 			ranked = append(ranked, rankedAddress{candidate: c, address: a, metadata: m, result: r, valid: valid, score: score})
 		}
 	}
-	sort.SliceStable(ranked, func(i, j int) bool {
-		a, b := ranked[i], ranked[j]
+	slices.SortStableFunc(ranked, func(a, b rankedAddress) int {
 		if a.valid != b.valid {
-			return a.valid
+			if a.valid {
+				return -1
+			}
+			return 1
 		}
 		if a.score != b.score {
-			return a.score < b.score
+			return cmp.Compare(a.score, b.score)
 		}
 		if a.candidate.source != b.candidate.source {
-			return a.candidate.source < b.candidate.source
+			return cmp.Compare(a.candidate.source, b.candidate.source)
 		}
 		if a.address.Index != b.address.Index {
-			return a.address.Index < b.address.Index
+			return cmp.Compare(a.address.Index, b.address.Index)
 		}
-		return a.address.IP.Less(b.address.IP)
+		return a.address.IP.Compare(b.address.IP)
 	})
 	if len(ranked) > 0 {
 		best := ranked[0]
