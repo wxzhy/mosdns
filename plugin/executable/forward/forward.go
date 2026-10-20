@@ -94,7 +94,7 @@ type UpstreamConfig struct {
 	//   - udp: responses that fail a simple spoofing heuristic are dropped.
 	//     Queries must carry EDNS0, otherwise all valid responses are dropped.
 	//   - tcp: the first 16 bytes of each dns frame are sent as TCP
-	//     out-of-band data.
+	//     out-of-band data. Pipelining is disabled for this option.
 	UseTricks bool `yaml:"use_tricks"`
 
 	Socks5       string `yaml:"socks5"`
@@ -158,6 +158,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 
 	for i, c := range args.Upstreams {
 		if len(c.Addr) == 0 {
+			_ = f.Close()
 			return nil, fmt.Errorf("#%d upstream invalid args, addr is required", i)
 		}
 		applyGlobal(&c)
@@ -271,6 +272,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		return nil, err
 	}
 	defer pool.ReleaseBuf(queryPayload)
+	queryID, queryOpcode := qCtx.Q().Id, qCtx.Q().Opcode
 
 	concurrent := f.args.Concurrent
 	if concurrent <= 0 {
@@ -307,6 +309,9 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 
 			var r *dns.Msg
 			respPayload, err := u.ExchangeContext(upstreamCtx, *qc)
+			if respPayload != nil {
+				defer pool.ReleaseBuf(respPayload)
+			}
 			if err != nil {
 				f.logger.Warn(
 					"upstream error",
@@ -318,11 +323,18 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 					zap.Error(err),
 				)
 			} else {
-				r = new(dns.Msg)
-				err = r.Unpack(*respPayload)
-				pool.ReleaseBuf(respPayload)
-				if err != nil {
-					r = nil
+				if respPayload == nil {
+					err = errors.New("upstream returned no payload")
+				} else {
+					r = new(dns.Msg)
+					err = r.Unpack(*respPayload)
+					if err == nil && (!r.Response || r.Id != queryID || r.Opcode != queryOpcode || len(r.Question) != 1 ||
+						r.Question[0].Qtype != question.Qtype || r.Question[0].Qclass != question.Qclass || !strings.EqualFold(r.Question[0].Name, question.Name)) {
+						err = errors.New("upstream response does not match query")
+					}
+					if err != nil {
+						r = nil
+					}
 				}
 			}
 			select {
