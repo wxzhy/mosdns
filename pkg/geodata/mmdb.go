@@ -61,7 +61,12 @@ func openMMDB(file string) (*maxminddb.Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open maxmind db %s: %w", file, err)
 	}
-	actual, _ := mmdbReaderCache.LoadOrStore(abs, r)
+	actual, loaded := mmdbReaderCache.LoadOrStore(abs, r)
+	if loaded {
+		// Another concurrent loader installed a reader while this one was
+		// opening. Only the installed reader lives for the process lifetime.
+		_ = r.Close()
+	}
 	return actual.(*maxminddb.Reader), nil
 }
 

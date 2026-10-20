@@ -147,6 +147,20 @@ func TestLoadSite(t *testing.T) {
 	compareEntries(t, got, want)
 }
 
+func TestLoadLongCode(t *testing.T) {
+	code := strings.Repeat("A", 128)
+	siteFile := writeFile(t, buildSiteEntry(nil, code, buildDomain(nil, TypeFull, "example.com")))
+	compareEntries(t, collectDomains(t, siteFile, strings.ToLower(code), nil), []domainEntry{{TypeFull, "example.com"}})
+	ipFile := writeFile(t, buildIPEntry(nil, code, buildCIDR(nil, []byte{1, 2, 3, 0}, 24), false))
+	prefixes, err := LoadIP(ipFile, strings.ToLower(code))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixes) != 1 || prefixes[0] != netip.MustParsePrefix("1.2.3.0/24") {
+		t.Fatalf("unexpected prefixes: %v", prefixes)
+	}
+}
+
 func TestLoadSiteLowerCaseCodeInFile(t *testing.T) {
 	var cn []byte
 	cn = buildDomain(cn, TypeDomain, "qq.com")

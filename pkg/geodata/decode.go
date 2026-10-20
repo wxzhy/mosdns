@@ -43,14 +43,16 @@ var errInvalidUTF8 = errors.New("string field contains invalid UTF-8")
 // seek advances br to the body of the GeoSite/GeoIP entry for code and returns
 // the body length. The dat file is a sequence of [tag 0x0a][varint length][entry
 // body]; since protobuf serializes fields in order, the entry body starts with
-// the code field (field 1, wire type 2), i.e. [0x0a][len(code)][code], which
+// the code field (field 1, wire type 2), i.e. [0x0a][varint len(code)][code], which
 // allows matching an entry by peeking a few bytes without decoding its body.
 func seek(br *bufio.Reader, code []byte, size int64) (int, error) {
 	codeL := len(code)
 	if codeL == 0 {
 		return 0, errors.New("empty code")
 	}
-	need := 2 + codeL
+	codeHeader := protowire.AppendTag(nil, 1, protowire.BytesType)
+	codeHeader = protowire.AppendVarint(codeHeader, uint64(codeL))
+	need := len(codeHeader) + codeL
 
 	for {
 		tag, err := br.ReadByte()
@@ -75,7 +77,7 @@ func seek(br *bufio.Reader, code []byte, size int64) (int, error) {
 			return 0, err
 		}
 		if tag == 0x0a && bodyL >= need && len(prefix) >= need &&
-			prefix[0] == 0x0a && int(prefix[1]) == codeL && bytes.EqualFold(prefix[2:need], code) {
+			bytes.Equal(prefix[:len(codeHeader)], codeHeader) && bytes.EqualFold(prefix[len(codeHeader):need], code) {
 			return bodyL, nil
 		}
 		if _, err := br.Discard(bodyL); err != nil {

@@ -49,7 +49,12 @@ var (
 )
 
 func cacheKey(parts ...string) string {
-	return strings.Join(parts, "\x00")
+	var b strings.Builder
+	for _, part := range parts {
+		fmt.Fprintf(&b, "%d:", len(part))
+		b.WriteString(part)
+	}
+	return b.String()
 }
 
 // GetSiteMatcher returns a shared, immutable matcher for the geosite entry of
@@ -58,7 +63,7 @@ func GetSiteMatcher(file, code string, attrs []string) (*domain.MixMatcher[struc
 	file = absPath(file)
 	sortedAttrs := slices.Clone(attrs)
 	sort.Strings(sortedAttrs)
-	key := cacheKey("site", file, strings.ToUpper(code), strings.Join(sortedAttrs, ","))
+	key := cacheKey("site", file, strings.ToUpper(code), cacheKey(sortedAttrs...))
 	if v, ok := siteMatcherCache.Load(key); ok {
 		return v.(*domain.MixMatcher[struct{}]), nil
 	}
@@ -115,7 +120,7 @@ func GetGeoIPMatcher(file, code string) (netlist.Matcher, error) {
 		file = f
 	}
 	file = absPath(file)
-	key := cacheKey("ip", file, strings.ToUpper(code))
+	key := cacheKey("geoip", file, strings.ToUpper(code))
 	if v, ok := ipMatcherCache.Load(key); ok {
 		return v.(netlist.Matcher), nil
 	}
@@ -138,7 +143,7 @@ func buildGeoIPMatcher(file, code string) (netlist.Matcher, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s is an asn database, the code must be an as number: %w", file, err)
 			}
-			return newMMDBASNMatcher(file, asn)
+			return GetASNMatcher(file, fmt.Sprint(asn))
 		}
 		return newMMDBCountryMatcher(file, code)
 	}
@@ -170,7 +175,7 @@ func GetASNMatcher(file, code string) (netlist.Matcher, error) {
 		file = f
 	}
 	file = absPath(file)
-	key := cacheKey("ip", file, fmt.Sprint(asn))
+	key := cacheKey("asn", file, fmt.Sprint(asn))
 	if v, ok := ipMatcherCache.Load(key); ok {
 		return v.(netlist.Matcher), nil
 	}

@@ -60,6 +60,25 @@ func TestGetSiteMatcherShared(t *testing.T) {
 	}
 }
 
+func TestGetSiteMatcherAttributeCacheKeys(t *testing.T) {
+	var rules []byte
+	rules = buildDomain(rules, TypeFull, "comma.example", "a,b")
+	rules = buildDomain(rules, TypeFull, "both.example", "a", "b")
+	file := writeFile(t, buildSiteEntry(nil, "TEST", rules))
+	for _, attrs := range [][]string{{"a,b"}, {"a", "b"}} {
+		m, err := GetSiteMatcher(file, "TEST", attrs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, domain := range []string{"comma.example", "both.example"} {
+			want := domain == "comma.example" && len(attrs) == 1 || domain == "both.example" && len(attrs) == 2
+			if _, got := m.Match(domain); got != want {
+				t.Errorf("attrs %q Match(%q) = %v, want %v", attrs, domain, got, want)
+			}
+		}
+	}
+}
+
 // TestParseIPExpASN covers the asn: syntax added to ParseIPExp.
 func TestParseIPExpASN(t *testing.T) {
 	tests := []struct {

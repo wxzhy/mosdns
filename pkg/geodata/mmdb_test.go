@@ -23,6 +23,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/geodata/internal/mmdbbuild"
@@ -316,11 +317,64 @@ func TestGetGeoIPMatcherASNDB(t *testing.T) {
 	if !m.Match(netip.MustParseAddr("1.1.1.1")) {
 		t.Error("expected a match")
 	}
+	for _, code := range []string{"13335", "AS13335", "as13335"} {
+		shared, err := GetGeoIPMatcher(file, code)
+		if err != nil {
+			t.Fatal(err)
+		}
+		asn, err := GetASNMatcher(file, code)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if shared != m || asn != m {
+			t.Errorf("ASN expression %q did not reuse the same matcher", code)
+		}
+	}
 
 	// A non-numeric code on an asn database is an error.
 	if _, err := GetGeoIPMatcher(file, "cn"); err == nil {
 		t.Error("expected an error")
 	}
+}
+
+func TestASNCacheDoesNotBypassDatabaseValidation(t *testing.T) {
+	w := mmdbbuild.New("GeoLite2-Country", 6)
+	addPrefix(t, w, "1.2.0.0/16", geoLite2CountryRecord("CN"))
+	countryFile := writeMMDB(t, w)
+	datFile := writeFile(t, buildIPEntry(nil, "13335", buildCIDR(nil, []byte{1, 2, 0, 0}, 16), false))
+	for _, file := range []string{countryFile, datFile} {
+		if _, err := GetGeoIPMatcher(file, "13335"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := GetASNMatcher(file, "13335"); err == nil {
+			t.Errorf("cached GeoIP matcher bypassed ASN database validation for %s", file)
+		}
+	}
+}
+
+func TestOpenMMDBConcurrent(t *testing.T) {
+	w := mmdbbuild.New("GeoLite2-Country", 6)
+	addPrefix(t, w, "1.2.0.0/16", geoLite2CountryRecord("CN"))
+	file := writeMMDB(t, w)
+	const workers = 32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range workers {
+		wg.Go(func() {
+			<-start
+			r, err := openMMDB(file)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			cached, _ := mmdbReaderCache.Load(absPath(file))
+			if r != cached || !r.Lookup(netip.MustParseAddr("1.2.3.4")).Found() {
+				t.Error("concurrent open did not return the working shared reader")
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
 }
 
 func TestGetASNMatcher(t *testing.T) {
