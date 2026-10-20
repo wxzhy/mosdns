@@ -1,0 +1,184 @@
+# COMPLETE SPEEDCHECK TEMPLATE. Read docs/speedcheck.md before enabling.
+# Run from repository root; relative paths use the process working directory.
+# Requires country data with CN and a MaxMind ASN database, NOT bundled:
+#   geoip.dat / geoip.metadb / Country.mmdb / geoip.mmdb (first existing wins)
+#   ASN.mmdb / GeoLite2-ASN.mmdb / asn.mmdb (first existing wins)
+# No automatic download occurs. Without these databases initialization fails.
+# For a ready-to-run example without databases, use examples/speedcheck.yaml.
+log:
+  level: info
+api:
+  http: "127.0.0.1:19091"             # http://127.0.0.1:19091/metrics
+
+plugins:
+  - tag: preferred_networks
+    type: ip_set
+    args:
+      ips: ["192.0.2.0/24", "2001:db8::/32"]
+      files: ["examples/data/speedcheck-preferred-ips.txt"]
+      sets: []                        # May reference earlier ip_set tags.
+
+  - tag: blocked_networks
+    type: ip_set
+    args:
+      ips: ["0.0.0.0/8", "127.0.0.0/8", "::/128", "::1/128"]
+      files: []
+      sets: []
+
+  - tag: skip_source_domains
+    type: domain_set
+    args:
+      exps: ["full:fallback.speedcheck.invalid"]
+      files: ["examples/data/speedcheck-skipped-domains.txt"]
+      sets: []
+
+  - tag: rejected_cnames
+    type: domain_set
+    args:
+      exps: ["domain:blocked-cname.invalid"]
+      files: []
+      sets: []
+
+  - tag: source_response_filters
+    type: sequence
+    args:
+      - matches: ["cname $rejected_cnames"]
+        exec: drop_resp
+      - matches: ["resp_ip $blocked_networks"]
+        exec: drop_resp
+      - matches: ["rcode 2 5"]
+        exec: drop_resp
+
+  - tag: upstream_a
+    type: forward
+    args:
+      concurrent: 1
+      upstreams:
+        - tag: dns_a
+          addr: "udp://1.1.1.1"
+
+  - tag: upstream_b
+    type: forward
+    args:
+      concurrent: 1
+      upstreams:
+        - tag: dns_b
+          addr: "udp://8.8.8.8"
+
+  - tag: source_a
+    type: sequence
+    args:
+      - matches: ["qname $skip_source_domains"]
+        exec: return
+      - exec: $upstream_a
+      - exec: $source_response_filters
+
+  - tag: source_b
+    type: sequence
+    args:
+      - matches: ["qname $skip_source_domains"]
+        exec: return
+      - exec: $upstream_b
+      - exec: $source_response_filters
+
+  - tag: select_fast_ip
+    type: speedcheck
+    args:
+      sources: [source_a, source_b]    # Tags without '$'; declaration order wins ties.
+      mode: bounded                  # Alternative: wait_all.
+      total_timeout: 5s
+      selection_timeout: 300ms        # bounded only; starts at first valid positive.
+      settle_window: 25ms             # bounded only; starts once at first RTT success.
+      probe:
+        tcp_ports: [80, 443]          # Explicit [] disables TCP, not the default.
+        icmp: false                  # true: pro-bing; capability checked on startup.
+        timeout: 300ms
+      max_num: 2                     # 1..64; DO=1 preserves the complete source RRset.
+      threshold_ms: 100               # Nonnegative; 0 keeps only equal scores.
+      labels:
+        preferred: ["$preferred_networks"]
+        domestic: ["geoip:cn"]
+        global: ["0.0.0.0/0", "::/0"]
+        blocked: ["$blocked_networks"]
+        do_not_probe: ["198.18.0.0/15"]
+        file_networks: ["&examples/data/speedcheck-preferred-ips.txt"]
+        cloudflare: ["asn:13335"]
+        # Explicit-file alternative, instead of geoip:cn:
+        # domestic: ["ext:Country.mmdb:cn"]
+      tag_multipliers:              # First matching label wins; order matters.
+        - tag: preferred
+          multiplier: 0.8
+        - tag: domestic
+          multiplier: 1.0
+      asn_multipliers:              # Used only when no tag multiplier matched.
+        13335: 0.9
+        15169: 1.1
+      candidate_filter:            # Any matching exclude rejects the entire source.
+        labels_include: [global, domestic, preferred]
+        labels_exclude: [blocked]
+        asn_include: [13335, 15169] # Labels/ASN includes are OR, excludes take priority.
+        asn_exclude: [64512]
+      probe_match:                 # Whole-source rule; unmatched IPs remain valid.
+        labels_include: [global]
+        labels_exclude: [do_not_probe]
+        asn_include: [13335]
+        asn_exclude: [64512]
+      # RTT cache, queue/socket limits and network binding have no YAML options.
+
+  - tag: static_fallback_hosts
+    type: hosts
+    args:
+      entries:
+        - "full:fallback.speedcheck.invalid 192.0.2.10 2001:db8::10"
+      files: []
+
+  - tag: static_fallback
+    type: sequence
+    args:
+      - exec: $static_fallback_hosts
+      - matches: ["has_resp"]
+        exec: accept
+
+  - tag: resolve_with_fallback
+    type: fallback
+    args:
+      primary: select_fast_ip
+      secondary: static_fallback
+      threshold: 5000              # Milliseconds; also starts secondary on error.
+      always_standby: false        # true prepares secondary immediately.
+
+  # Optional RESPONSE cache: defined here but NOT called by main below.
+  # Enable the cache AND has_resp/accept guard shown in main below.
+  # The guard bypasses speedcheck on a cache hit; cache itself always continues.
+  - tag: response_cache
+    type: cache
+    args:
+      size: 1024
+      lazy_cache_ttl: 0            # Disable stale answers in this example.
+      dump_file: ""               # Empty disables persistence; otherwise writable file.
+      dump_interval: 600          # Seconds, only meaningful with dump_file.
+
+  - tag: main
+    type: sequence
+    args:
+      # - exec: $response_cache    # Enable all three optional lines together.
+      # - matches: ["has_resp"]
+      #   exec: accept
+      - exec: $resolve_with_fallback
+      # Linux ipset/nftset side effects belong here, after address selection.
+      - exec: accept
+
+  - tag: udp_listener
+    type: udp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+
+  - tag: tcp_listener
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+      idle_timeout: 10            # Seconds.
+      cert: ""                    # Both cert+key empty: plain DNS over TCP.
+      key: ""                     # Supply both paths to serve TLS instead.

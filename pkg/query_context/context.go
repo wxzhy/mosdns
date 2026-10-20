@@ -51,6 +51,7 @@ type Context struct {
 	resp        *dns.Msg
 	respOpt     *dns.OPT // nil if clientOpt == nil
 	upstreamOpt *dns.OPT // may be nil
+	receivedAt  time.Time
 
 	// lazy init.
 	kv    map[uint32]any
@@ -78,6 +79,7 @@ func NewContext(q *dns.Msg) *Context {
 		// The DO bit of the query MUST be copied in the response.
 		if ctx.clientOpt.Do() {
 			setDo(ctx.respOpt, true)
+			setDo(ctx.QOpt(), true)
 		}
 	}
 	return ctx
@@ -131,8 +133,10 @@ func (ctx *Context) SetResponse(m *dns.Msg) {
 	ctx.resp = m
 	if m == nil {
 		ctx.upstreamOpt = nil
+		ctx.receivedAt = time.Time{}
 	} else {
 		ctx.upstreamOpt = popOpt(m)
+		ctx.receivedAt = time.Now()
 	}
 }
 
@@ -157,6 +161,68 @@ func (ctx *Context) RespOpt() *dns.OPT {
 // The OPT is read-only.
 func (ctx *Context) UpstreamOpt() *dns.OPT {
 	return ctx.upstreamOpt
+}
+
+// ResponseSnapshot owns a response and its separate EDNS state. It deliberately
+// excludes query, marks and arbitrary plugin state, so a branch can only commit
+// its response to the parent query.
+type ResponseSnapshot struct {
+	Response    *dns.Msg
+	UpstreamOpt *dns.OPT
+	RespOpt     *dns.OPT
+	ReceivedAt  time.Time
+}
+
+// Clone returns an independently mutable snapshot.
+func (s ResponseSnapshot) Clone() ResponseSnapshot {
+	if s.Response != nil {
+		s.Response = s.Response.Copy()
+	}
+	if s.UpstreamOpt != nil {
+		s.UpstreamOpt = dns.Copy(s.UpstreamOpt).(*dns.OPT)
+	}
+	if s.RespOpt != nil {
+		s.RespOpt = dns.Copy(s.RespOpt).(*dns.OPT)
+	}
+	return s
+}
+
+func (ctx *Context) SnapshotResponse() ResponseSnapshot {
+	return (ResponseSnapshot{Response: ctx.resp, UpstreamOpt: ctx.upstreamOpt, RespOpt: ctx.respOpt, ReceivedAt: ctx.receivedAt}).Clone()
+}
+
+// ResponseReceivedAt is the time SetResponse accepted the current DNS response,
+// before any subsequent filtering or waits in the source sequence.
+func (ctx *Context) ResponseReceivedAt() time.Time { return ctx.receivedAt }
+
+// CommitResponse copies only response state, retaining the parent's query view
+// and plugin state. Neither the caller nor another subscriber can mutate it.
+func (ctx *Context) CommitResponse(s ResponseSnapshot) {
+	s = s.Clone()
+	if s.Response != nil {
+		for opt := popOpt(s.Response); opt != nil; opt = popOpt(s.Response) {
+			if s.UpstreamOpt == nil {
+				s.UpstreamOpt = opt
+			}
+		}
+	} else {
+		s.UpstreamOpt = nil
+	}
+	ctx.resp, ctx.upstreamOpt = s.Response, s.UpstreamOpt
+	ctx.receivedAt = s.ReceivedAt
+	if s.Response == nil {
+		ctx.receivedAt = time.Time{}
+	} else if ctx.receivedAt.IsZero() {
+		ctx.receivedAt = time.Now()
+	}
+	ctx.respOpt = nil
+	if ctx.clientOpt != nil {
+		ctx.respOpt = s.RespOpt
+		if ctx.respOpt == nil {
+			ctx.respOpt = newOpt()
+			setDo(ctx.respOpt, ctx.clientOpt.Do())
+		}
+	}
 }
 
 // InfoField returns a zap.Field contains a brief summary of this Context.
@@ -185,11 +251,16 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 
 	if ctx.resp != nil {
 		d.resp = ctx.resp.Copy()
+	} else {
+		d.resp = nil
 	}
 	if ctx.respOpt != nil {
 		d.respOpt = dns.Copy(ctx.respOpt).(*dns.OPT)
+	} else {
+		d.respOpt = nil
 	}
 	d.upstreamOpt = ctx.upstreamOpt
+	d.receivedAt = ctx.receivedAt
 
 	d.kv = copyMap(ctx.kv)
 	d.marks = copyMap(ctx.marks)

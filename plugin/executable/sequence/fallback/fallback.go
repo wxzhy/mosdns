@@ -28,8 +28,8 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_policy"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
-	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
 
@@ -108,7 +108,12 @@ func (f *fallback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 }
 
 func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) error {
-	respChan := make(chan *dns.Msg, 2) // resp could be nil.
+	if query_policy.InheritCancellation(ctx) {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+	}
+	respChan := make(chan *query_context.ResponseSnapshot, 2) // nil means failed.
 	primFailed := make(chan struct{})
 	primDone := make(chan struct{})
 
@@ -129,7 +134,8 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			respChan <- nil
 		} else {
 			close(primDone)
-			respChan <- r
+			snapshot := qCtx.SnapshotResponse()
+			respChan <- &snapshot
 		}
 	}()
 
@@ -140,6 +146,8 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 		defer pool.ReleaseTimer(timer)
 		if !f.alwaysStandby { // not always standby, wait here.
 			select {
+			case <-ctx.Done():
+				return
 			case <-primDone: // primary is done, no need to exec this.
 				return
 			case <-primFailed: // primary failed
@@ -167,7 +175,12 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			case <-timer.C: // or timed out.
 			}
 		}
-		respChan <- r
+		if r == nil {
+			respChan <- nil
+		} else {
+			snapshot := qCtx.SnapshotResponse()
+			respChan <- &snapshot
+		}
 	}()
 
 	for i := 0; i < 2; i++ {
@@ -178,7 +191,7 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			if r == nil { // One of goroutines finished but failed.
 				continue
 			}
-			qCtx.SetResponse(r)
+			qCtx.CommitResponse(*r)
 			return nil
 		}
 	}
@@ -192,5 +205,5 @@ func makeDdlCtx(ctx context.Context, timeout time.Duration) (context.Context, fu
 	if !ok {
 		ddl = time.Now().Add(timeout)
 	}
-	return context.WithDeadline(context.Background(), ddl)
+	return context.WithDeadline(ctx, ddl)
 }

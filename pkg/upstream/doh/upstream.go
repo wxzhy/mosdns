@@ -27,10 +27,13 @@ import (
 	"io"
 	"net/http"
 	urlpkg "net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_policy"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
@@ -75,6 +78,10 @@ var (
 )
 
 func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, error) {
+	if len(q) < dnsutils.DnsHeaderLen {
+		return nil, dnsutils.ErrPayloadTooSmall
+	}
+	id := binary.BigEndian.Uint16(q)
 	bp := pool.GetBuf(len(q))
 	defer pool.ReleaseBuf(bp)
 	wire := *bp
@@ -98,12 +105,28 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 	// See: https://tools.ietf.org/html/rfc8484#section-6.
 	base64.RawURLEncoding.Encode(queryBuf[p:], wire)
 
+	if query_policy.InheritCancellation(ctx) {
+		requestCtx, cancel := context.WithTimeout(ctx, defaultDoHTimeout)
+		defer cancel()
+		r, err := u.exchange(requestCtx, utils.BytesToStringUnsafe(queryBuf))
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, context.Cause(ctx)
+			}
+			return nil, err
+		}
+		binary.BigEndian.PutUint16(*r, id)
+		return r, nil
+	}
+
 	type res struct {
 		r   *[]byte
 		err error
 	}
 
-	resChan := make(chan res, 1)
+	resChan := make(chan res)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
 		// We overwrite the ctx with a fixed timeout context here.
 		// Because the http package may close the underlay connection
@@ -115,7 +138,13 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 		if err != nil {
 			u.logger.Check(zap.WarnLevel, "exchange failed").Write(zap.Error(err))
 		}
-		resChan <- res{r: r, err: err}
+		select {
+		case resChan <- res{r: r, err: err}:
+		case <-done:
+			if r != nil {
+				pool.ReleaseBuf(r)
+			}
+		}
 	}()
 
 	select {
@@ -125,7 +154,7 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 		r := res.r
 		err := res.err
 		if r != nil {
-			binary.BigEndian.PutUint16(*r, binary.BigEndian.Uint16(q))
+			binary.BigEndian.PutUint16(*r, id)
 		}
 		return r, err
 	}
@@ -153,12 +182,39 @@ func (u *Upstream) exchange(ctx context.Context, dnsQuery string) (*[]byte, erro
 
 	bb := bufPool4k.Get()
 	defer bufPool4k.Release(bb)
-	_, err = bb.ReadFrom(io.LimitReader(resp.Body, dns.MaxMsgSize))
+	_, err = bb.ReadFrom(io.LimitReader(resp.Body, dns.MaxMsgSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read http body: %w", err)
 	}
 	if bb.Len() < dnsutils.DnsHeaderLen {
 		return nil, dnsutils.ErrPayloadTooSmall
+	}
+	if bb.Len() > dns.MaxMsgSize {
+		return nil, fmt.Errorf("DoH response exceeds DNS message size")
+	}
+	m := new(dns.Msg)
+	if err := m.Unpack(bb.Bytes()); err != nil {
+		return nil, fmt.Errorf("invalid DoH response: %w", err)
+	}
+	if !m.Response || m.Id != 0 {
+		return nil, fmt.Errorf("invalid DoH response header")
+	}
+	// RFC 8484 section 5.1: an HTTP cache's Age consumes DNS TTL.
+	// Preserve zero TTL rather than using SubtractTTL's one-second floor.
+	if age, err := strconv.ParseUint(strings.TrimSpace(resp.Header.Get("Age")), 10, 64); err == nil && age > 0 {
+		for _, section := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
+			for _, rr := range section {
+				if rr.Header().Rrtype == dns.TypeOPT {
+					continue
+				}
+				if age >= uint64(rr.Header().Ttl) {
+					rr.Header().Ttl = 0
+				} else {
+					rr.Header().Ttl -= uint32(age)
+				}
+			}
+		}
+		return pool.PackBuffer(m)
 	}
 	payload := pool.GetBuf(bb.Len())
 	copy(*payload, bb.Bytes())

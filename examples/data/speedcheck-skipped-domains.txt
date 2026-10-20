@@ -1,0 +1,2 @@
+# Query names for which these demonstration sources intentionally return no answer.
+full:skip-upstreams.speedcheck.invalid

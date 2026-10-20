@@ -1,0 +1,130 @@
+# Run from the repository directory: mosdns start -c examples/speedcheck.yaml
+# No GeoIP/ASN database is required. Replace upstreams with reachable DNS servers.
+# See speedcheck-full.yaml for every speedcheck field and database-backed rules.
+log:
+  level: info
+api:
+  http: "127.0.0.1:19091"             # GET /metrics
+
+plugins:
+  - tag: preferred_networks
+    type: ip_set
+    args:
+      ips: ["192.0.2.0/24", "2001:db8::/32"] # Documentation ranges; replace.
+
+  - tag: blocked_networks
+    type: ip_set
+    args:
+      ips: ["0.0.0.0/8", "127.0.0.0/8", "::/128", "::1/128"]
+
+  - tag: skip_source_domains
+    type: domain_set
+    args:
+      exps: ["full:fallback.speedcheck.invalid"]
+
+  # A source submits its response only after these response filters finish.
+  - tag: source_response_filters
+    type: sequence
+    args:
+      - matches: ["cname domain:blocked-cname.invalid"]
+        exec: drop_resp
+      - matches: ["resp_ip $blocked_networks"]
+        exec: drop_resp
+      - matches: ["rcode 2 5"]        # Drop SERVFAIL/REFUSED, preserve NXDOMAIN.
+        exec: drop_resp
+
+  - tag: upstream_a
+    type: forward
+    args:
+      upstreams:
+        - addr: "udp://1.1.1.1"
+
+  - tag: upstream_b
+    type: forward
+    args:
+      upstreams:
+        - addr: "udp://8.8.8.8"
+
+  # One upstream per source lets every source response reach speedcheck.
+  - tag: source_a
+    type: sequence
+    args:
+      - matches: ["qname $skip_source_domains"]
+        exec: return
+      - exec: $upstream_a
+      - exec: $source_response_filters
+
+  - tag: source_b
+    type: sequence
+    args:
+      - matches: ["qname $skip_source_domains"]
+        exec: return
+      - exec: $upstream_b
+      - exec: $source_response_filters
+
+  - tag: select_fast_ip
+    type: speedcheck
+    args:
+      sources: [source_a, source_b]
+      mode: bounded                  # Or wait_all, still queries/probes in parallel.
+      total_timeout: 5s
+      selection_timeout: 300ms
+      settle_window: 25ms
+      probe:
+        tcp_ports: [80, 443]          # [] disables TCP; omit for [80, 443].
+        icmp: false                  # true enables pro-bing alongside TCP.
+        timeout: 300ms
+      max_num: 1
+      threshold_ms: 100
+      labels:
+        preferred: ["$preferred_networks"]
+        blocked: ["$blocked_networks"]
+      tag_multipliers:
+        - tag: preferred
+          multiplier: 0.8
+      candidate_filter:
+        labels_exclude: [blocked]
+      # probe_match may restrict probes without rejecting otherwise valid answers.
+
+  # Only this demonstration name has a static answer; never map all names here.
+  - tag: static_fallback_hosts
+    type: hosts
+    args:
+      entries:
+        - "full:fallback.speedcheck.invalid 192.0.2.10 2001:db8::10"
+
+  - tag: static_fallback
+    type: sequence
+    args:
+      - exec: $static_fallback_hosts
+      - matches: ["has_resp"]
+        exec: accept
+      # Other names deliberately have no invented address if every source fails.
+
+  - tag: resolve_with_fallback
+    type: fallback
+    args:
+      primary: select_fast_ip
+      secondary: static_fallback
+      threshold: 5000                # Milliseconds; error starts fallback at once.
+      always_standby: false
+
+  - tag: main
+    type: sequence
+    args:
+      - exec: $resolve_with_fallback
+      # Put ipset/nftset side effects here, after selection (Linux only).
+      - exec: accept
+
+  - tag: udp_listener
+    type: udp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+
+  - tag: tcp_listener
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+      idle_timeout: 10                # Seconds.

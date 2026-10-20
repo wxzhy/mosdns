@@ -1,0 +1,293 @@
+# 全模块参数模板：仅用于查阅、严格解码检查和按需裁剪。
+# 不能把它当作无需准备即可运行的部署配置。
+# 工作目录应为仓库根目录。DB、规则文本、证书需自行提供：
+#   data/geosite.dat、data/Country.mmdb、data/ASN.mmdb、rules/*、tls/*。
+# 数字 ASN 倍率/过滤还需默认 ASN 库：工作目录中的 ASN.mmdb、
+# GeoLite2-ASN.mmdb、asn.mmdb 之一；data/ASN.mmdb 仅供 ext: 表达式使用。
+# 请先删除不使用的 provider / listener / 改写模块，再替换域名/IP及路径。
+# quick-setup-only 动作放在 module_actions 中；Linux ipset/nftset 被注释，
+# 如启用需先在系统创建集合并授予所需权限。Windows 上它们无操作。
+# 主链选择 speedcheck；示范缓存单独定义为 cached_main，不默认启用。
+# 参数含义和真实默认值：../configuration-reference.md
+log:
+  level: info
+  file: ""
+  production: false
+include: []
+api:
+  http: "127.0.0.1:19091"
+plugins:
+  - tag: domains_base
+    type: domain_set
+    args:
+      exps: ["full:router.example", "domain:example.org"]
+      sets: []
+      files: ["./rules/domains.txt"]
+  - tag: domains_database
+    type: domain_set
+    args:
+      exps: ["ext:./data/geosite.dat:cn"]
+      sets: [domains_base]
+      files: []
+  - tag: ips_base
+    type: ip_set
+    args:
+      ips: ["192.168.0.0/16", "fd00::/8"]
+      sets: []
+      files: ["./rules/ips.txt"]
+  - tag: ips_database
+    type: ip_set
+    args:
+      ips: ["ext:./data/Country.mmdb:CN", "ext:./data/ASN.mmdb:AS13335"]
+      sets: [ips_base]
+      files: []
+  - tag: hosts_local
+    type: hosts
+    args:
+      entries: ["router.example 192.168.1.1 fd00::1"]
+      files: ["./rules/hosts.txt"]
+  - tag: static_records
+    type: arbitrary
+    args:
+      rules: ['status.example. 60 IN TXT "ready"']
+      files: ["./rules/records.zone"]
+  - tag: aliases
+    type: redirect
+    args:
+      rules: ["www.alias.example www.target.example"]
+      files: ["./rules/redirect.txt"]
+  - tag: response_cache
+    type: cache
+    args:
+      size: 4096
+      lazy_cache_ttl: 0
+      dump_file: "./cache.dump"
+      dump_interval: 600                   # 秒
+  - tag: client_ecs
+    type: ecs_handler
+    args:
+      forward: true
+      send: false
+      preset: ""                          # 例如 203.0.113.10；不带掩码
+      mask4: 24
+      mask6: 48
+  - tag: rate_limit
+    type: rate_limiter                    # 实际是 matcher，不能 exec: $rate_limit
+    args:
+      qps: 20
+      burst: 40
+      mask4: 32
+      mask6: 48
+  - tag: seen_names
+    type: reverse_lookup
+    args:
+      size: 65536
+      handle_ptr: true
+      ttl: 7200                           # 秒
+  - tag: short_delay
+    type: sleep
+    args:
+      duration: 10                        # 毫秒
+
+  # 一份完整 forward 参数演示。使用该实例需让上游支持配置的协议。
+  # max_conns 已弃用；使用 SOCKS 时填写 host:port，UDP/QUIC不会走SOCKS。
+  - tag: upstream_full
+    type: forward
+    args:
+      concurrent: 1
+      socks5: ""
+      so_mark: 0                          # Linux；Windows为空操作
+      bind_to_device: ""                 # Linux接口名称
+      bootstrap: "1.1.1.1:53"
+      bootstrap_version: 4
+      upstreams:
+        - tag: doh_a
+          addr: "https://cloudflare-dns.com/dns-query"
+          dial_addr: "1.1.1.1:443"
+          idle_timeout: 30                # 秒
+          max_conns: 0                    # 无效果
+          enable_pipeline: false
+          enable_http3: false             # 与 fingerprint/ECH 不同时启用
+          insecure_skip_verify: false
+          alpn: ["h2", "http/1.1"]
+          verify_peer_cert_by_name: "cloudflare-dns.com"
+          fingerprint: "chrome"
+          ech_config_list: ""             # 有效base64，或 域名+DNS上游URL
+          repeat: 0                       # 仅UDP有效
+          use_tricks: false               # 仅UDP/TCP有效
+          socks5: ""
+          so_mark: 0
+          bind_to_device: ""
+          bootstrap: "1.1.1.1:53"
+          bootstrap_version: 4
+  - tag: upstream_b
+    type: forward
+    args:
+      concurrent: 1
+      upstreams:
+        - tag: udp_b
+          addr: "udp://8.8.8.8:53"
+          repeat: 0
+          use_tricks: false
+
+  - tag: source_a
+    type: sequence
+    args:
+      - exec: $upstream_full
+      - matches: ["rcode 2 5"]
+        exec: drop_resp
+  - tag: source_b
+    type: sequence
+    args:
+      - exec: $upstream_b
+      - matches: ["rcode 2 5"]
+        exec: drop_resp
+  - tag: select_fast_ip
+    type: speedcheck
+    args:
+      sources: [source_a, source_b]
+      mode: bounded                      # 或 wait_all
+      total_timeout: 5s
+      selection_timeout: 300ms
+      settle_window: 25ms
+      probe:
+        tcp_ports: [80, 443]              # []关闭TCP，未配置则使用默认
+        icmp: false                      # true启用pro-bing，启动时检查能力
+        timeout: 300ms
+      max_num: 2
+      threshold_ms: 100
+      labels:
+        preferred: ["$ips_database"]
+        global: ["0.0.0.0/0", "::/0"]
+        blocked: ["0.0.0.0/8", "::/128"]
+        no_probe: ["198.18.0.0/15"]
+      tag_multipliers:
+        - tag: preferred
+          multiplier: 0.8
+      asn_multipliers:
+        13335: 0.9
+        15169: 1.1
+      candidate_filter:
+        labels_include: [global, preferred]
+        labels_exclude: [blocked]
+        asn_include: [13335, 15169]
+        asn_exclude: [64512]
+      probe_match:
+        labels_include: [global]
+        labels_exclude: [no_probe]
+        asn_include: [13335]
+        asn_exclude: [64512]
+  - tag: secondary_query
+    type: sequence
+    args:
+      - exec: $hosts_local
+      - matches: ["has_resp"]
+        exec: accept
+      - exec: $upstream_b
+  - tag: resolve_with_fallback
+    type: fallback
+    args:
+      primary: select_fast_ip
+      secondary: secondary_query
+      threshold: 5000                    # 毫秒
+      always_standby: false
+
+  # 独立演示链，主链不调用：内含互斥/调试动作，不应整段照搬生产规则。
+  - tag: module_actions
+    type: sequence
+    args:
+      - exec: metrics_collector module_actions
+      - exec: query_summary module_demo
+      - matches: ["random 0.01"]
+        exec: debug_print sampled_query
+      - matches: ["env MOSDNS_DEBUG"]
+        exec: mark 100
+      - matches: ["string_exp $MOSDNS_MODE eq office"]
+        exec: mark 200
+      - matches: ["qname $domains_base", "qtype 1 28", "qclass 1"]
+        exec: $hosts_local
+      - matches: ["client_ip $ips_base", "ptr_ip 192.168.0.0/16"]
+        exec: mark 300
+      - matches: ["!has_resp"]
+        exec: $static_records
+      - matches: ["has_resp", "has_wanted_ans"]
+        exec: accept
+      - exec: $seen_names
+      - exec: $aliases
+      - exec: $client_ecs
+      - exec: forward_edns0opt 10 15
+      # - exec: ecs 203.0.113.10          # 老版快捷形式，与ecs_handler择一
+      # - exec: prefer_ipv4              # 与prefer_ipv6择一，放在上游查询前
+      - exec: $upstream_full doh_a
+      - matches: ["cname domain:blocked.example", "resp_ip $ips_base"]
+        exec: drop_resp
+      - exec: ttl 0-600
+      # - exec: ipset dns4,inet,24 dns6,inet6,48
+      # - exec: nftset inet,dns_table,dns4,ipv4_addr,24 inet,dns_table,dns6,ipv6_addr,48
+      - matches: ["mark 100", "string_exp url_path prefix /dns-query"]
+        exec: $short_delay
+      - matches: ["string_exp server_name suffix .example"]
+        exec: sleep 1
+      - matches: ["_false"]
+        exec: "black_hole 0.0.0.0 ::"
+      - matches: ["_true"]
+        exec: return
+
+  - tag: main
+    type: sequence
+    args:
+      - matches: ["!$rate_limit"]
+        exec: reject 5
+      - exec: $resolve_with_fallback
+      - exec: accept
+  - tag: cached_main
+    type: sequence
+    args:
+      - exec: $response_cache
+      - matches: ["has_resp"]           # 命中缓存后必须显式停止后续查询
+        exec: accept
+      - exec: $resolve_with_fallback
+      - exec: accept
+
+  - tag: dns_udp
+    type: udp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+  - tag: dns_tcp
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+      cert: ""
+      key: ""
+      idle_timeout: 10
+  - tag: dns_tls
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:1853"
+      cert: "./tls/server.crt"
+      key: "./tls/server.key"
+      idle_timeout: 10
+  - tag: dns_quic
+    type: quic_server
+    args:
+      entry: main
+      listen: "127.0.0.1:1853"           # UDP，和TCP/DoT不冲突
+      cert: "./tls/server.crt"
+      key: "./tls/server.key"
+      idle_timeout: 30
+  - tag: dns_https
+    type: http_server
+    args:
+      entries:
+        - exec: main
+          path: /dns-query
+        - exec: cached_main
+          path: /dns-query-cached
+      listen: "127.0.0.1:18443"
+      src_ip_header: ""                 # 可信反代清洗后才填写X-Real-IP等
+      cert: "./tls/server.crt"
+      key: "./tls/server.key"
+      idle_timeout: 30

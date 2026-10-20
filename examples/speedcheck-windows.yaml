@@ -1,0 +1,57 @@
+# Windows: TCP probing works without raw socket privileges.
+# Replace the upstream addresses with DNS servers reachable from your network.
+log:
+  level: info
+
+plugins:
+  - tag: upstream_a
+    type: forward
+    args:
+      upstreams:
+        - addr: "udp://1.1.1.1"
+  - tag: upstream_b
+    type: forward
+    args:
+      upstreams:
+        - addr: "udp://8.8.8.8"
+
+  - tag: source_a
+    type: sequence
+    args:
+      - exec: $upstream_a
+  - tag: source_b
+    type: sequence
+    args:
+      - exec: $upstream_b
+
+  - tag: select_fast_ip
+    type: speedcheck
+    args:
+      sources: [source_a, source_b]
+      mode: bounded
+      total_timeout: 5s
+      selection_timeout: 300ms
+      settle_window: 25ms
+      probe:
+        tcp_ports: [80, 443]
+        icmp: false
+        timeout: 300ms
+      max_num: 1
+      threshold_ms: 100
+
+  - tag: main
+    type: sequence
+    args:
+      - exec: $select_fast_ip
+      - exec: accept
+
+  - tag: udp_listener
+    type: udp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+  - tag: tcp_listener
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"

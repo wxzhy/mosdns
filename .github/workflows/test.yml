@@ -21,3 +21,26 @@ jobs:
 
       - name: Test
         run: go test -race -v ./...
+
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            gomips: ""
+          - arch: mipsle
+            gomips: softfloat
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Build Linux / OpenWrt targets
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GOMIPS: ${{ matrix.gomips }}
+          CGO_ENABLED: "0"
+        run: go build ./...

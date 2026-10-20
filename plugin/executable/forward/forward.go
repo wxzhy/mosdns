@@ -31,6 +31,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_policy"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
@@ -287,6 +288,12 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	resChan := make(chan res)
 	done := make(chan struct{})
 	defer close(done)
+	upstreamParent := context.Background()
+	if query_policy.InheritCancellation(ctx) {
+		var cancel context.CancelFunc
+		upstreamParent, cancel = context.WithCancel(ctx)
+		defer cancel()
+	}
 
 	r := rand.IntN(len(us))
 	for i := 0; i < concurrent; i++ {
@@ -295,7 +302,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		go func(uqid uint32, question dns.Question) {
 			defer pool.ReleaseBuf(qc)
 			// Give each upstream a fixed timeout to finish the query.
-			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+			upstreamCtx, cancel := context.WithTimeout(upstreamParent, queryTimeout)
 			defer cancel()
 
 			var r *dns.Msg

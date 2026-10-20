@@ -53,6 +53,7 @@ func CheckNumRange[K constraints.Integer | constraints.Float](v, min, max K) boo
 // WeakDecode decodes args from config to output.
 func WeakDecode(in any, output any) error {
 	config := &mapstructure.DecoderConfig{
+		DecodeHook:       mapstructure.StringToTimeDurationHookFunc(),
 		ErrorUnused:      true,
 		Result:           output,
 		WeaklyTypedInput: true,

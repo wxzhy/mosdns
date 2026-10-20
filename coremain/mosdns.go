@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/IrineSistiana/mosdns/v5/pkg/safe_close"
+	"github.com/IrineSistiana/mosdns/v5/pkg/speedtest"
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -33,6 +34,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/pprof"
+	"sync"
 )
 
 type Mosdns struct {
@@ -44,6 +46,38 @@ type Mosdns struct {
 	httpMux    *chi.Mux
 	metricsReg *prometheus.Registry
 	sc         *safe_close.SafeClose
+	probeOnce  sync.Once
+	probes     *speedtest.Manager
+}
+
+// ProbeManager belongs to this instance, so selectors share flights, capacity
+// and raw RTTs. SafeClose waits for all sockets and probe workers on shutdown.
+func (m *Mosdns) ProbeManager() *speedtest.Manager {
+	m.probeOnce.Do(func() {
+		m.probes = speedtest.NewManager(speedtest.Options{Logger: m.logger})
+		reg := prometheus.WrapRegistererWithPrefix("speedcheck_manager_", m.GetMetricsReg())
+		reg.MustRegister(
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "active_sockets", Help: "Physical probe sockets currently reserved."}, func() float64 { return float64(m.probes.Stats().Active) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "queued_methods", Help: "Probe methods waiting for a socket slot."}, func() float64 { return float64(m.probes.Stats().Queued) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "flights", Help: "Shared IP/profile probe flights."}, func() float64 { return float64(m.probes.Stats().Flights) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "cache_entries", Help: "Raw probe results in the bounded cache."}, func() float64 { return float64(m.probes.Stats().CacheEntries) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "cache_hits_total", Help: "Subscriptions served from the raw probe cache."}, func() float64 { return float64(m.probes.Stats().CacheHits) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "shared_total", Help: "Subscriptions attached to an existing flight."}, func() float64 { return float64(m.probes.Stats().Shared) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "probes_total", Help: "Physical probe methods started."}, func() float64 { return float64(m.probes.Stats().Probes) }),
+		)
+		m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
+			defer done()
+			<-closeSignal
+			_ = m.probes.Close()
+		})
+		// Attach does not run when the instance has already been closed.
+		select {
+		case <-m.sc.ReceiveCloseSignal():
+			_ = m.probes.Close()
+		default:
+		}
+	})
+	return m.probes
 }
 
 // NewMosdns initializes a mosdns instance and its plugins.
