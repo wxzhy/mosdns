@@ -4,7 +4,7 @@ Windows amd64 可以运行本功能，默认 TCP 探测不需要 ICMP 权限。I
 
 ## 构建与启动
 
-仓库要求 Go 1.26.4 或更新版本。当前功能需从本工作树构建，旧版发行包不包含 `type: speedcheck`。
+仓库要求 Go 1.27.2 或更新版本（以 `go.mod` 为准）。当前功能需从本工作树构建，旧版发行包不包含 `type: speedcheck`。
 
 ```powershell
 Set-Location 'C:\Users\Lenovo\Documents\Dev\mosdns'

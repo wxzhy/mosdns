@@ -6,6 +6,8 @@
 
 docker 镜像: [docker hub](https://hub.docker.com/r/irinesistiana/mosdns)
 
+源码构建需要 Go 1.27.2 或更新版本，以 [go.mod](go.mod) 为准；参见[依赖更新与验证](docs/dependency-update.md)。
+
 本地配置参考：[顶层配置、全部已启用插件与 sequence 规则](docs/configuration-reference.md) · [全模块参数模板](docs/examples/all-modules.yaml)
 
 并行多上游测速选址：[speedcheck 配置与说明](docs/speedcheck.md) · [基础示例](examples/speedcheck.yaml) · [全参数示例](examples/speedcheck-full.yaml)

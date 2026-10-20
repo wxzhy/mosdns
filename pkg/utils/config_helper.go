@@ -20,9 +20,10 @@
 package utils
 
 import (
-	"github.com/mitchellh/mapstructure"
-	"golang.org/x/exp/constraints"
 	"strconv"
+
+	"github.com/go-viper/mapstructure/v2"
+	"golang.org/x/exp/constraints"
 )
 
 func SetDefaultNum[K constraints.Integer | constraints.Float](p *K, d K) {
