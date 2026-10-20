@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/mlog"
@@ -120,6 +121,8 @@ type Opt struct {
 	//   - tcp upstream: The first 16 bytes of each dns frame are sent as
 	//     TCP out-of-band data, so that middleboxes that don't process
 	//     urgent data can't reassemble the dns query.
+	//     Pipelining is disabled because TCP only retains one urgent pointer;
+	//     a later query could put the preceding urgent byte in the DNS stream.
 	UseTricks bool
 
 	// Bootstrap specifies a plain dns server to solve the
@@ -179,7 +182,7 @@ type Opt struct {
 //
 // sdns protocol parses a DNS stamp (sdns://...) which can express
 // plain/DNSCrypt/DoH/DoQ/DoT upstreams.
-func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
+func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 	if opt.Logger == nil {
 		opt.Logger = mlog.Nop()
 	}
@@ -336,6 +339,13 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			if err != nil {
 				return nil, err
 			}
+			defer func() {
+				if err != nil {
+					echResolver.Close()
+				} else {
+					upstream = &upstreamWithClose{Upstream: upstream, closers: []io.Closer{echResolver}}
+				}
+			}()
 		}
 	}
 
@@ -414,7 +424,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			}
 			return wrapConn(c, opt.EventObserver), nil
 		}
-		if opt.EnablePipeline {
+		if opt.EnablePipeline && !opt.UseTricks {
 			to := transport.TraditionalDnsConnOpts{
 				WithLengthHeader:   true,
 				IdleTimeout:        idleTimeout,
@@ -448,7 +458,12 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			// RFC 9461, some DoT providers (e.g., NextDNS on non-standard
 			// port 443) rely on ALPN to differentiate DoT from DoH traffic.
 			// See https://github.com/AdguardTeam/dnsproxy/issues/510.
-			tlsConfig.NextProtos = []string{"dot"}
+			// Preserve optional/no-ALPN fingerprints unless ALPN was explicit.
+			if useUTLS && (fp.Client == utls.HelloRandomizedNoALPN.Client || fp.Client == utls.HelloRandomized.Client) {
+				tlsConfig.NextProtos = nil
+			} else {
+				tlsConfig.NextProtos = []string{"dot"}
+			}
 		}
 
 		tcpDialer, err := newTcpDialer(false, defaultPort)
@@ -527,8 +542,8 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			quicConfig := newDefaultClientQuicConfig()
 			quicConfig.MaxIdleTimeout = idleConnTimeout
 
-			defer closeIfFuncErr(quicTransport)
-			addonCloser = quicTransport
+			addonCloser = &closeGroup{closers: []io.Closer{quicTransport, conn}}
+			defer closeIfFuncErr(addonCloser)
 			t = &http3.Transport{
 				TLSClientConfig: opt.TLSConfig,
 				QUICConfig:      quicConfig,
@@ -563,14 +578,20 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			if useUTLS {
 				// uTLS performs the TLS handshake itself.
 				t1.TLSClientConfig = nil
-				tlsCfg := opt.TLSConfig
+				tlsCfg := opt.TLSConfig.Clone()
 				if tlsCfg == nil {
 					tlsCfg = new(tls.Config)
 				}
+				if len(tlsCfg.ServerName) == 0 {
+					tlsCfg.ServerName = addrURL.Hostname()
+				}
 				if len(tlsCfg.NextProtos) == 0 {
-					c := tlsCfg.Clone()
-					c.NextProtos = []string{"h2", "http/1.1"}
-					tlsCfg = c
+					// Preserve optional/no-ALPN fingerprints unless ALPN was explicit.
+					if fp.Client == utls.HelloRandomizedNoALPN.Client || fp.Client == utls.HelloRandomized.Client {
+						tlsCfg.NextProtos = nil
+					} else {
+						tlsCfg.NextProtos = []string{"h2", "http/1.1"}
+					}
 				}
 				t1.DialTLSContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 					conn, err := tcpDialer(ctx)
@@ -602,10 +623,11 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			return nil, fmt.Errorf("failed to create doh upstream, %w", err)
 		}
 
-		return &dohWithClose{
-			u:      u,
-			closer: addonCloser,
-		}, nil
+		closers := []io.Closer{}
+		if addonCloser != nil {
+			closers = append(closers, addonCloser)
+		}
+		return &upstreamWithClose{Upstream: u, closers: closers}, nil
 	case "quic", "doq":
 		if useUTLS {
 			return nil, errors.New("fingerprint and ech_config_list are not supported for quic upstream")
@@ -653,6 +675,8 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			Conn:              uc,
 			StatelessResetKey: (*quic.StatelessResetKey)(srk),
 		}
+		owned := &closeGroup{closers: []io.Closer{t, uc}}
+		defer closeIfFuncErr(owned)
 
 		dialDnsConn := func(ctx context.Context) (transport.DnsConn, error) {
 			ua, err := udpBootstrap(ctx)
@@ -671,30 +695,37 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			}
 			c, err = ec.NextConnection(ctx)
 			if err != nil {
+				ec.CloseWithError(0, "failed to establish connection")
 				return nil, err
 			}
 			return transport.NewQuicDnsConn(c), nil
 		}
 
-		return transport.NewPipelineTransport(transport.PipelineOpts{
+		return &upstreamWithClose{Upstream: transport.NewPipelineTransport(transport.PipelineOpts{
 			DialContext: dialDnsConn,
 			// Quic rfc recommendation is 100. Some implications use 65535.
 			MaxConcurrentQueryWhileDialing: 90,
 			Logger:                         opt.Logger,
-		}), nil
+		}), closers: []io.Closer{owned}}, nil
 	case "sdns":
 		// Parse the stamp from the original address string.
 		// The round-tripped url string may not preserve the base64 encoding.
-		stamp, err := dnsstamps.NewServerStampFromString(addr)
+		stamp, err := parseDNSStamp(addr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse dns stamp, %w", err)
 		}
 
 		// If the stamp has a server ip, dial to it directly.
 		// High layer addresses (SNI, HTTP Host) are not affected.
-		if s := stamp.ServerAddrStr; len(s) > 0 {
+		if s := stamp.ServerAddrStr; len(s) > 0 && len(opt.DialAddr) == 0 {
 			if _, err := netip.ParseAddr(tryRemovePort(s)); err == nil {
 				opt.DialAddr = s
+			}
+		}
+		if len(stamp.Hashes) > 0 {
+			opt.TLSConfig, err = tlsConfigWithStampHashes(opt.TLSConfig, stamp.Hashes)
+			if err != nil {
+				return nil, err
 			}
 		}
 
@@ -702,8 +733,9 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		case dnsstamps.StampProtoTypePlain:
 			return NewUpstream("udp://"+stamp.ServerAddrStr, opt)
 		case dnsstamps.StampProtoTypeDNSCrypt:
-			// DNSCrypt always dials the stamp server address.
-			opt.DialAddr = stamp.ServerAddrStr
+			if len(opt.DialAddr) == 0 {
+				opt.DialAddr = stamp.ServerAddrStr
+			}
 
 			const defaultPort = 443
 			udpAddrResolve, err := newUdpAddrResolveFunc(defaultPort)
@@ -763,20 +795,36 @@ func (u *udpWithFallback) Close() error {
 	return nil
 }
 
-type dohWithClose struct {
-	u      *doh.Upstream
-	closer io.Closer // maybe nil
+type closeGroup struct {
+	closers []io.Closer
+	once    sync.Once
+	err     error
 }
 
-func (u *dohWithClose) ExchangeContext(ctx context.Context, m []byte) (*[]byte, error) {
-	return u.u.ExchangeContext(ctx, m)
+func (g *closeGroup) Close() error {
+	g.once.Do(func() {
+		for _, c := range g.closers {
+			g.err = errors.Join(g.err, c.Close())
+		}
+	})
+	return g.err
 }
 
-func (u *dohWithClose) Close() error {
-	if u.closer != nil {
-		return u.closer.Close()
-	}
-	return nil
+type upstreamWithClose struct {
+	Upstream
+	closers []io.Closer
+	once    sync.Once
+	err     error
+}
+
+func (u *upstreamWithClose) Close() error {
+	u.once.Do(func() {
+		u.err = u.Upstream.Close()
+		for _, c := range u.closers {
+			u.err = errors.Join(u.err, c.Close())
+		}
+	})
+	return u.err
 }
 
 func newDefaultClientQuicConfig() *quic.Config {

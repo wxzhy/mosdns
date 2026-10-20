@@ -77,6 +77,16 @@ var (
 	bufPool4k = pool.NewBytesBufPool(4096)
 )
 
+func (u *Upstream) Close() error {
+	if closer, ok := u.rt.(io.Closer); ok {
+		return closer.Close()
+	}
+	if closer, ok := u.rt.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+	return nil
+}
+
 func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, error) {
 	if len(q) < dnsutils.DnsHeaderLen {
 		return nil, dnsutils.ErrPayloadTooSmall
@@ -164,7 +174,13 @@ func (u *Upstream) exchange(ctx context.Context, dnsQuery string) (*[]byte, erro
 	req := u.reqTemplate.WithContext(ctx)
 	req.URL = new(urlpkg.URL)
 	*req.URL = *u.urlTemplate
-	req.URL.RawQuery = dnsQuery
+	if req.URL.RawQuery == "" {
+		req.URL.RawQuery = dnsQuery
+	} else {
+		params := req.URL.Query()
+		params.Set("dns", strings.TrimPrefix(dnsQuery, "dns="))
+		req.URL.RawQuery = params.Encode()
+	}
 	resp, err := u.rt.RoundTrip(req)
 	if err != nil {
 		return nil, fmt.Errorf("http request failed: %w", err)

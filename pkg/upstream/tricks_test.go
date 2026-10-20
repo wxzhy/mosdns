@@ -22,10 +22,12 @@ package upstream
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/miekg/dns"
 )
 
@@ -139,4 +141,43 @@ func Test_TCP_use_tricks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_TCP_use_tricks_long_pipeline(t *testing.T) {
+	addr, shutdown := newTCPTestServer(t, &vServer{})
+	defer shutdown()
+	u, err := NewUpstream("tcp://"+addr, Opt{UseTricks: true, EnablePipeline: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	var wg sync.WaitGroup
+	for i := range 64 {
+		wg.Go(func() {
+			q := new(dns.Msg)
+			q.SetQuestion(fmt.Sprintf("query-%d.long-domain-for-tcp-trick.example.", i), dns.TypeA)
+			payload, err := q.Pack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			r, err := u.ExchangeContext(ctx, payload)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer pool.ReleaseBuf(r)
+			resp := new(dns.Msg)
+			if err := resp.Unpack(*r); err != nil {
+				t.Error(err)
+				return
+			}
+			if len(resp.Question) != 1 || resp.Question[0] != q.Question[0] {
+				t.Errorf("response question mismatch: %v", resp.Question)
+			}
+		})
+	}
+	wg.Wait()
 }

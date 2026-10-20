@@ -153,6 +153,61 @@ func Test_fastUpstream(t *testing.T) {
 	}
 }
 
+func TestStampDialAddrOverride(t *testing.T) {
+	t.Run("plain", func(t *testing.T) {
+		addr, shutdown := newUDPTestServer(t, &vServer{})
+		defer shutdown()
+		stamp := (&dnsstamps.ServerStamp{Proto: dnsstamps.StampProtoTypePlain, ServerAddrStr: "127.0.0.2:1"}).String()
+		u, err := NewUpstream(stamp, Opt{DialAddr: addr})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer u.Close()
+		if err := testUpstream(u); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("dnscrypt", func(t *testing.T) {
+		stampStr := startDNSCryptTestServer(t, dnscryptTestHandler{})
+		stamp, err := dnsstamps.NewServerStampFromString(stampStr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := stamp.ServerAddrStr
+		stamp.ServerAddrStr = "127.0.0.2:1"
+		u, err := NewUpstream(stamp.String(), Opt{DialAddr: addr})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer u.Close()
+		if err := testUpstream(u); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestQUICUpstreamClosesOwnedSocket(t *testing.T) {
+	for _, addr := range []string{"quic://127.0.0.1", "h3://127.0.0.1/dns-query"} {
+		t.Run(addr, func(t *testing.T) {
+			u, err := NewUpstream(addr, Opt{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			group := u.(*upstreamWithClose).closers[0].(*closeGroup)
+			conn := group.closers[1].(net.PacketConn)
+			if err := u.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.SetDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("owned UDP socket remains open: %v", err)
+			}
+			if err := u.Close(); err != nil {
+				t.Fatalf("second close failed: %v", err)
+			}
+		})
+	}
+}
+
 // startDNSCryptTestServer starts a DNSCrypt test server (udp + tcp)
 // and returns its stamp string.
 func startDNSCryptTestServer(t testing.TB, h dnscrypt.Handler) (stampStr string) {
@@ -221,7 +276,7 @@ func Test_sdnsUpstream(t *testing.T) {
 		addr, shutdownServer := newUDPTestServer(t, &vServer{})
 		defer shutdownServer()
 		stampStr := (&dnsstamps.ServerStamp{
-			Proto:        dnsstamps.StampProtoTypePlain,
+			Proto:         dnsstamps.StampProtoTypePlain,
 			ServerAddrStr: addr,
 		}).String()
 
