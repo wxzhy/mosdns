@@ -589,6 +589,9 @@ func (s *Selector) selectResponse(states []*candidateState, probes map[netip.Add
 		if c == nil {
 			continue
 		}
+		if until := c.value.Snapshot.ValidUntil; !until.IsZero() && !now.Before(until) {
+			continue
+		}
 		for _, a := range c.value.Addresses {
 			// An original TTL zero answer is valid for this reply. A nonzero
 			// address that expired while collecting sources cannot be revived.

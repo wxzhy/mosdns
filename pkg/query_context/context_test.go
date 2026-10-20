@@ -2,6 +2,7 @@ package query_context
 
 import (
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -42,6 +43,33 @@ func TestResponseSnapshotCommitsOnlyResponse(t *testing.T) {
 	}
 	if parent.R().IsEdns0() != nil || !parent.QOpt().Do() || !parent.RespOpt().Do() {
 		t.Fatal("OPT ownership or DO propagation is broken")
+	}
+}
+
+func TestResponseLifetimeBoundSurvivesSnapshotsAndCopies(t *testing.T) {
+	q := new(dns.Msg).SetQuestion("example.org.", dns.TypeA)
+	c := NewContext(q)
+	until := time.Now().Add(time.Second)
+	c.CommitResponse(ResponseSnapshot{Response: new(dns.Msg).SetReply(c.Q()), ValidUntil: until})
+	if !c.SnapshotResponse().Clone().ValidUntil.Equal(until) || !c.Copy().SnapshotResponse().ValidUntil.Equal(until) {
+		t.Fatal("absolute response lifetime was lost during snapshot/copy")
+	}
+	d := NewContext(q.Copy())
+	c.CopyTo(d)
+	if !d.SnapshotResponse().ValidUntil.Equal(until) {
+		t.Fatal("CopyTo lost response lifetime")
+	}
+	d.SetResponse(new(dns.Msg).SetReply(d.Q()))
+	if !d.SnapshotResponse().ValidUntil.IsZero() {
+		t.Fatal("new raw response inherited old synthesized lifetime")
+	}
+	c.CommitResponse(ResponseSnapshot{})
+	if !c.SnapshotResponse().ValidUntil.IsZero() {
+		t.Fatal("clearing response retained old lifetime")
+	}
+	c.CopyTo(d)
+	if !d.SnapshotResponse().ValidUntil.IsZero() {
+		t.Fatal("CopyTo retained destination lifetime")
 	}
 }
 

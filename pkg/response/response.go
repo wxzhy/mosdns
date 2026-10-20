@@ -98,6 +98,24 @@ func Analyze(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Ti
 	if err := c.findAddresses(); err != nil {
 		return nil, err
 	}
+	// Capture the source lease before any Replay or rewrite can round a short
+	// positive TTL to zero. This also bounds an otherwise long-lived address
+	// by the nonzero lifetime of the aliases needed to reach it.
+	if len(c.Addresses) > 0 {
+		var bounds ttlBounds
+		bounds.includeValidity(c.Snapshot.ValidUntil)
+		for _, address := range c.Addresses {
+			if address.ExpiresAt.After(c.ReceivedAt) {
+				bounds.includeValidity(address.ExpiresAt)
+			}
+		}
+		for _, link := range c.chain {
+			if link.expiresAt.After(c.ReceivedAt) {
+				bounds.includeValidity(link.expiresAt)
+			}
+		}
+		c.Snapshot.ValidUntil = bounds.validUntil
+	}
 	c.Negative = len(c.Addresses) == 0
 	c.Rewritable = !c.Negative && !opaque(r)
 	if opt := query.IsEdns0(); opt != nil && opt.Do() {
@@ -238,21 +256,10 @@ func Rebuild(anchor *Candidate, selected []SelectedAddress, now time.Time) (quer
 	if anchor == nil || !anchor.Rewritable || len(selected) == 0 {
 		return query_context.ResponseSnapshot{}, fmt.Errorf("response: no rewritable selection")
 	}
-	var expiry time.Time
-	var expirySet bool
-	minTTL := ^uint32(0)
+	var bounds ttlBounds
 	contributors := make(map[*Candidate]bool)
 	seen := make(map[netip.Addr]bool)
 	var records []dns.RR
-	bound := func(expiresAt time.Time, originalTTL uint32) {
-		if !expirySet || expiresAt.Before(expiry) {
-			expiry = expiresAt
-			expirySet = true
-		}
-		if originalTTL < minTTL {
-			minTTL = originalTTL
-		}
-	}
 	for _, item := range selected {
 		c := item.Candidate
 		if !Compatible(anchor, c) {
@@ -263,7 +270,10 @@ func Rebuild(anchor *Candidate, selected []SelectedAddress, now time.Time) (quer
 			return query_context.ResponseSnapshot{}, fmt.Errorf("response: address does not belong to candidate")
 		}
 		rr := c.Snapshot.Response.Answer[address.Index]
-		bound(address.ExpiresAt, rr.Header().Ttl)
+		bounds.include(address.ExpiresAt, rr.Header().Ttl)
+		if address.ExpiresAt.After(c.ReceivedAt) {
+			bounds.includeValidity(address.ExpiresAt)
+		}
 		contributors[c] = true
 		if seen[address.IP] {
 			continue
@@ -273,17 +283,97 @@ func Rebuild(anchor *Candidate, selected []SelectedAddress, now time.Time) (quer
 		copyRR.Header().Name = anchor.Terminal
 		records = append(records, copyRR)
 	}
+	return rebuildRecords(anchor, records, contributors, bounds, now), nil
+}
+
+// ReplaceAddresses creates a policy response with new terminal addresses rather
+// than selecting addresses from source candidates. The original complete RRset
+// and alias chain bound every replacement's lifetime. Only an address candidate
+// that Analyze marked rewritable can be used; in particular, DNSSEC requests,
+// truncated replies and opaque responses cannot be replaced.
+func ReplaceAddresses(anchor *Candidate, ips []netip.Addr, now time.Time) (query_context.ResponseSnapshot, error) {
+	if anchor == nil || !anchor.Rewritable || anchor.Snapshot.Response == nil ||
+		anchor.Question.Qclass != dns.ClassINET ||
+		(anchor.Question.Qtype != dns.TypeA && anchor.Question.Qtype != dns.TypeAAAA) ||
+		anchor.Snapshot.Response.Rcode != dns.RcodeSuccess || anchor.Snapshot.Response.Truncated ||
+		len(anchor.Addresses) == 0 || len(ips) == 0 {
+		return query_context.ResponseSnapshot{}, fmt.Errorf("response: no rewritable address replacement")
+	}
+	var records []dns.RR
+	seen := make(map[netip.Addr]bool)
+	for _, ip := range ips {
+		if !ip.IsValid() || ip.Zone() != "" ||
+			(anchor.Question.Qtype == dns.TypeA && !ip.Is4()) ||
+			(anchor.Question.Qtype == dns.TypeAAAA && !ip.Is6()) {
+			return query_context.ResponseSnapshot{}, fmt.Errorf("response: invalid replacement address %s for %s", ip, dns.TypeToString[anchor.Question.Qtype])
+		}
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		hdr := dns.RR_Header{Name: anchor.Terminal, Rrtype: anchor.Question.Qtype, Class: anchor.Question.Qclass}
+		if ip.Is4() {
+			records = append(records, &dns.A{Hdr: hdr, A: ip.AsSlice()})
+		} else {
+			records = append(records, &dns.AAAA{Hdr: hdr, AAAA: ip.AsSlice()})
+		}
+	}
+	var bounds ttlBounds
+	for _, address := range anchor.Addresses {
+		rr := anchor.Snapshot.Response.Answer[address.Index]
+		bounds.include(address.ExpiresAt, rr.Header().Ttl)
+		if address.ExpiresAt.After(anchor.ReceivedAt) {
+			bounds.includeValidity(address.ExpiresAt)
+		}
+	}
+	return rebuildRecords(anchor, records, map[*Candidate]bool{anchor: true}, bounds, now), nil
+}
+
+type ttlBounds struct {
+	expiry     time.Time
+	set        bool
+	minTTL     uint32
+	validUntil time.Time
+}
+
+func (b *ttlBounds) include(expiresAt time.Time, originalTTL uint32) {
+	if !b.set || expiresAt.Before(b.expiry) {
+		b.expiry = expiresAt
+	}
+	if !b.set || originalTTL < b.minTTL {
+		b.minTTL = originalTTL
+	}
+	b.set = true
+}
+
+func (b *ttlBounds) includeValidity(deadline time.Time) {
+	if !deadline.IsZero() && (b.validUntil.IsZero() || deadline.Before(b.validUntil)) {
+		b.validUntil = deadline
+	}
+}
+
+// records are already independent of all candidates. Both selection and address
+// replacement use this path so aliases, authentication flags and EDNS policy
+// cannot drift between the two kinds of synthesized response.
+func rebuildRecords(anchor *Candidate, records []dns.RR, contributors map[*Candidate]bool, bounds ttlBounds, now time.Time) query_context.ResponseSnapshot {
 	// The anchor supplies the aliases even when all selected records came from
 	// another compatible candidate.
 	contributors[anchor] = true
 	for c := range contributors {
+		bounds.includeValidity(c.Snapshot.ValidUntil)
 		for _, link := range c.chain {
-			bound(link.expiresAt, link.rr.Hdr.Ttl)
+			bounds.include(link.expiresAt, link.rr.Hdr.Ttl)
+			if link.expiresAt.After(c.ReceivedAt) {
+				bounds.includeValidity(link.expiresAt)
+			}
 		}
 	}
-	ttl := ttlUntil(expiry, now)
-	if ttl > minTTL {
-		ttl = minTTL
+	ttl := ttlUntil(bounds.expiry, now)
+	if !bounds.validUntil.IsZero() {
+		ttl = min(ttl, ttlUntil(bounds.validUntil, now))
+	}
+	if ttl > bounds.minTTL {
+		ttl = bounds.minTTL
 	}
 	r := new(dns.Msg)
 	r.MsgHdr = dns.MsgHdr{
@@ -304,7 +394,7 @@ func Rebuild(anchor *Candidate, selected []SelectedAddress, now time.Time) (quer
 		r.Answer = append(r.Answer, rr)
 	}
 	upstreamOpt, respOpt := rebuiltOpts(anchor, contributors)
-	return query_context.ResponseSnapshot{Response: r, UpstreamOpt: upstreamOpt, RespOpt: respOpt, ReceivedAt: now}, nil
+	return query_context.ResponseSnapshot{Response: r, UpstreamOpt: upstreamOpt, RespOpt: respOpt, ReceivedAt: now, ValidUntil: bounds.validUntil}
 }
 
 func (c *Candidate) address(want Address) (Address, bool) {
