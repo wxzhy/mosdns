@@ -1,0 +1,70 @@
+# Run from the repository directory: mosdns start -c examples/ip-replace.yaml
+# Local-only demonstration: no upstream, GeoIP database, or speedcheck probe.
+# These documentation addresses demonstrate rewriting; do not probe them.
+log:
+  level: info
+  production: false
+include: []
+api:
+  http: "127.0.0.1:19091"
+plugins:
+  - tag: cdn_networks
+    type: ip_set
+    args:
+      ips: ["192.0.2.0/24", "2001:db8:20::/48"]
+      sets: []
+      files: []
+
+  - tag: demo_hosts
+    type: hosts
+    args:
+      entries:
+        - "cdn.ip-replace.invalid 192.0.2.42 2001:db8:20::42"
+      files: []
+
+  - tag: replace_cdn
+    type: ip_replace
+    args:
+      replace_map:
+        - match_ip: ["$cdn_networks"]
+          exclude_ip: []
+          ipv4_prefixlen: 24        # Default 32; accepts 0..32.
+          ipv6_prefixlen: 64        # Default 128; accepts 0..128.
+          # Host bits in each base are masked off, not added to the old IP.
+          ipv4: ["203.0.113.99", "198.51.100.77"]
+          ipv6: ["2001:db8:100::99"]
+
+  - tag: main
+    type: sequence
+    args:
+      - exec: $demo_hosts
+      - exec: $replace_cdn
+      - matches: ["has_resp"]
+        exec: accept
+      - exec: reject 3              # Only the demonstration name is defined.
+
+  - tag: udp_listener
+    type: udp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+  - tag: tcp_listener
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+      idle_timeout: 10
+
+# Production wiring with speedcheck (replace addresses with real networks):
+# Define replace_cdn before source_a/source_b, then call it in every source:
+# source_a.args:
+#   - exec: $upstream_a
+#   - exec: $source_response_filters
+#   - exec: $replace_cdn
+# source_b.args:
+#   - exec: $upstream_b
+#   - exec: $source_response_filters
+#   - exec: $replace_cdn
+# speedcheck.args.sources: [source_a, source_b]
+# Rewriting must precede source publication, not follow speedcheck: only the
+# rewritten addresses should be probed and ranked. Other sources still overlap.

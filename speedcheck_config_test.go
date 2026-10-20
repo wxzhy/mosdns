@@ -86,6 +86,7 @@ func TestDocumentedExamplesUseKnownPluginParameters(t *testing.T) {
 		"examples/speedcheck.yaml",
 		"examples/speedcheck-windows.yaml",
 		"examples/speedcheck-full.yaml",
+		"examples/ip-replace.yaml",
 		"docs/examples/all-modules.yaml",
 	} {
 		t.Run(path, func(t *testing.T) {

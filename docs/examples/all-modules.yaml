@@ -41,6 +41,18 @@ plugins:
       ips: ["ext:./data/Country.mmdb:CN", "ext:./data/ASN.mmdb:AS13335"]
       sets: [ips_base]
       files: []
+  - tag: replace_cdn
+    type: ip_replace
+    args:
+      replace_map:
+        - match_ip: ["$ips_database", "192.0.2.0/24", "2001:db8:20::/48"]
+          exclude_ip: ["192.0.2.99", "2001:db8:20::99"]
+          ipv4_prefixlen: 24              # 默认32；0..32，0保留原IP全部位
+          ipv6_prefixlen: 64              # 默认128；0..128
+          ipv4: ["203.0.113.99", "198.51.100.77"]
+          ipv6: ["2001:db8:100::99"]
+          # 基址按prefix掩码规范化。目标是文档地址，下面no_probe禁止探测。
+          # 正式使用需替换为实际CDN网段；不带CIDR，prefix由上面字段指定。
   - tag: hosts_local
     type: hosts
     args:
@@ -136,12 +148,14 @@ plugins:
       - exec: $upstream_full
       - matches: ["rcode 2 5"]
         exec: drop_resp
+      - exec: $replace_cdn                 # 过滤后、来源发布/测速前替换
   - tag: source_b
     type: sequence
     args:
       - exec: $upstream_b
       - matches: ["rcode 2 5"]
         exec: drop_resp
+      - exec: $replace_cdn
   - tag: select_fast_ip
     type: speedcheck
     args:
@@ -160,7 +174,7 @@ plugins:
         preferred: ["$ips_database"]
         global: ["0.0.0.0/0", "::/0"]
         blocked: ["0.0.0.0/8", "::/128"]
-        no_probe: ["198.18.0.0/15"]
+        no_probe: ["198.18.0.0/15", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32"]
       tag_multipliers:
         - tag: preferred
           multiplier: 0.8
