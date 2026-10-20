@@ -10,4 +10,6 @@ docker 镜像: [docker hub](https://hub.docker.com/r/irinesistiana/mosdns)
 
 并行多上游测速选址：[speedcheck 配置与说明](docs/speedcheck.md) · [基础示例](examples/speedcheck.yaml) · [全参数示例](examples/speedcheck-full.yaml)
 
+CDN 地址前缀替换：[ip_replace 参数与行为](docs/ip-replace.md) · [无外网演示配置](examples/ip-replace.yaml)
+
 Windows：[运行与配置](docs/speedcheck-windows.md) · [UDP/TCP 完整示例](examples/speedcheck-windows.yaml)

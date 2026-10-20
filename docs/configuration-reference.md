@@ -6,6 +6,8 @@
 
 `speedcheck` 的完整参数、并行时序、标签、ASN 和过滤示例见 [speedcheck](speedcheck.md)、[Windows 运行说明](speedcheck-windows.md) 及 [完整测速示例](../examples/speedcheck-full.yaml)。本页同时覆盖其余全部已启用模块，不能把所有片段直接拼成一个生产配置：有些动作互斥，有些依赖数据库、证书或 Linux 防火墙集合。
 
+`ip_replace` 支持按前缀替换 CDN 地址；[独立说明](ip-replace.md) 包含计算方式与测速接线，[本地演示](../examples/ip-replace.yaml) 使用 hosts 生成原响应，无需外网或数据库。
+
 [全模块 YAML 参数模板](examples/all-modules.yaml) 将全部顶层插件和完整参数汇集到同一文件，可用于严格解码检查；文件顶部列出了外部资源要求。模块片段适用于插入 `plugins` 列表，动作片段适用于 sequence 的 `args` 列表。
 
 ## 一个可启动的配置
@@ -325,6 +327,37 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
 ```
 
 在 sequence 使用 `$hosts_local` 后接 `matches: [has_resp]`、`exec: accept`，避免后续上游覆盖本地响应。
+
+### ip_replace：CDN IP 前缀替换
+
+只对合法 IN/A、IN/AAAA 正响应的 CNAME 终点地址执行替换；按规则顺序、原记录顺序选取首个匹配 IP，使用其主机位生成目标列表。替换后只返回生成地址，不混入原地址。完整说明与无外网演示见 [ip_replace](ip-replace.md)。
+
+| `args` 字段 | 默认值与行为 |
+| --- | --- |
+| `replace_map` | 有序规则列表，空列表不替换。 |
+| `replace_map[].match_ip` | 必填、非空的 IP matcher 表达式列表，列表内 OR；支持 IP/CIDR、`$ip_set`、`&文件`、GeoIP/ASN/`ext:`。 |
+| `replace_map[].exclude_ip` | 默认空；逐 IP 排除，优先于当前规则的 match。 |
+| `replace_map[].ipv4_prefixlen` | 默认 `32`，整数 `0..32`；显式 `0` 保留原地址全部位。 |
+| `replace_map[].ipv6_prefixlen` | 默认 `128`，整数 `0..128`；显式 `0` 保留原地址全部位。 |
+| `replace_map[].ipv4` | 默认空；不带 CIDR 的 IPv4 目标列表，按配置顺序生成并去重。 |
+| `replace_map[].ipv6` | 默认空；不带 CIDR 的 IPv6 目标列表，按配置顺序生成并去重。 |
+
+```yaml
+- tag: replace_cdn
+  type: ip_replace
+  args:
+    replace_map:
+      - match_ip: ["192.0.2.0/24", "2001:db8:20::/48"]
+        exclude_ip: []
+        ipv4_prefixlen: 24
+        ipv6_prefixlen: 64
+        ipv4: ["203.0.113.99", "198.51.100.77"]
+        ipv6: ["2001:db8:100::99"]
+```
+
+地址计算为 `(目标 & 前缀掩码) | (原地址 & 主机位掩码)`，目标自动规范化。例如 `192.0.2.42` 配目标 `203.0.113.99`、prefix 24，生成 `203.0.113.42`；不会把基址与原主机位相加。默认 `/32`、`/128` 等同固定地址替换。首个命中规则没有当前地址族目标时保留原响应并结束，不继续匹配后面的规则。配置中非法 IP、地址族或 prefix 会在启动时报错；目标不接受带 zone 的 IPv6 或 IPv4-mapped IPv6。
+
+在 speedcheck 的每个来源中，放在 forward 和必需过滤之后、来源 sequence 返回之前，保证测速的是替换地址。DO=1 跳过；重建保留 CNAME 和剩余 TTL，清理 AD/AA 及失效证明记录。HTTPS/SVCB hint 与 ECS 不改写。示例使用文档地址，不应对它们运行真实探测；实际使用需换成目标 CDN 网段。
 
 ### arbitrary
 
@@ -676,9 +709,9 @@ TCP/HTTP 监听地址以 `@` 开头时，代码会选择 Unix socket；这是面
 
 - 数据：`domain_set`、`ip_set`。
 - 匹配：`client_ip`、`cname`、`env`、`has_resp`、`has_wanted_ans`、`ptr_ip`、`qclass`、`qname`、`qtype`、`random`、`rcode`、`resp_ip`、`string_exp`、`mark`，及 `_true`/`_false`。
-- 执行：`arbitrary`、`black_hole`、`cache`、`debug_print`、`drop_resp`、`dual_selector` 的 `prefer_ipv4`/`prefer_ipv6`、`ecs_handler`/`ecs`、`forward`、`forward_edns0opt`、`hosts`、`ipset`、`metrics_collector`、`nftset`、`query_summary`、`rate_limiter`（实际 matcher）、`redirect`、`reverse_lookup`、`sequence`/内置控制流、`fallback`、`sleep`、`ttl`。`speedcheck` 链接至专门参考和完整示例。
+- 执行：`arbitrary`、`black_hole`、`cache`、`debug_print`、`drop_resp`、`dual_selector` 的 `prefer_ipv4`/`prefer_ipv6`、`ecs_handler`/`ecs`、`forward`、`forward_edns0opt`、`hosts`、`ip_replace`、`ipset`、`metrics_collector`、`nftset`、`query_summary`、`rate_limiter`（实际 matcher）、`redirect`、`reverse_lookup`、`sequence`/内置控制流、`fallback`、`sleep`、`ttl`。`speedcheck` 链接至专门参考和完整示例。
 - 服务：`http_server`、`quic_server`、`tcp_server`、`udp_server`。
 
 配置核对顺序：先检查顶层/插件字段名及依赖定义顺序，再检查单位和快速语法，最后在本机未占用端口启动并做真实查询。程序目前没有独立的“只解析、不启动插件”配置检查命令；`start` 会真实打开文件、数据库和监听 socket。不要把源码中未注册的结构字段或内部常量当成用户配置项。
 
-在仓库根目录运行 `go test . -run TestDocumentedExamplesUseKnownPluginParameters`，可严格解码四份示例，检查未知字段、插件类型及全部顶层注册类型的示例覆盖。全模块/全参数模板只做解码，不加载其外部资源；基础配置另有无外网的初始化、A/AAAA 静态 fallback 测试。这些检查不代替目标环境中的数据库、证书和网络验证。
+在仓库根目录运行 `go test . -run TestDocumentedExamplesUseKnownPluginParameters`，可严格解码示例，检查未知字段、插件类型及全部顶层注册类型的示例覆盖。全模块/全参数模板只做解码，不加载其外部资源；基础测速配置和 IP 替换演示另有无外网的初始化及 A/AAAA 主链测试。这些检查不代替目标环境中的数据库、证书和网络验证。

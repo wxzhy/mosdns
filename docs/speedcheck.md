@@ -131,6 +131,21 @@ bounded 在收集窗口、首正答上限、总预算、全部工作完成中最
 
 这里 `resp_ip` 检查 Answer 内的 A/AAAA；选择器自身的 `candidate_filter` 仅检查 CNAME 终点地址，范围不同。一个 `matches` 列表中多个条件为 AND，单个 matcher 内的多个取值一般为 OR。慢过滤也会推迟此来源开始测速，因此只把提交候选必需的处理放在来源中；写 ipset/nftset 等副作用放在最终选择后。
 
+若需替换 CDN IP，先声明 [`ip_replace`](ip-replace.md)，再在每个来源的查询和必需过滤之后调用；不能放在最终 speedcheck 选址之后：
+
+```yaml
+# replace_cdn 和 source_response_filters 应在来源之前定义。
+- tag: source_a
+  type: sequence
+  args:
+    - exec: $upstream_a
+    - exec: $source_response_filters
+    - exec: $replace_cdn
+# source_b 同样依次调用 upstream_b、过滤、replace_cdn。
+```
+
+来源返回后，候选标签、ASN 权重、过滤、探测和缓存均采用替换地址；相同目标可跨来源共享 RTT。替换不增加收齐屏障，其他来源继续并行查询。客户端或查询 DO=1 时跳过替换。无需外网、不会真实探测文档地址的独立演示见 [ip-replace.yaml](../examples/ip-replace.yaml)。
+
 基础示例的 `fallback.speedcheck.invalid` 同时在两个来源中被跳过，外层 fallback 随主分支失败立即取静态 hosts。`fallback.threshold` 的单位为毫秒，`5000` 与默认选择总预算配合，避免静态答案在正常选择窗口之前抢先返回。有效 NXDOMAIN/NODATA 是成功结果，不会自动触发兜底。`always_standby: true` 会立即准备 secondary，在阈值或主分支失败后才能采用它；静态主机仅配置明确允许的域名。
 
 ```yaml
