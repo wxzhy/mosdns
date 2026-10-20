@@ -18,15 +18,11 @@
  */
 
 // Package dnscrypt implements a DNSCrypt v2 upstream.
-//
-// Note: The resolver certificate is fetched by the dns library itself,
-// which dials the server with its own net.Dialer. Socket options
-// (so_mark, bind_to_device), socks5 proxy and bootstrap are only
-// applied to query connections (see Opt.UDPDialContext/TCPDialContext).
 package dnscrypt
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"log/slog"
 	"net"
@@ -64,7 +60,8 @@ type Upstream struct {
 	dialTCP func(ctx context.Context) (net.Conn, error)
 
 	// mu protects ri.
-	mu sync.RWMutex
+	mu       sync.RWMutex
+	fetchSem chan struct{}
 	// ri is the fetched resolver certificate info. May be nil.
 	ri *dnscrypt.ResolverInfo
 }
@@ -77,6 +74,9 @@ func NewUpstream(stampStr string, opt Opt) (*Upstream, error) {
 	}
 	if stamp.Proto != dnsstamps.StampProtoTypeDNSCrypt {
 		return nil, fmt.Errorf("unexpected stamp protocol [%d]", stamp.Proto)
+	}
+	if len(stamp.ServerPk) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("invalid dnscrypt public key length %d", len(stamp.ServerPk))
 	}
 
 	logger := opt.Logger
@@ -101,11 +101,13 @@ func NewUpstream(stampStr string, opt Opt) (*Upstream, error) {
 
 	var libLogger *slog.Logger = slog.New(slog.DiscardHandler)
 	return &Upstream{
-		stamp:  stamp,
-		logger: logger,
+		fetchSem: make(chan struct{}, 1),
+		stamp:    stamp,
+		logger:   logger,
 		udpClt: dnscrypt.NewClient(&dnscrypt.ClientConfig{
-			Logger: libLogger,
-			Proto:  dnscrypt.ProtoUDP,
+			Logger:  libLogger,
+			Proto:   dnscrypt.ProtoUDP,
+			UDPSize: dns.MaxMsgSize,
 		}),
 		tcpClt: dnscrypt.NewClient(&dnscrypt.ClientConfig{
 			Logger: libLogger,
@@ -118,7 +120,12 @@ func NewUpstream(stampStr string, opt Opt) (*Upstream, error) {
 
 // ExchangeContext exchanges query message m to the upstream, and returns
 // response. It does not keep or modify m.
-func (u *Upstream) ExchangeContext(ctx context.Context, m []byte) (*[]byte, error) {
+func (u *Upstream) ExchangeContext(ctx context.Context, m []byte) (_ *[]byte, err error) {
+	defer func() {
+		if err != nil && ctx.Err() != nil {
+			err = context.Cause(ctx)
+		}
+	}()
 	req := new(dns.Msg)
 	if err := req.Unpack(m); err != nil {
 		return nil, fmt.Errorf("invalid query message, %w", err)
@@ -141,7 +148,9 @@ func (u *Upstream) exchange(ctx context.Context, req *dns.Msg, ri *dnscrypt.Reso
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial udp conn, %w", err)
 	}
+	stop := closeOnCancel(ctx, conn)
 	resp, err := u.udpClt.ExchangeConnContext(ctx, conn, req, ri)
+	stop()
 	conn.Close()
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange query, %w", err)
@@ -154,7 +163,9 @@ func (u *Upstream) exchange(ctx context.Context, req *dns.Msg, ri *dnscrypt.Reso
 		if err != nil {
 			return nil, fmt.Errorf("failed to dial tcp conn, %w", err)
 		}
+		stop := closeOnCancel(ctx, conn)
 		resp, err = u.tcpClt.ExchangeConnContext(ctx, conn, req, ri)
+		stop()
 		conn.Close()
 		if err != nil {
 			return nil, fmt.Errorf("failed to exchange query via tcp, %w", err)
@@ -180,20 +191,33 @@ func (u *Upstream) fetchResolverInfo(ctx context.Context) (*dnscrypt.ResolverInf
 		return ri, nil
 	}
 
-	u.mu.Lock()
-	defer u.mu.Unlock()
+	select {
+	case u.fetchSem <- struct{}{}:
+		defer func() { <-u.fetchSem }()
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
 	// Re-check. Another goroutine may have fetched it.
 	now = uint32(time.Now().Unix())
-	if u.ri != nil && u.ri.ResolverCert.NotAfter >= now {
-		return u.ri, nil
+	u.mu.RLock()
+	ri = u.ri
+	u.mu.RUnlock()
+	if ri != nil && ri.ResolverCert.NotAfter >= now {
+		return ri, nil
 	}
 
-	ri, err := u.udpClt.DialStampContext(ctx, u.stamp)
+	ri, err := u.fetchCertificate(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch resolver certificate, %w", err)
 	}
+	u.mu.Lock()
 	u.ri = ri
+	u.mu.Unlock()
 	return ri, nil
+}
+
+func closeOnCancel(ctx context.Context, conn net.Conn) func() bool {
+	return context.AfterFunc(ctx, func() { conn.Close() })
 }
 
 // Close implements the io.Closer interface. It is a no-op.

@@ -21,25 +21,31 @@ package dnscrypt
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/AdguardTeam/dnscrypt"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/ameshkov/dnsstamps"
 	"github.com/miekg/dns"
 )
 
 // startTestServer starts a DNSCrypt test server (udp + tcp) and returns
 // its stamp string.
-func startTestServer(t testing.TB, h dnscrypt.Handler) (stampStr string) {
+func startTestServer(t testing.TB, h dnscrypt.Handler, constructions ...dnscrypt.CryptoConstruction) (stampStr string) {
 	t.Helper()
 
 	rc, err := dnscrypt.GenerateResolverConfig("example.com", nil, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(constructions) > 0 {
+		rc.ESVersion = constructions[0]
 	}
 	cert, err := rc.NewCert()
 	if err != nil {
@@ -121,6 +127,7 @@ func exchange(t testing.TB, u *Upstream) *dns.Msg {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer pool.ReleaseBuf(r)
 
 	resp := new(dns.Msg)
 	if err := resp.Unpack(*r); err != nil {
@@ -207,5 +214,120 @@ func TestNewUpstream_InvalidStamp(t *testing.T) {
 		t.Fatal("expected error")
 	} else if !strings.Contains(err.Error(), "stamp protocol") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestUpstream_CertificateUsesConfiguredDialer(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		construction dnscrypt.CryptoConstruction
+	}{{"xsalsa20", dnscrypt.XSalsa20Poly1305}, {"xchacha20", dnscrypt.XChacha20Poly1305}} {
+		t.Run(tc.name, func(t *testing.T) {
+			stampStr := startTestServer(t, testHandler{}, tc.construction)
+			stamp, err := dnsstamps.NewServerStampFromString(stampStr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := stamp.ServerAddrStr
+			stamp.ServerAddrStr = "127.0.0.2:1"
+			var calls atomic.Int32
+			u, err := NewUpstream(stamp.String(), Opt{UDPDialContext: func(ctx context.Context) (net.Conn, error) {
+				calls.Add(1)
+				return new(net.Dialer).DialContext(ctx, "udp", addr)
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			exchange(t, u)
+			if got := calls.Load(); got != 2 {
+				t.Fatalf("certificate and encrypted query must both use configured route, got %d calls", got)
+			}
+		})
+	}
+}
+
+func TestUpstream_CertificateWaitCancellation(t *testing.T) {
+	stampStr := startTestServer(t, testHandler{})
+	started := make(chan struct{})
+	u, err := NewUpstream(stampStr, Opt{UDPDialContext: func(ctx context.Context) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, context.Cause(ctx)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = u.fetchResolverInfo(ctx) }()
+	<-started
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer waitCancel()
+	waitDone := make(chan error, 1)
+	go func() { _, err := u.fetchResolverInfo(waitCtx); waitDone <- err }()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("unexpected cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("cancelled query remained blocked behind certificate refresh")
+	}
+	cancel()
+	<-done
+}
+
+type largeResponseHandler struct{}
+
+func (largeResponseHandler) ServeDNS(ctx context.Context, w dnscrypt.ResponseWriter, req *dns.Msg) error {
+	r := new(dns.Msg).SetReply(req)
+	r.SetEdns0(4096, false)
+	r.IsEdns0().Option = []dns.EDNS0{&dns.EDNS0_PADDING{Padding: make([]byte, 1024)}}
+	return w.WriteMsg(ctx, r)
+}
+
+func TestUpstream_LargeUDPResponse(t *testing.T) {
+	u, err := NewUpstream(startTestServer(t, largeResponseHandler{}), Opt{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := exchange(t, u)
+	if resp.Len() <= 512 {
+		t.Fatalf("large response was lost or truncated: %d bytes", resp.Len())
+	}
+}
+
+func TestUpstream_CancelWithoutDeadline(t *testing.T) {
+	u, err := NewUpstream(startTestServer(t, testHandler{}), Opt{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exchange(t, u) // Cache a valid resolver certificate.
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	u.dialUDP = func(context.Context) (net.Conn, error) { return client, nil }
+	received := make(chan struct{})
+	go func() { _, _ = server.Read(make([]byte, dns.MaxMsgSize)); close(received) }()
+	q := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+	query, err := q.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	done := make(chan error, 1)
+	go func() { _, err := u.ExchangeContext(ctx, query); done <- err }()
+	<-received
+	want := errors.New("query withdrawn")
+	cancel(want)
+	select {
+	case err := <-done:
+		if !errors.Is(err, want) {
+			t.Fatalf("cancel cause lost: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled query remained blocked on network read")
 	}
 }
