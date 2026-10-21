@@ -25,3 +25,6 @@ release/
 testutils/
 
 .reference/
+
+# Local data exported from the original SmartDNS deployment.
+data/smartdns/

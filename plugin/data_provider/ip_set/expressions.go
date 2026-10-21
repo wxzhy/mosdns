@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 )
 
@@ -12,7 +13,11 @@ import (
 // references and &file paths using OR semantics. Provider matchers precede
 // matchers from the local list loader. A nil bp supports expressions and files.
 func CompileExpressions(bp *coremain.BP, expressions []string) (MatcherGroup, error) {
-	loader := NewListLoader()
+	var paths geodata.Paths
+	if bp != nil {
+		paths = bp.M().GeodataPaths()
+	}
+	loader := NewListLoader(paths)
 	var group MatcherGroup
 	for i, expression := range expressions {
 		expression = strings.TrimSpace(expression)

@@ -2,8 +2,7 @@
 # 不能把它当作无需准备即可运行的部署配置。
 # 工作目录应为仓库根目录。DB、规则文本、证书需自行提供：
 #   data/geosite.dat、data/Country.mmdb、data/ASN.mmdb、rules/*、tls/*。
-# 数字 ASN 倍率/过滤还需默认 ASN 库：工作目录中的 ASN.mmdb、
-# GeoLite2-ASN.mmdb、asn.mmdb 之一；data/ASN.mmdb 仅供 ext: 表达式使用。
+# geodata 统一设置本实例默认库，包含 speedcheck 的数字 ASN 倍率/过滤。
 # 请先删除不使用的 provider / listener / 改写模块，再替换域名/IP及路径。
 # quick-setup-only 动作放在 module_actions 中；Linux ipset/nftset 被注释，
 # 如启用需先在系统创建集合并授予所需权限。Windows 上它们无操作。
@@ -14,6 +13,10 @@ log:
   file: ""
   production: false
 include: []
+geodata:
+  geosite: "./data/geosite.dat"
+  geoip: "./data/Country.mmdb"
+  asn: "./data/ASN.mmdb"
 api:
   http: "127.0.0.1:19091"
 plugins:
@@ -26,7 +29,8 @@ plugins:
   - tag: domains_database
     type: domain_set
     args:
-      exps: ["ext:./data/geosite.dat:cn"]
+      exps: ["geosite:cn"]
+      # 显式覆盖默认库的写法：ext:./data/other-geosite.dat:cn
       sets: [domains_base]
       files: []
   - tag: ips_base
@@ -38,7 +42,7 @@ plugins:
   - tag: ips_database
     type: ip_set
     args:
-      ips: ["ext:./data/Country.mmdb:CN", "ext:./data/ASN.mmdb:AS13335"]
+      ips: ["geoip:CN", "asn:AS13335"]
       sets: [ips_base]
       files: []
   - tag: replace_cdn
@@ -124,6 +128,8 @@ plugins:
         - tag: doh_a
           addr: "https://cloudflare-dns.com/dns-query"
           dial_addr: "1.1.1.1:443"
+          http_host: ""                   # DoH HTTP Host；不改变URL/TLS SNI
+          http_method: GET                # DoH GET或POST；默认GET
           idle_timeout: 30                # 秒
           max_conns: 0                    # 无效果
           enable_pipeline: false

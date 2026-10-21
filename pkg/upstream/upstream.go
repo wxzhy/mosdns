@@ -104,6 +104,11 @@ type Opt struct {
 	// Note: There is no fallback. Make sure the server supports it.
 	EnableHTTP3 bool
 
+	// HTTPHost overrides the HTTP Host header independently of the URL and
+	// TLS server name. HTTPMethod is GET (default) or POST. DoH only.
+	HTTPHost   string
+	HTTPMethod string
+
 	// Repeat is the number of additional copies sent for each udp query,
 	// to improve the reliability against packet loss. Default 0 (send once).
 	// Only available for udp upstream. (smartdns's "repeat" option)
@@ -618,7 +623,7 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 			t = t1
 		}
 
-		u, err := doh.NewUpstream(addrURL.String(), t, opt.Logger)
+		u, err := doh.NewUpstreamWithOptions(addrURL.String(), t, opt.Logger, doh.Options{HTTPHost: opt.HTTPHost, HTTPMethod: opt.HTTPMethod})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create doh upstream, %w", err)
 		}

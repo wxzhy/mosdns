@@ -20,6 +20,7 @@
 package doh
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -37,6 +38,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
+	"golang.org/x/net/http/httpguts"
 )
 
 const (
@@ -53,14 +55,40 @@ type Upstream struct {
 	reqTemplate *http.Request
 }
 
+// Options controls DoH HTTP framing without changing the endpoint or TLS SNI.
+type Options struct {
+	HTTPHost   string
+	HTTPMethod string // GET (default) or POST.
+}
+
 func NewUpstream(endPoint string, rt http.RoundTripper, logger *zap.Logger) (*Upstream, error) {
-	req, err := http.NewRequest(http.MethodGet, endPoint, nil)
+	return NewUpstreamWithOptions(endPoint, rt, logger, Options{})
+}
+
+func NewUpstreamWithOptions(endPoint string, rt http.RoundTripper, logger *zap.Logger, opt Options) (*Upstream, error) {
+	method := strings.ToUpper(strings.TrimSpace(opt.HTTPMethod))
+	if method == "" {
+		method = http.MethodGet
+	}
+	if method != http.MethodGet && method != http.MethodPost {
+		return nil, fmt.Errorf("unsupported DoH HTTP method %q: expected GET or POST", opt.HTTPMethod)
+	}
+	if opt.HTTPHost != "" && !httpguts.ValidHostHeader(opt.HTTPHost) {
+		return nil, fmt.Errorf("invalid DoH HTTP host %q", opt.HTTPHost)
+	}
+	req, err := http.NewRequest(method, endPoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse http request, %w", err)
 	}
 
 	req.Header["Accept"] = []string{"application/dns-message"}
 	req.Header["User-Agent"] = nil // Don't let go http send a default user agent header.
+	if opt.HTTPHost != "" {
+		req.Host = opt.HTTPHost
+	}
+	if method == http.MethodPost {
+		req.Header["Content-Type"] = []string{"application/dns-message"}
+	}
 
 	if logger == nil {
 		logger = nopLogger
@@ -92,33 +120,35 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 		return nil, dnsutils.ErrPayloadTooSmall
 	}
 	id := binary.BigEndian.Uint16(q)
-	bp := pool.GetBuf(len(q))
-	defer pool.ReleaseBuf(bp)
-	wire := *bp
-	copy(wire, q)
-
 	// In order to maximize HTTP cache friendliness, DoH clients using media
 	// formats that include the ID field from the DNS message header, such
 	// as "application/dns-message", SHOULD use a DNS ID of 0 in every DNS
 	// request.
 	// https://tools.ietf.org/html/rfc8484#section-4.1
-	wire[0] = 0
-	wire[1] = 0
-
-	queryLen := 4 + base64.RawURLEncoding.EncodedLen(len(wire))
-	queryBuf := make([]byte, queryLen)
-
-	p := 0
-	p += copy(queryBuf, "dns=")
-
-	// Padding characters for base64url MUST NOT be included.
-	// See: https://tools.ietf.org/html/rfc8484#section-6.
-	base64.RawURLEncoding.Encode(queryBuf[p:], wire)
+	var dnsQuery string
+	var body []byte
+	if u.reqTemplate.Method == http.MethodPost {
+		// RoundTripper may consume/close Body after returning, including after
+		// cancellation. Keep its bytes independent of callers and buffer pools.
+		body = bytes.Clone(q)
+		body[0], body[1] = 0, 0
+	} else {
+		bp := pool.GetBuf(len(q))
+		defer pool.ReleaseBuf(bp)
+		wire := *bp
+		copy(wire, q)
+		wire[0], wire[1] = 0, 0
+		queryBuf := make([]byte, 4+base64.RawURLEncoding.EncodedLen(len(wire)))
+		copy(queryBuf, "dns=")
+		// RFC 8484 section 6 forbids base64url padding.
+		base64.RawURLEncoding.Encode(queryBuf[4:], wire)
+		dnsQuery = utils.BytesToStringUnsafe(queryBuf)
+	}
 
 	if query_policy.InheritCancellation(ctx) {
 		requestCtx, cancel := context.WithTimeout(ctx, defaultDoHTimeout)
 		defer cancel()
-		r, err := u.exchange(requestCtx, utils.BytesToStringUnsafe(queryBuf))
+		r, err := u.exchange(requestCtx, dnsQuery, body)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, context.Cause(ctx)
@@ -144,7 +174,7 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 		// reduces the connection reuse efficiency.
 		ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)
 		defer cancel()
-		r, err := u.exchange(ctx, utils.BytesToStringUnsafe(queryBuf))
+		r, err := u.exchange(ctx, dnsQuery, body)
 		if err != nil {
 			u.logger.Check(zap.WarnLevel, "exchange failed").Write(zap.Error(err))
 		}
@@ -170,11 +200,17 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 	}
 }
 
-func (u *Upstream) exchange(ctx context.Context, dnsQuery string) (*[]byte, error) {
+func (u *Upstream) exchange(ctx context.Context, dnsQuery string, body []byte) (*[]byte, error) {
 	req := u.reqTemplate.WithContext(ctx)
 	req.URL = new(urlpkg.URL)
 	*req.URL = *u.urlTemplate
-	if req.URL.RawQuery == "" {
+	if req.Method == http.MethodPost {
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+	} else if req.URL.RawQuery == "" {
 		req.URL.RawQuery = dnsQuery
 	} else {
 		params := req.URL.Query()

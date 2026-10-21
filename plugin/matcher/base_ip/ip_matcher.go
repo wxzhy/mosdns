@@ -22,6 +22,7 @@ package base_ip
 import (
 	"context"
 	"fmt"
+	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
@@ -68,7 +69,11 @@ func NewMatcher(bq sequence.BQ, args *Args, f MatchFunc) (m *Matcher, err error)
 
 	// Anonymous set from plugin's args and files.
 	if len(args.IPs)+len(args.Files) > 0 {
-		loader := ip_set.NewListLoader()
+		var paths geodata.Paths
+		if bq != nil {
+			paths = bq.M().GeodataPaths()
+		}
+		loader := ip_set.NewListLoader(paths)
 		if err := loader.LoadFromIPsAndFiles(args.IPs, args.Files); err != nil {
 			return nil, err
 		}

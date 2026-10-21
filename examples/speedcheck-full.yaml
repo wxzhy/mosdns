@@ -1,12 +1,15 @@
 # COMPLETE SPEEDCHECK TEMPLATE. Read docs/speedcheck.md before enabling.
 # Run from repository root; relative paths use the process working directory.
-# Requires country data with CN and a MaxMind ASN database, NOT bundled:
-#   geoip.dat / geoip.metadb / Country.mmdb / geoip.mmdb (first existing wins)
-#   ASN.mmdb / GeoLite2-ASN.mmdb / asn.mmdb (first existing wins)
+# Requires the geodata paths below: country data with CN and a MaxMind ASN
+# database. Neither is bundled. Short expressions and numeric ASN rules share
+# these defaults; explicit ext:FILE:CODE expressions always override them.
 # No automatic download occurs. Without these databases initialization fails.
 # For a ready-to-run example without databases, use examples/speedcheck.yaml.
 log:
   level: info
+geodata:
+  geoip: "./data/Country.mmdb"
+  asn: "./data/ASN.mmdb"
 api:
   http: "127.0.0.1:19091"             # http://127.0.0.1:19091/metrics
 
@@ -103,8 +106,8 @@ plugins:
         do_not_probe: ["198.18.0.0/15"]
         file_networks: ["&examples/data/speedcheck-preferred-ips.txt"]
         cloudflare: ["asn:13335"]
-        # Explicit-file alternative, instead of geoip:cn:
-        # domestic: ["ext:Country.mmdb:cn"]
+        # Explicit-file alternative overriding geodata.geoip:
+        # domestic: ["ext:./data/other-Country.mmdb:cn"]
       tag_multipliers:              # First matching label wins; order matters.
         - tag: preferred
           multiplier: 0.8

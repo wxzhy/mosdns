@@ -46,7 +46,7 @@ curl http://127.0.0.1:19091/metrics
 | `candidate_filter` | 未配置 | 来源候选过滤，支持下表中的全部字段 |
 | `probe_match` | 未配置 | 使用相同字段限制探测启动；不丢弃有效候选 |
 
-`candidate_filter` 与 `probe_match` 的子字段完整如下。所有名称必须是已声明标签，ASN 必须能从本地默认 ASN 数据库加载。
+`candidate_filter` 与 `probe_match` 的子字段完整如下。所有名称必须是已声明标签，数字 ASN 使用根配置 `geodata.asn` 指定的数据库；未指定时沿用默认文件查找。
 
 | 字段 | 未配置时 | 示例 |
 | --- | --- | --- |
@@ -61,7 +61,20 @@ bounded 在收集窗口、首正答上限、总预算、全部工作完成中最
 
 `labels` 是名称到 IP 匹配表达式列表的映射，列表内按 OR 匹配。支持 CIDR/IP、`$ip_set标签`、`&文件`，以及已有的 `geoip:cn`、`asn:13335`、`ext:文件:代码` 表达式。数据库沿用现有 IPSet/GeoIP 组件。标签集合由所有声明标签组成，不能只声明参与倍率的标签就假定它与其他网络同组。
 
-下面是完整的选择器参数块；引用的来源、IPSet 和规则文件在 [全参数模板](../examples/speedcheck-full.yaml) 中定义。`geoip:cn` 按顺序寻找工作目录中的 `geoip.dat`、`geoip.metadb`、`Country.mmdb`、`geoip.mmdb`，使用第一个存在的文件，需包含 CN 数据。`asn:`、数字 ASN 倍率及过滤器按顺序寻找 `ASN.mmdb`、`GeoLite2-ASN.mmdb`、`asn.mmdb`，必须是受支持的 ASN 类型 MaxMind 数据库。数据库不随示例附带，也不会自动下载；缺失、损坏或 ASN 类型不兼容会使初始化失败。DAT 缺少指定代码会报错；MMDB 未覆盖的地址或国家/ASN 则不会命中。只想使用 CIDR/文本标签时运行基础示例即可。
+在根配置中设置默认数据库位置后，标签表达式、provider、sequence matcher 及数字 ASN 倍率、过滤使用同一组实例路径：
+
+```yaml
+geodata:
+  geosite: "./data/geosite.dat"   # 需要 geosite: 表达式时才使用
+  geoip: "./data/Country.mmdb"
+  asn: "./data/ASN.mmdb"
+```
+
+`geoip:cn` 使用 `geodata.geoip`，需包含 CN 数据；`asn:13335`、`asn:AS13335` 与数字 ASN 字段使用 `geodata.asn`，必须是受支持的 ASN 类型 MaxMind 数据库。显式 `ext:文件:代码` 可以覆盖默认文件。默认路径统一在根配置设置，对全部 include 插件生效；子配置设置非空路径会报错，即使值与根配置相同，空 `geodata: {}` 则与未指定等价。路径相对于工作目录，不相对于 YAML 所在目录。
+
+未配置对应路径时，`geoip:` 依次寻找工作目录中的 `geoip.dat`、`geoip.metadb`、`Country.mmdb`、`geoip.mmdb`；`asn:` 和数字 ASN 字段依次寻找 `ASN.mmdb`、`GeoLite2-ASN.mmdb`、`asn.mmdb`，采用第一个存在的文件。`geosite:` 未配置路径时使用 `geosite.dat`，只支持 *ray dat，不支持 trie 或文本目录。数据库不随示例附带，也不会自动下载或热重载；显式路径缺失、损坏或格式不兼容会使使用它的插件初始化失败，不会退回默认文件。DAT 缺少指定代码会报错；MMDB 未覆盖的地址或国家/ASN 则不会命中。只想使用 CIDR/文本标签时运行基础示例即可。
+
+下面是完整的选择器参数块；引用的来源、IPSet 和规则文件在 [全参数模板](../examples/speedcheck-full.yaml) 中定义。
 
 ```yaml
 - tag: select_fast_ip

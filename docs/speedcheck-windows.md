@@ -60,20 +60,31 @@ pro-bing 以 `Count=1`、`RunWithContext` 和 `OnRecv` 取 RTT，禁用 `RecordR
 
 ## 权重、过滤与文件路径
 
-标签 CIDR/IP 匹配、`ip_set` 数据提供器、GeoIP 和 ASN 匹配均可在 Windows 使用。例如：
+标签 CIDR/IP 匹配、`ip_set` 数据提供器、GeoIP 和 ASN 匹配均可在 Windows 使用。先在根配置中设置本实例的数据库路径：
+
+```yaml
+geodata:
+  geosite: 'C:/mosdns/data/geosite.dat'
+  geoip: 'C:/mosdns/data/Country.mmdb'
+  asn: 'C:/mosdns/data/ASN.mmdb'
+```
+
+随后在 `speedcheck.args` 中使用短表达式；数字 ASN 字段也使用上面的 `asn` 文件：
 
 ```yaml
 labels:
   preferred: ['&C:/mosdns/data/preferred.txt']
-  cf: ['ext:C:/mosdns/data/ASN.mmdb:13335']
+  cf: ['asn:13335']
+  # 显式覆盖默认库时仍可用 ext:C:/mosdns/data/other-ASN.mmdb:13335
 tag_multipliers:
   - {tag: preferred, multiplier: 0.8}
   - {tag: cf, multiplier: 0.9}
+asn_multipliers: {15169: 1.1}
 ```
 
 首个命中的标签倍率优先于 ASN 倍率，分数为 `RTT_ms × multiplier`，越小越优先；未命中倍率为 1。多个输出地址须与最佳 IP 的完整标签集合一致，且分差不大于 `threshold_ms`；全部无成功 RTT 时按倍率回退。客户端 DO=1 时选择完整来源，不按 `max_num` 裁剪 RRset。
 
-Windows YAML 路径用单引号或正斜杠，避免双引号中的反斜杠被当作转义。`-d` 先设置进程工作目录，再读取 `-c`，因此相对配置、规则文件和默认数据库都相对工作目录。数值 `asn_multipliers` 依次查找工作目录中的 `ASN.mmdb`、`GeoLite2-ASN.mmdb`、`asn.mmdb`；需要指定其他位置时可像上例那样使用标签表达式。
+Windows YAML 路径用单引号或正斜杠，避免双引号中的反斜杠被当作转义。`-d` 先设置进程工作目录，再读取 `-c`，因此相对配置、规则文件和 `geodata` 路径都相对工作目录。根配置中的 `geodata` 对全部 include 插件生效；子配置只能省略或保留空路径，任何非空默认路径都会报错，即使与根配置相同。未指定 `geodata.asn` 时，`asn:` 及数字 ASN 字段才依次查找工作目录中的 `ASN.mmdb`、`GeoLite2-ASN.mmdb`、`asn.mmdb`。显式文件缺失或格式不符时，在使用它的插件初始化时报错，不会退回其他候选文件；数据更新需要重启。GeoSite 路径只接受 *ray dat，普通文本规则仍用 `domain_set.files`。
 
 ## Windows 平台边界
 

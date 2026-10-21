@@ -98,7 +98,7 @@ func Init(bp *coremain.BP, value any) (any, error) {
 	}
 	asns := make(map[uint32]netlist.Matcher)
 	for _, asn := range neededASNs(args) {
-		m, err := geodata.GetASNMatcher("", strconv.FormatUint(uint64(asn), 10))
+		m, err := geodata.GetASNMatcher(bp.M().GeodataPaths().ASN, strconv.FormatUint(uint64(asn), 10))
 		if err != nil {
 			return nil, fmt.Errorf("speedcheck: ASN %d: %w", asn, err)
 		}

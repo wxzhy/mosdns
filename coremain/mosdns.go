@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/mlog"
+	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/pkg/safe_close"
 	"github.com/IrineSistiana/mosdns/v5/pkg/speedtest"
 	"github.com/go-chi/chi/v5"
@@ -38,7 +39,8 @@ import (
 )
 
 type Mosdns struct {
-	logger *zap.Logger // non-nil logger.
+	logger       *zap.Logger // non-nil logger.
+	geodataPaths geodata.Paths
 
 	// Plugins
 	plugins map[string]any
@@ -82,6 +84,10 @@ func (m *Mosdns) ProbeManager() *speedtest.Manager {
 
 // NewMosdns initializes a mosdns instance and its plugins.
 func NewMosdns(cfg *Config) (*Mosdns, error) {
+	paths, err := cfg.Geodata.Absolute()
+	if err != nil {
+		return nil, err
+	}
 	// Init logger.
 	lg, err := mlog.NewLogger(cfg.Log)
 	if err != nil {
@@ -89,11 +95,12 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	}
 
 	m := &Mosdns{
-		logger:     lg,
-		plugins:    make(map[string]any),
-		httpMux:    chi.NewRouter(),
-		metricsReg: newMetricsReg(),
-		sc:         safe_close.NewSafeClose(),
+		logger:       lg,
+		geodataPaths: paths,
+		plugins:      make(map[string]any),
+		httpMux:      chi.NewRouter(),
+		metricsReg:   newMetricsReg(),
+		sc:           safe_close.NewSafeClose(),
 	}
 	// This must be called after m.httpMux and m.metricsReg been set.
 	m.initHttpMux()
@@ -157,14 +164,27 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 }
 
 // NewTestMosdnsWithPlugins returns a mosdns instance for testing.
-func NewTestMosdnsWithPlugins(p map[string]any) *Mosdns {
-	return &Mosdns{
+func NewTestMosdnsWithPlugins(p map[string]any, paths ...geodata.Paths) *Mosdns {
+	m := &Mosdns{
 		logger:     mlog.Nop(),
 		httpMux:    chi.NewRouter(),
 		plugins:    p,
 		metricsReg: newMetricsReg(),
 		sc:         safe_close.NewSafeClose(),
 	}
+	if len(paths) > 0 {
+		m.geodataPaths = paths[0]
+	}
+	return m
+}
+
+// GeodataPaths returns a copy of this instance's immutable shortcut defaults.
+// A nil instance has the same defaults as an unconfigured instance.
+func (m *Mosdns) GeodataPaths() geodata.Paths {
+	if m == nil {
+		return geodata.Paths{}
+	}
+	return m.geodataPaths
 }
 
 func (m *Mosdns) GetSafeClose() *safe_close.SafeClose {
@@ -251,6 +271,9 @@ func (m *Mosdns) loadPresetPlugins() error {
 
 // loadPluginsFromCfg loads plugins from this config. It follows include first.
 func (m *Mosdns) loadPluginsFromCfg(cfg *Config, includeDepth int) error {
+	if includeDepth > 0 && cfg.Geodata != (geodata.Paths{}) {
+		return errors.New("geodata defaults must be declared in the root config, not an included config")
+	}
 	const maxIncludeDepth = 8
 	if includeDepth > maxIncludeDepth {
 		return errors.New("maximum include depth reached")

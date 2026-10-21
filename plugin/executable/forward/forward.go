@@ -72,10 +72,12 @@ type UpstreamConfig struct {
 
 	// Deprecated: This option has no affect.
 	// TODO: (v6) Remove this option.
-	MaxConns           int  `yaml:"max_conns"`
-	EnablePipeline     bool `yaml:"enable_pipeline"`
-	EnableHTTP3        bool `yaml:"enable_http3"`
-	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	MaxConns           int    `yaml:"max_conns"`
+	EnablePipeline     bool   `yaml:"enable_pipeline"`
+	EnableHTTP3        bool   `yaml:"enable_http3"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
+	HTTPHost           string `yaml:"http_host"`
+	HTTPMethod         string `yaml:"http_method"`
 
 	// TLS options. Available for TLS based upstreams (tls, https).
 	// Note fingerprint and ech_config_list are not available for
@@ -172,6 +174,8 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 			IdleTimeout:    time.Duration(c.IdleTimeout) * time.Second,
 			EnablePipeline: c.EnablePipeline,
 			EnableHTTP3:    c.EnableHTTP3,
+			HTTPHost:       c.HTTPHost,
+			HTTPMethod:     c.HTTPMethod,
 			Bootstrap:      c.Bootstrap,
 			BootstrapVer:   c.BootstrapVer,
 			TLSConfig: &tls.Config{

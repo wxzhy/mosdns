@@ -21,9 +21,11 @@ package coremain
 
 import (
 	"github.com/IrineSistiana/mosdns/v5/mlog"
+	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 )
 
 type Config struct {
+	Geodata geodata.Paths  `yaml:"geodata"`
 	Log     mlog.LogConfig `yaml:"log"`
 	Include []string       `yaml:"include"`
 	Plugins []PluginConfig `yaml:"plugins"`

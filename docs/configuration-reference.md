@@ -56,7 +56,10 @@ plugins:
 | `log.level` | 字符串；空值按日志库采用 `info`。可用 `debug`、`info`、`warn`、`error`、`dpanic`、`panic`、`fatal`。 |
 | `log.file` | 字符串；空值写 stderr；非空时写指定文件。 |
 | `log.production` | 布尔，默认 `false`；`true` 使用 JSON 日志。 |
-| `include` | YAML 配置文件路径列表，默认空；先递归加载 include 中的插件，再按顺序加载本文件插件。递归加载有深度上限，避免循环 include。子文件的 `log`/`api` 不覆盖主文件设置。 |
+| `include` | YAML 配置文件路径列表，默认空；先递归加载 include 中的插件，再按顺序加载本文件插件。递归加载有深度上限，避免循环 include。子文件的 `log`/`api` 不覆盖主文件设置；子文件不得设置非空 `geodata` 默认路径，即使与根配置相同也报错；空对象与未指定等价。 |
+| `geodata.geosite` | 空；为本实例的 `geosite:` 表达式指定默认 *ray GeoSite dat 文件。未指定时使用工作目录中的 `geosite.dat`。 |
+| `geodata.geoip` | 空；为本实例的 `geoip:` 表达式指定默认 GeoIP dat / MaxMind 数据库。未指定时按下文列出的文件名顺序寻找。 |
+| `geodata.asn` | 空；为本实例的 `asn:` 表达式及 speedcheck 数字 ASN 倍率、过滤指定默认 MaxMind ASN 数据库。未指定时按下文列出的文件名顺序寻找。 |
 | `plugins` | 插件列表；逐项初始化。 |
 | `plugins[].tag` | 可选名称；省略时按类型和当前插件数量自动生成 tag。需要被 `$tag`、`sources`、`entry` 等引用时应显式命名。 |
 | `plugins[].type` | 必填，已注册的顶层插件类型。 |
@@ -71,12 +74,18 @@ log:
 include:
   - "./providers.yaml"             # 被引用的 providers 先加载
   - "./upstreams.yaml"
+geodata:                            # 仅在根配置声明，所有 include 共享
+  geosite: "./data/geosite.dat"
+  geoip: "./data/Country.mmdb"
+  asn: "./data/ASN.mmdb"
 api:
   http: "127.0.0.1:9091"
 plugins: []
 ```
 
 未声明字段会被配置解码器拒绝。Go `time.Duration` 字段使用 `300ms`、`5s` 等带单位字符串；本页明确标注为整数秒/毫秒的字段不能写成这种字符串。
+
+`geodata` 是每个 Mosdns 实例的配置，适用于 provider、sequence 行内 matcher、`ip_replace`、`https_record` 和 `speedcheck` 等公共表达式入口。路径仍相对于进程工作目录；显式 `ext:文件:代码` 始终使用指定文件，不受默认路径影响。已配置的文件缺失、损坏或格式不兼容时，在首次使用相应数据库初始化插件时返回错误，不改用其他候选文件。数据库不会自动下载或热重载，修改路径或数据后需要重启。
 
 ## 数据集合：domain_set、ip_set
 
@@ -127,8 +136,9 @@ plugins: []
   type: domain_set
   args:
     exps:
-      - "geosite:cn"                 # 工作目录中的 geosite.dat
-      - "ext:./data/geosite.dat:google@cn"
+      - "geosite:cn"                 # 上文 geodata.geosite 指定的文件
+      - "geosite:google@cn"
+      - "ext:./data/other-geosite.dat:google@cn" # 显式覆盖默认文件
       # ext-domain:、ext-site: 为 ext: 的别名；多个 @attr 使用 AND
     sets: []
     files: []
@@ -138,14 +148,14 @@ plugins: []
     ips:
       - "geoip:cn"
       - "asn:AS13335"
-      - "ext:./data/Country.mmdb:US"
-      - "ext:./data/ASN.mmdb:AS15169"
+      - "geoip:US"
+      - "asn:15169"
       # ext-ip: 为 ext: 的别名
     sets: []
     files: []
 ```
 
-`geoip:` 在工作目录依次寻找 `geoip.dat`、`geoip.metadb`、`Country.mmdb`、`geoip.mmdb`；`asn:` 寻找 `ASN.mmdb`、`GeoLite2-ASN.mmdb`、`asn.mmdb`。格式按文件内容识别；GeoIP 支持 *ray dat 和 MaxMind，ASN 需要含 ASN 字段的 MaxMind 数据库。可用代码及属性由实际数据库决定。数据实现与普通 CIDR matcher 均可在 Windows 使用，它们和下文操作 Linux 防火墙的 `ipset` 动作不同。
+未配置对应 `geodata` 路径时，`geosite:` 使用工作目录中的 `geosite.dat`；`geoip:` 依次寻找 `geoip.dat`、`geoip.metadb`、`Country.mmdb`、`geoip.mmdb`；`asn:` 及 speedcheck 数字 ASN 倍率、过滤依次寻找 `ASN.mmdb`、`GeoLite2-ASN.mmdb`、`asn.mmdb`，使用第一个存在的文件。GeoIP 格式按文件内容识别，支持 *ray dat 和 MaxMind；ASN 需要受支持的 ASN 类型 MaxMind 数据库。GeoSite 仅支持 *ray dat，不读取 SmartDNS 的 trie 或文本目录；导出的普通文本仍通过 `domain_set.files` 加载。可用代码及属性由实际数据库决定，多个 `@attr` 使用 AND；ASN 支持纯数字或 `AS` 前缀。数据实现与普通 CIDR matcher 均可在 Windows 使用，它们和下文操作 Linux 防火墙的 `ipset` 动作不同。
 
 ## sequence 规则与控制流
 
@@ -244,6 +254,8 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
 | `tag` | 可选上游名称；显式命名才注册该上游指标；同一 forward 内不能重复。 |
 | `addr` | 必填，上游地址/URL/DNS stamp。 |
 | `dial_addr` | 空；覆盖实际拨号目标，可带端口，不改变 TLS SNI 或 HTTP Host。 |
+| `http_host` | 空；DoH 默认使用 URL 的 Host。非空单独覆盖 HTTP Host / HTTP2 `:authority`，不改变 URL、TLS SNI 或证书验证名称。 |
+| `http_method` | `GET`；DoH 可选 `GET` / `POST`，大小写不敏感。POST 使用 `application/dns-message` 请求体；GET 使用 `dns` 查询参数。 |
 | `idle_timeout` | 整数秒；TCP/DoT 默认 10，DoH/HTTP3/DoQ 默认 30；UDP transport 固定 300 秒。当前 DoT 非 pipeline 路径采用底层默认 10 秒，填写该值并不改变其复用超时。 |
 | `max_conns` | 兼容旧配置但已弃用，**无效果**。 |
 | `enable_pipeline` | `false`；仅 TCP/DoT，要求上游支持同一连接并发，不做不兼容回退。 |
@@ -276,6 +288,8 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
       - tag: doh_a
         addr: "https://cloudflare-dns.com/dns-query"
         dial_addr: "1.1.1.1:443"
+        http_host: ""
+        http_method: GET
         idle_timeout: 30
         max_conns: 0                   # 已弃用，无效果
         enable_pipeline: false

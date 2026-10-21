@@ -46,7 +46,8 @@ func Init(bp *coremain.BP, args any) (any, error) {
 type Args struct {
 	// Exps are domain expressions. Besides the plain "type:pattern" syntax,
 	// *ray geosite expressions are supported: geosite:CODE (loads CODE from
-	// geosite.dat in the working directory), ext:FILE:CODE[@attr...] (loads
+	// the instance's geodata.geosite, or geosite.dat in the working directory),
+	// ext:FILE:CODE[@attr...] (loads
 	// CODE from FILE, attrs have AND semantics). ext-domain: and ext-site:
 	// are aliases of ext:.
 	Exps  []string `yaml:"exps"`
@@ -68,7 +69,11 @@ func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
 func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
 	ds := &DomainSet{}
 
-	loader := NewMixLoader()
+	var paths geodata.Paths
+	if bp != nil {
+		paths = bp.M().GeodataPaths()
+	}
+	loader := NewMixLoader(paths)
 	if err := loader.LoadExpsAndFiles(args.Exps, args.Files); err != nil {
 		return nil, err
 	}
@@ -90,10 +95,15 @@ func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
 type MixLoader struct {
 	own    *domain.MixMatcher[struct{}]
 	shared []domain.Matcher[struct{}]
+	paths  geodata.Paths
 }
 
-func NewMixLoader() *MixLoader {
-	return &MixLoader{own: domain.NewDomainMixMatcher()}
+func NewMixLoader(paths ...geodata.Paths) *MixLoader {
+	l := &MixLoader{own: domain.NewDomainMixMatcher()}
+	if len(paths) > 0 {
+		l.paths = paths[0]
+	}
+	return l
 }
 
 func (l *MixLoader) LoadExpsAndFiles(exps []string, fs []string) error {
@@ -117,7 +127,7 @@ func (l *MixLoader) LoadExps(exps []string) error {
 // entry in a geosite dat file (see geodata.ParseDomainExp), which is loaded
 // as a shared matcher.
 func (l *MixLoader) loadExp(exp string) error {
-	file, code, attrs, ok, err := geodata.ParseDomainExp(exp)
+	file, code, attrs, ok, err := l.paths.ParseDomainExp(exp)
 	if err != nil {
 		return err
 	}

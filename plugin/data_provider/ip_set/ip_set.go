@@ -43,11 +43,13 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 type Args struct {
 	// IPs are ip/prefix strings. Besides plain ips and CIDRs, *ray style
-	// expressions are supported: geoip:CODE (loads CODE from the first
+	// expressions are supported: geoip:CODE (loads CODE from geodata.geoip,
+	// or the first
 	// existing of geoip.dat, geoip.metadb, Country.mmdb, geoip.mmdb in the
 	// working directory; dat and maxmind formats are auto-detected),
 	// asn:AS_NUMBER (maxmind asn db, tried among ASN.mmdb, GeoLite2-ASN.mmdb,
-	// asn.mmdb; AS_NUMBER is digits with an optional "AS" prefix), and
+	// asn.mmdb unless geodata.asn is configured; AS_NUMBER is digits with
+	// an optional "AS" prefix), and
 	// ext:FILE:CODE (auto-detects the format from the file content). ext-ip:
 	// is an alias of ext:.
 	IPs   []string `yaml:"ips"`
@@ -68,7 +70,11 @@ func (d *IPSet) GetIPMatcher() netlist.Matcher {
 func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
 	p := &IPSet{}
 
-	loader := NewListLoader()
+	var paths geodata.Paths
+	if bp != nil {
+		paths = bp.M().GeodataPaths()
+	}
+	loader := NewListLoader(paths)
 	if err := loader.LoadFromIPsAndFiles(args.IPs, args.Files); err != nil {
 		return nil, err
 	}
@@ -100,10 +106,15 @@ func parseNetipPrefix(s string) (netip.Prefix, error) {
 type ListLoader struct {
 	own    *netlist.List
 	shared []netlist.Matcher
+	paths  geodata.Paths
 }
 
-func NewListLoader() *ListLoader {
-	return &ListLoader{own: netlist.NewList()}
+func NewListLoader(paths ...geodata.Paths) *ListLoader {
+	l := &ListLoader{own: netlist.NewList()}
+	if len(paths) > 0 {
+		l.paths = paths[0]
+	}
+	return l
 }
 
 func (l *ListLoader) LoadFromIPsAndFiles(ips []string, fs []string) error {
@@ -126,7 +137,7 @@ func (l *ListLoader) LoadFromIPs(ips []string) error {
 // referring to a geoip entry or an as number (see geodata.ParseIPExp),
 // which is loaded as a shared matcher.
 func (l *ListLoader) loadIP(s string) error {
-	file, kind, code, ok, err := geodata.ParseIPExp(s)
+	file, kind, code, ok, err := l.paths.ParseIPExp(s)
 	if err != nil {
 		return err
 	}

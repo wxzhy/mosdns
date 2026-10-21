@@ -22,6 +22,7 @@ package base_domain
 import (
 	"context"
 	"fmt"
+	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
@@ -67,7 +68,11 @@ func NewMatcher(bq sequence.BQ, args *Args, f MatchFunc) (m *Matcher, err error)
 
 	// Anonymous set from plugin's args and files.
 	if len(args.Exps)+len(args.Files) > 0 {
-		loader := domain_set.NewMixLoader()
+		var paths geodata.Paths
+		if bq != nil {
+			paths = bq.M().GeodataPaths()
+		}
+		loader := domain_set.NewMixLoader(paths)
 		if err := loader.LoadExpsAndFiles(args.Exps, args.Files); err != nil {
 			return nil, err
 		}
