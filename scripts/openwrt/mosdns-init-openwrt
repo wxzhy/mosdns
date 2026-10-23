@@ -19,29 +19,268 @@
 #
 
 START=99
+STOP=10
 USE_PROCD=1
 
 #####  ONLY CHANGE THIS BLOCK  ######
-PROG=/usr/bin/mosdns # where is mosdns
-RES_DIR=/etc/mosdns/ # resource dir / working dir / the dir where you store ip/domain lists
-CONF=./config.yaml   # where is the config file, it can be a relative path to $RES_DIR
+PROG=/usr/bin/mosdns
+RES_DIR=/etc/mosdns
+CONF=./config.yaml # Relative paths are resolved from RES_DIR, including plugin resources.
+RUN_USER=mosdns
+RUN_GROUP="$RUN_USER"
+CAPABILITIES=/etc/mosdns/mosdns.capabilities.json
+RUNDIR=/var/run/mosdns
+STATEDIR=/var/lib/mosdns
 #####  ONLY CHANGE THIS BLOCK  ######
 
-start_service() {
-  procd_open_instance
-  procd_set_param command $PROG start -d $RES_DIR -c $CONF
+SERVICE_NAME=mosdns
 
-  procd_set_param user root
+service_stopped() {
+  # procd_kill submits an asynchronous request. Wait for ujail's grace period
+  # and supervisor cleanup before a caller can start another DNS listener.
+  local remaining=75
+  while procd_running "$SERVICE_NAME" main; do
+    if [ "$remaining" -eq 0 ]; then
+      echo "mosdns: stop timed out; instance is still running" >&2
+      return 1
+    fi
+    sleep 1
+    remaining=$((remaining - 1))
+  done
+}
+
+root_owned_regular_file() {
+  # BusyBox ls is available even when neither stat nor coreutils-stat is.
+  local details expected
+  expected=$2
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  details=$(LC_ALL=C ls -ldn "$1" 2>/dev/null) || return 1
+  set -- $details
+  [ "$#" -ge 4 ] && [ "$1" = "$expected" ] && \
+    [ "$3" = 0 ] && [ "$4" = 0 ]
+}
+
+service_group_id() {
+  # OpenWrt need not have getent. Look up the configured group exactly.
+  local name password gid members
+  while IFS=: read -r name password gid members; do
+    if [ "$name" = "$1" ]; then
+      printf '%s\n' "$gid"
+      return 0
+    fi
+  done < /etc/group
+  return 1
+}
+
+writable_directory_path() {
+  local directory base relative component checked_path
+  directory=$1
+  base=$2
+  # Ignore trailing separators when checking the leaf itself for symlinks.
+  while [ "${directory%/}" != "$directory" ]; do
+    directory=${directory%/}
+  done
+  # Only children of the designated runtime/state base may be handed over to
+  # the service account. Never chown a system directory or a traversal alias.
+  case "$directory" in
+    ''|*//*|*/./*|*/.|*/../*|*/..)
+      echo "mosdns: unsafe runtime/state path: $1" >&2
+      return 1
+      ;;
+  esac
+  case "$directory" in
+    "$base"/?*) ;;
+    *)
+      echo "mosdns: runtime/state path must be a child of $base: $1" >&2
+      return 1
+      ;;
+  esac
+  # /var itself may legitimately point to /tmp on OpenWrt. Below the trusted
+  # base, reject symlinks in every component, including a substituted leaf.
+  relative=${directory#"$base"/}
+  checked_path=$base
+  while [ -n "$relative" ]; do
+    component=${relative%%/*}
+    checked_path="$checked_path/$component"
+    if [ -L "$checked_path" ] || { [ -e "$checked_path" ] && [ ! -d "$checked_path" ]; }; then
+      echo "mosdns: runtime/state component is a symlink or not a directory: $checked_path" >&2
+      return 1
+    fi
+    case "$relative" in
+      */*) relative=${relative#*/} ;;
+      *) relative= ;;
+    esac
+  done
+  printf '%s\n' "$directory"
+}
+
+canonical_directory_target() {
+  # readlink -f needs existing parents on some BusyBox versions. Resolve the
+  # nearest existing directory and append the already-validated missing tail.
+  local ancestor tail
+  ancestor=$1
+  tail=
+  while [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ]; do
+    tail="/${ancestor##*/}$tail"
+    ancestor=${ancestor%/*}
+    [ -n "$ancestor" ] || ancestor=/
+  done
+  [ -d "$ancestor" ] || return 1
+  ancestor=$(readlink -f "$ancestor") || return 1
+  [ "$ancestor" != / ] || ancestor=
+  printf '%s%s\n' "$ancestor" "$tail"
+}
+
+path_contains() {
+  [ "$1" = / ] && return 0
+  case "$2" in
+    "$1"|"$1"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_jail_path() {
+  # procd's mount helpers iterate over unquoted $@. Reject paths that those
+  # helpers would split or expand before assembling ujail's mount arguments.
+  case "$1" in
+    ''|*[[:space:]]*|*'*'*|*'?'*|*'['*|*']'*)
+      echo "mosdns: jail paths cannot contain whitespace or glob characters: $1" >&2
+      return 1
+      ;;
+  esac
+}
+
+writable_directories_are_isolated() {
+  local runtime state program resources config profile shell writable readonly
+  runtime=$1
+  state=$2
+  program=$3
+  resources=$4
+  config=$5
+  profile=${6:-}
+  shell=${7:-}
+  if path_contains "$runtime" "$state" || path_contains "$state" "$runtime"; then
+    echo "mosdns: runtime and state directories must not overlap" >&2
+    return 1
+  fi
+  for writable in "$runtime" "$state"; do
+    for readonly in "$program" "$resources" "$config" "$profile" "$shell"; do
+      [ -n "$readonly" ] || continue
+      if path_contains "$writable" "$readonly"; then
+        echo "mosdns: writable directory contains a program/config resource: $writable" >&2
+        return 1
+      fi
+    done
+    if path_contains "$resources" "$writable"; then
+      echo "mosdns: writable directory must be outside the read-only resource tree" >&2
+      return 1
+    fi
+  done
+}
+
+prepare_writable_directory() {
+  local directory
+  directory=$(writable_directory_path "$1" "$2") || return 1
+  # Only change the directory itself; never chown an existing tree recursively.
+  mkdir -p -m 0750 "$directory" && \
+    chown "$RUN_USER:$RUN_GROUP" "$directory" && \
+    chmod 0750 "$directory"
+}
+
+start_service() {
+  local run_uid run_gid program_real resource_real config_path config_real capabilities_real shell_real path runtime_target state_target
+  run_uid=$(id -u "$RUN_USER" 2>/dev/null) || {
+    echo "mosdns: service user is missing: $RUN_USER" >&2
+    return 1
+  }
+  if ! [ "$run_uid" -gt 0 ] 2>/dev/null; then
+    echo "mosdns: service user must have a non-root numeric UID: $RUN_USER" >&2
+    return 1
+  fi
+  run_gid=$(service_group_id "$RUN_GROUP") || {
+    echo "mosdns: service group is missing: $RUN_GROUP" >&2
+    return 1
+  }
+  if ! [ "$run_gid" -gt 0 ] 2>/dev/null; then
+    echo "mosdns: service group must have a non-root numeric GID: $RUN_GROUP" >&2
+    return 1
+  fi
+  if [ ! -x /sbin/ujail ]; then
+    echo "mosdns: procd-ujail is required for the OpenWrt service" >&2
+    return 1
+  fi
+  if ! root_owned_regular_file "$CAPABILITIES" '-rw-r--r--'; then
+    echo "mosdns: capability profile must be a regular root:root 0644 file: $CAPABILITIES" >&2
+    return 1
+  fi
+  capabilities_real=$(readlink -f "$CAPABILITIES") || return 1
+  program_real=$(readlink -f "$PROG") || return 1
+  if [ ! -f "$program_real" ] || [ ! -x "$program_real" ]; then
+    echo "mosdns: binary is missing or not executable: $PROG" >&2
+    return 1
+  fi
+  resource_real=$(readlink -f "$RES_DIR") || return 1
+  if [ ! -d "$resource_real" ]; then
+    echo "mosdns: resource directory is missing: $RES_DIR" >&2
+    return 1
+  fi
+  case "$CONF" in
+    /*) config_path=$CONF ;;
+    *) config_path="$resource_real/$CONF" ;;
+  esac
+  config_real=$(readlink -f "$config_path") || return 1
+  if [ ! -f "$config_real" ] || [ ! -r "$config_real" ]; then
+    echo "mosdns: config is missing or unreadable: $config_path" >&2
+    return 1
+  fi
+  shell_real=$(readlink -f /bin/sh) || return 1
+  if [ ! -x "$shell_real" ]; then
+    echo "mosdns: /bin/sh is missing or not executable" >&2
+    return 1
+  fi
+  runtime_target=$(writable_directory_path "$RUNDIR" /var/run) || return 1
+  state_target=$(writable_directory_path "$STATEDIR" /var/lib) || return 1
+  runtime_target=$(canonical_directory_target "$runtime_target") || return 1
+  state_target=$(canonical_directory_target "$state_target") || return 1
+  for path in "$program_real" "$resource_real" "$config_real" "$capabilities_real" \
+    "$shell_real" "$RUNDIR" "$STATEDIR" "$runtime_target" "$state_target"; do
+    validate_jail_path "$path" || return 1
+  done
+  writable_directories_are_isolated "$runtime_target" "$state_target" \
+    "$program_real" "$resource_real" "$config_real" "$capabilities_real" "$shell_real" || return 1
+  umask 027
+  prepare_writable_directory "$RUNDIR" /var/run && \
+    prepare_writable_directory "$STATEDIR" /var/lib || return 1
+
+  procd_open_instance main
+  # Pass each value as its own argument; never interpolate paths into shell code.
+  # exec keeps mosdns in the foreground and preserves procd's signal handling.
+  procd_set_param command /bin/sh -c \
+    'cd "$1" && umask 027 && exec "$2" start -d "$1" -c "$3"' \
+    mosdns "$resource_real" "$program_real" "$config_real"
+  procd_set_param user "$RUN_USER"
+  procd_set_param group "$RUN_GROUP"
+  procd_set_param no_new_privs 1
+  procd_set_param capabilities "$capabilities_real"
+  procd_set_param env "HOME=$STATEDIR" "TMPDIR=$RUNDIR"
+  procd_add_jail mosdns ronly log requirejail
+  procd_add_jail_mount "$program_real" "$resource_real" "$config_real" /bin/sh "$shell_real"
+  # The Go release binary is static; the shell wrapper may need shared libraries.
+  for path in /lib /usr/lib /usr/share/ca-certificates /usr/share/zoneinfo \
+    /etc/ssl /etc/hosts /etc/resolv.conf /etc/nsswitch.conf \
+    /etc/TZ /etc/localtime /etc/passwd /etc/group; do
+    [ -e "$path" ] && procd_add_jail_mount "$path"
+  done
+  procd_add_jail_mount_rw "$RUNDIR" "$STATEDIR"
+  procd_set_param term_timeout 35
+  procd_set_param respawn 3600 5 5
+  procd_set_param file "$config_real" "$capabilities_real"
   procd_set_param stdout 1
   procd_set_param stderr 1
-  procd_set_param respawn "${respawn_threshold:-3600}" "${respawn_timeout:-5}" "${respawn_retry:-5}"
   procd_close_instance
-  echo "mosdns is started!"
 }
 
 reload_service() {
-  stop
-  sleep 2s
-  echo "mosdns is restarted!"
+  stop || return 1
   start
 }

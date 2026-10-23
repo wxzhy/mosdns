@@ -6,6 +6,8 @@
 
 `speedcheck` 的完整参数、并行时序、标签、ASN 和过滤示例见 [speedcheck](speedcheck.md)、[Windows 运行说明](speedcheck-windows.md) 及 [完整测速示例](../examples/speedcheck-full.yaml)。本页同时覆盖其余全部已启用模块，不能把所有片段直接拼成一个生产配置：有些动作互斥，有些依赖数据库、证书或 Linux 防火墙集合。
 
+系统服务的运行账户、配置读取及可写路径要求见[低权限系统服务](service.md)。启用服务沙箱后，相对路径仍按工作目录解析；日志和缓存输出需放入允许写入的目录。
+
 `ip_replace` 支持按前缀替换 CDN 地址；[独立说明](ip-replace.md) 包含计算方式与测速接线，[本地演示](../examples/ip-replace.yaml) 使用 hosts 生成原响应，无需外网或数据库。
 
 [全模块 YAML 参数模板](examples/all-modules.yaml) 将全部顶层插件和完整参数汇集到同一文件，可用于严格解码检查；文件顶部列出了外部资源要求。模块片段适用于插入 `plugins` 列表，动作片段适用于 sequence 的 `args` 列表。

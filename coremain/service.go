@@ -26,18 +26,14 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"os"
-	"path/filepath"
+	"os/exec"
 	"time"
 )
 
 var (
 	// initialized by "service" sub command
 	svc    service.Service
-	svcCfg = &service.Config{
-		Name:        "mosdns",
-		DisplayName: "mosdns",
-		Description: "A DNS forwarder",
-	}
+	svcCfg = newServiceConfig()
 )
 
 type serverService struct {
@@ -46,6 +42,9 @@ type serverService struct {
 }
 
 func (ss *serverService) Start(s service.Service) error {
+	if err := validateServiceIdentity(s.Platform(), os.Geteuid(), os.Getegid()); err != nil {
+		return err
+	}
 	mlog.L().Info("starting service", zap.String("platform", s.Platform()))
 	m, err := NewServer(ss.f)
 	if err != nil {
@@ -83,29 +82,44 @@ func newSvcInstallCmd() *cobra.Command {
 	sf := new(serverFlags)
 	c := &cobra.Command{
 		Use:   "install [-d working_dir] [-c config_file]",
-		Short: "Install mosdns as a system service.",
+		Short: "Install mosdns as a low-privilege system service.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(sf.dir) > 0 {
-				absWd, err := filepath.Abs(sf.dir)
-				if err != nil {
-					return fmt.Errorf("cannot solve absolute working dir path, %w", err)
-				} else {
-					sf.dir = absWd
-				}
-			} else {
-				ep, err := os.Executable()
-				if err != nil {
-					return fmt.Errorf("cannot solve current executable path, %w", err)
-				}
-				sf.dir = filepath.Dir(ep)
+			executable, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("cannot resolve current executable path, %w", err)
 			}
-			mlog.S().Infof("set service working dir as %s", sf.dir)
-			svcCfg.Arguments = []string{"start", "--as-service", "-d", sf.dir}
-			if len(sf.c) > 0 {
-				svcCfg.Arguments = append(svcCfg.Arguments, "-c", sf.c)
+			workingDir, configPath, err := resolveServicePaths(executable, sf.dir, sf.c)
+			if err != nil {
+				return err
 			}
-			return svc.Install()
+			platform := svc.Platform()
+			cfg, err := newLowPrivilegeServiceConfig(platform, executable, workingDir, configPath)
+			if err != nil {
+				return err
+			}
+			if platform == "linux-systemd" {
+				version, err := exec.Command("systemctl", "--version").Output()
+				if err != nil {
+					return fmt.Errorf("cannot check systemd version, %w", err)
+				}
+				if err := validateSystemdVersion(string(version)); err != nil {
+					return err
+				}
+				info, err := os.Stat(configPath)
+				if err != nil {
+					return err
+				}
+				if info.Size() > maxServiceCredentialSize {
+					return fmt.Errorf("service config exceeds the %d-byte credential limit", maxServiceCredentialSize)
+				}
+			}
+			installed, err := service.New(&serverService{}, cfg)
+			if err != nil {
+				return fmt.Errorf("cannot configure low-privilege service, %w", err)
+			}
+			mlog.S().Infof("set service working dir as %s; service account %s", workingDir, cfg.UserName)
+			return installed.Install()
 		},
 		DisableFlagsInUseLine: true,
 		SilenceUsage:          true,
