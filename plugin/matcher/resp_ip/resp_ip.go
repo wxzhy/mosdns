@@ -28,7 +28,6 @@ import (
 	"github.com/miekg/dns"
 	"net"
 	"net/netip"
-	"time"
 )
 
 const PluginType = "resp_ip"
@@ -68,20 +67,7 @@ func matchRespAddr(qCtx *query_context.Context, m netlist.Matcher) (bool, error)
 	}
 	question := qCtx.QQuestion()
 	if question.Qclass == dns.ClassINET && (question.Qtype == dns.TypeHTTPS || question.Qtype == dns.TypeSVCB) {
-		candidate, err := response.AnalyzeBindings(qCtx.Q(), qCtx.SnapshotResponse(), time.Now())
-		if err != nil {
-			return false, err
-		}
-		for _, record := range candidate.Records {
-			if record.Priority == 0 {
-				continue
-			}
-			for _, ip := range record.Hints {
-				if m.Match(ip) {
-					return true, nil
-				}
-			}
-		}
+		return response.MatchBindingHints(qCtx.Q(), r, qCtx.UpstreamOpt(), qCtx.RespOpt(), m.Match)
 	}
 	return false, nil
 }

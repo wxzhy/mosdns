@@ -27,7 +27,6 @@ import (
 	"log/slog"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/AdguardTeam/dnscrypt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
@@ -182,12 +181,10 @@ func (u *Upstream) exchange(ctx context.Context, req *dns.Msg, ri *dnscrypt.Reso
 // certificate. It fetches the certificate on first use, and re-fetches
 // it when the cached one expired.
 func (u *Upstream) fetchResolverInfo(ctx context.Context) (*dnscrypt.ResolverInfo, error) {
-	now := uint32(time.Now().Unix())
-
 	u.mu.RLock()
 	ri := u.ri
 	u.mu.RUnlock()
-	if ri != nil && ri.ResolverCert.NotAfter >= now {
+	if ri != nil && ri.ResolverCert.VerifyDate() {
 		return ri, nil
 	}
 
@@ -198,11 +195,10 @@ func (u *Upstream) fetchResolverInfo(ctx context.Context) (*dnscrypt.ResolverInf
 		return nil, context.Cause(ctx)
 	}
 	// Re-check. Another goroutine may have fetched it.
-	now = uint32(time.Now().Unix())
 	u.mu.RLock()
 	ri = u.ri
 	u.mu.RUnlock()
-	if ri != nil && ri.ResolverCert.NotAfter >= now {
+	if ri != nil && ri.ResolverCert.VerifyDate() {
 		return ri, nil
 	}
 

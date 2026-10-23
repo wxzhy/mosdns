@@ -13,14 +13,18 @@ import (
 	probing "github.com/prometheus-community/pro-bing"
 )
 
+func (m *Manager) icmpNetwork(ip netip.Addr) string {
+	if ip.Is4() {
+		return m.icmp4
+	}
+	return m.icmp6
+}
+
 func (m *Manager) probeNetwork(ctx context.Context, ip netip.Addr, method probeMethod) Result {
 	if method.port != 0 {
 		return probeTCP(ctx, ip, method.port)
 	}
-	network := m.icmp6
-	if ip.Is4() {
-		network = m.icmp4
-	}
+	network := m.icmpNetwork(ip)
 	if network == "" {
 		return Result{Outcome: Unmeasured, Reason: "icmp_family_unavailable"}
 	}

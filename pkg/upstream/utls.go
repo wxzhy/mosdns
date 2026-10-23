@@ -364,13 +364,23 @@ type echConfigResolver struct {
 
 	logger *zap.Logger // non-nil
 
-	mu          echConfigMutex // protects followings
+	mu          echConfigMutex // protects u and query execution
 	u           Upstream       // the dns server upstream, lazily initialized
+	stateMu     sync.Mutex     // protects config, nextRefresh, flight, closed
 	config      []byte         // the last queried ECHConfigList
 	nextRefresh time.Time
+	flight      *echFlight
 	closed      bool
 	closedCtx   context.Context
 	cancel      context.CancelFunc
+}
+
+type echFlight struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+	waiters int
+	result  []byte
 }
 
 // echConfigMutex lets handshakes abandon a queued ECH refresh when their
@@ -436,32 +446,94 @@ func (r *echConfigResolver) getConfigList(ctx context.Context) []byte {
 		return r.static
 	}
 
-	if !r.mu.LockContext(ctx) {
-		return invalidECHConfigList
-	}
-	defer r.mu.Unlock()
+	r.stateMu.Lock()
 	if r.closed || ctx.Err() != nil || r.closedCtx.Err() != nil {
+		r.stateMu.Unlock()
 		return invalidECHConfigList
 	}
 	if time.Now().Before(r.nextRefresh) && r.config != nil {
-		return r.config
+		cfg := r.config
+		r.stateMu.Unlock()
+		return cfg
 	}
-	config, ttl, err := r.query(ctx)
-	if err != nil {
-		r.logger.Warn("failed to query ech config list", zap.Error(err))
-		// Keep serving the stale config if we have one.
-		if r.config == nil {
+	f := r.flight
+	if f == nil {
+		flightCtx, cancel := context.WithCancel(r.closedCtx)
+		f = &echFlight{ctx: flightCtx, cancel: cancel, done: make(chan struct{})}
+		r.flight = f
+		go r.runFlight(f)
+	}
+	f.waiters++
+	r.stateMu.Unlock()
+
+	select {
+	case <-f.done:
+		if ctx.Err() != nil || r.closedCtx.Err() != nil {
 			return invalidECHConfigList
 		}
-		return r.config
+		return f.result
+	case <-ctx.Done():
+		r.releaseFlight(f)
+		return invalidECHConfigList
+	case <-r.closedCtx.Done():
+		r.releaseFlight(f)
+		return invalidECHConfigList
 	}
-	r.config = config
-	refresh := time.Duration(ttl) * time.Second
-	if refresh < minECHConfigTTL {
-		refresh = minECHConfigTTL
+}
+
+func (r *echConfigResolver) releaseFlight(f *echFlight) {
+	r.stateMu.Lock()
+	f.waiters--
+	if f.waiters == 0 && r.flight == f {
+		r.flight = nil
+		f.cancel()
 	}
-	r.nextRefresh = time.Now().Add(refresh)
-	return r.config
+	r.stateMu.Unlock()
+}
+
+func (r *echConfigResolver) runFlight(f *echFlight) {
+	defer f.cancel()
+	var config []byte
+	var ttl uint32
+	var err error
+	if r.mu.LockContext(f.ctx) {
+		if f.ctx.Err() == nil && r.closedCtx.Err() == nil {
+			config, ttl, err = r.query(f.ctx)
+		} else {
+			err = f.ctx.Err()
+		}
+		r.mu.Unlock()
+	} else {
+		err = f.ctx.Err()
+	}
+
+	r.stateMu.Lock()
+	if r.flight == f {
+		r.flight = nil
+	}
+	if err != nil {
+		if f.ctx.Err() == nil {
+			r.logger.Warn("failed to query ech config list", zap.Error(err))
+		}
+		// Keep serving the stale config if we have one.
+		if r.config == nil || r.closed {
+			f.result = invalidECHConfigList
+		} else {
+			f.result = r.config
+		}
+	} else if r.closed || f.waiters == 0 {
+		f.result = invalidECHConfigList
+	} else {
+		r.config = config
+		refresh := time.Duration(ttl) * time.Second
+		if refresh < minECHConfigTTL {
+			refresh = minECHConfigTTL
+		}
+		r.nextRefresh = time.Now().Add(refresh)
+		f.result = r.config
+	}
+	close(f.done)
+	r.stateMu.Unlock()
 }
 
 // Close releases the lazily created DNS upstream used for ECH lookups.
@@ -470,6 +542,8 @@ func (r *echConfigResolver) Close() error {
 	r.cancel()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
 	if r.closed {
 		return nil
 	}

@@ -25,6 +25,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,13 @@ const mmdbMetadataMaxSize = 128 * 1024
 var mmdbMetadataMarker = []byte("\xab\xcd\xefMaxMind.com")
 
 var mmdbReaderCache sync.Map // absolute file path -> *maxminddb.Reader
+
+type mmdbOffsetKey struct {
+	r      *maxminddb.Reader
+	offset uintptr
+}
+
+var mmdbRecordCache sync.Map // mmdbOffsetKey -> string or []string
 
 // openMMDB opens a maxmind db reader from file, or returns the shared,
 // already opened one. Readers are cached for the lifetime of the process and
@@ -73,6 +81,11 @@ func openMMDB(file string) (*maxminddb.Reader, error) {
 // isMMDBFile reports whether file is a maxmind db, by searching the metadata
 // start marker in the last 128 KiB of the file.
 func isMMDBFile(file string) bool {
+	if abs, err := filepath.Abs(file); err == nil {
+		if _, ok := mmdbReaderCache.Load(abs); ok {
+			return true
+		}
+	}
 	f, err := os.Open(file) // #nosec G304 -- path comes from the user's config
 	if err != nil {
 		return false
@@ -173,52 +186,113 @@ func (m *MMDBIPMatcher) Match(addr netip.Addr) bool {
 	if addr.Is4In6() {
 		addr = addr.Unmap()
 	}
+	switch m.kind {
+	case mmdbKindCountry, mmdbKindCountrySing, mmdbKindCountryMetaV0:
+		res := m.r.Lookup(addr)
+		if !res.Found() {
+			return false
+		}
+		key := mmdbOffsetKey{r: m.r, offset: res.Offset()}
+		if cached, ok := mmdbRecordCache.Load(key); ok {
+			return matchCachedCountry(cached, m.code)
+		}
+		cached, ok := decodeCountryRecord(res, m.kind)
+		if !ok {
+			return false
+		}
+		mmdbRecordCache.Store(key, cached)
+		return matchCachedCountry(cached, m.code)
+	case mmdbKindASNMaxmind, mmdbKindASNIPInfo:
+		asn, ok := m.LookupASN(addr)
+		return ok && asn == m.asn
+	}
+	return false
+}
+
+// LookupASN resolves the autonomous system number of addr in an ASN database.
+func (m *MMDBIPMatcher) LookupASN(addr netip.Addr) (uint32, bool) {
+	if m == nil || (m.kind != mmdbKindASNMaxmind && m.kind != mmdbKindASNIPInfo) {
+		return 0, false
+	}
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
 	res := m.r.Lookup(addr)
 	if !res.Found() {
-		return false
+		return 0, false
 	}
 	switch m.kind {
-	case mmdbKindCountry:
-		var rec mmdbCountryRecord
-		if res.Decode(&rec) != nil {
-			return false
-		}
-		return strings.EqualFold(rec.Country.IsoCode, m.code)
-	case mmdbKindCountrySing:
-		var code string
-		if res.Decode(&code) != nil {
-			return false
-		}
-		return strings.EqualFold(code, m.code)
-	case mmdbKindCountryMetaV0:
-		var v any
-		if res.Decode(&v) != nil {
-			return false
-		}
-		switch code := v.(type) {
-		case string:
-			return strings.EqualFold(code, m.code)
-		case []any:
-			for _, e := range code {
-				if s, ok := e.(string); ok && strings.EqualFold(s, m.code) {
-					return true
-				}
-			}
-		}
-		return false
 	case mmdbKindASNMaxmind:
 		var rec mmdbASNRecord
 		if res.Decode(&rec) != nil {
-			return false
+			return 0, false
 		}
-		return rec.ASN == m.asn
+		return rec.ASN, true
 	case mmdbKindASNIPInfo:
 		var rec mmdbIPInfoASNRecord
 		if res.Decode(&rec) != nil {
-			return false
+			return 0, false
 		}
 		asn, err := strconv.ParseUint(strings.TrimPrefix(rec.ASN, "AS"), 10, 32)
-		return err == nil && uint32(asn) == m.asn
+		if err != nil {
+			return 0, false
+		}
+		return uint32(asn), true
+	default:
+		return 0, false
 	}
-	return false
+}
+
+// SameReader reports whether m and other query the same underlying MMDB reader.
+func (m *MMDBIPMatcher) SameReader(other *MMDBIPMatcher) bool {
+	return m != nil && other != nil && m.r == other.r && m.kind == other.kind
+}
+
+func decodeCountryRecord(res maxminddb.Result, kind int) (any, bool) {
+	switch kind {
+	case mmdbKindCountry:
+		var rec mmdbCountryRecord
+		if res.Decode(&rec) != nil {
+			return nil, false
+		}
+		return strings.ToLower(rec.Country.IsoCode), true
+	case mmdbKindCountrySing:
+		var code string
+		if res.Decode(&code) != nil {
+			return nil, false
+		}
+		return strings.ToLower(code), true
+	case mmdbKindCountryMetaV0:
+		var v any
+		if res.Decode(&v) != nil {
+			return nil, false
+		}
+		switch code := v.(type) {
+		case string:
+			return strings.ToLower(code), true
+		case []any:
+			codes := make([]string, 0, len(code))
+			for _, e := range code {
+				if s, ok := e.(string); ok {
+					codes = append(codes, strings.ToLower(s))
+				}
+			}
+			return codes, true
+		default:
+			return "", true
+		}
+	default:
+		return nil, false
+	}
+}
+
+func matchCachedCountry(cached any, want string) bool {
+	switch v := cached.(type) {
+	case string:
+		return v == want
+	case []string:
+		return slices.Contains(v, want)
+	default:
+		return false
+	}
 }

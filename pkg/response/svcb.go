@@ -59,7 +59,34 @@ type BindingEdit struct {
 }
 
 func AnalyzeBindings(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Time) (*BindingCandidate, error) {
-	base, err := analyzeEnvelope(query, snapshot, at)
+	return analyzeBindings(query, snapshot, at, true)
+}
+
+// MatchBindingHints reports whether any reachable terminal ServiceMode record
+// in resp contains an ipv4hint or ipv6hint matching match, without cloning the
+// DNS message or EDNS options.
+func MatchBindingHints(query, resp *dns.Msg, upstreamOpt, respOpt *dns.OPT, match func(netip.Addr) bool) (bool, error) {
+	c, err := analyzeBindings(query, query_context.ResponseSnapshot{
+		Response:    resp,
+		UpstreamOpt: upstreamOpt,
+		RespOpt:     respOpt,
+	}, time.Time{}, false)
+	if err != nil {
+		return false, err
+	}
+	for _, record := range c.Records {
+		if record.Priority == 0 {
+			continue
+		}
+		if slices.ContainsFunc(record.Hints, match) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func analyzeBindings(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Time, clone bool) (*BindingCandidate, error) {
+	base, err := analyzeEnvelopeWithClone(query, snapshot, at, clone)
 	if err != nil {
 		return nil, err
 	}

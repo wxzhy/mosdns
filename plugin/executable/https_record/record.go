@@ -216,26 +216,30 @@ func (p *Record) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	}
 	// Optional lookups consumed part of the source lease even when they failed
 	// or the first cleanup had nothing to change. Replay the cleanup at the
-	// final time before taking any success/failure exit, preserving its original
-	// absolute deadline and aging every retained wire TTL.
+	// final time when taking any fallback exit, preserving its original
+	// absolute deadline and aging every retained wire TTL without rebuilding
+	// twice on the successful injection/synthesis path.
 	now := p.now()
-	agedSnapshot, _, ageErr := response.RewriteBindings(candidate, edits, now)
-	if ageErr != nil {
-		return ageErr
-	}
-	qCtx.CommitResponse(agedSnapshot)
-	if len(ech.value) == 0 {
+	commitAgedCleanup := func() error {
+		agedSnapshot, _, ageErr := response.RewriteBindings(candidate, edits, now)
+		if ageErr != nil {
+			return ageErr
+		}
+		qCtx.CommitResponse(agedSnapshot)
 		return nil
+	}
+	if len(ech.value) == 0 {
+		return commitAgedCleanup()
 	}
 	if !ech.validUntil.IsZero() && !now.Before(ech.validUntil) {
-		return nil
+		return commitAgedCleanup()
 	}
 	if candidate.NODATA {
 		if len(synthesis.ips) == 0 {
-			return nil
+			return commitAgedCleanup()
 		}
 		if !synthesis.validUntil.IsZero() && !now.Before(synthesis.validUntil) {
-			return nil
+			return commitAgedCleanup()
 		}
 		ttl := min(uint32(maxECHCacheTTL/time.Second), ech.ttl, synthesis.ttl)
 		until := earlier(ech.validUntil, synthesis.validUntil)
@@ -244,12 +248,13 @@ func (p *Record) Exec(ctx context.Context, qCtx *query_context.Context) error {
 		}
 		snapshot, synthErr := response.SynthesizeBinding(candidate, ech.value, ttl, until, now)
 		if synthErr != nil {
-			return nil
+			return commitAgedCleanup()
 		}
 		if until := snapshot.ValidUntil; !until.IsZero() && !p.now().Before(until) {
-			return nil
+			return commitAgedCleanup()
 		}
 		if err := ctx.Err(); err != nil {
+			_ = commitAgedCleanup()
 			return context.Cause(ctx)
 		}
 		qCtx.CommitResponse(snapshot)
@@ -269,18 +274,20 @@ func (p *Record) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	}
 	snapshot, injected, rewriteErr := response.RewriteBindings(candidate, edits, now)
 	if rewriteErr != nil {
-		return nil
+		return commitAgedCleanup()
 	}
 	if until := snapshot.ValidUntil; !until.IsZero() && !p.now().Before(until) {
-		return nil
+		return commitAgedCleanup()
 	}
 	if err := ctx.Err(); err != nil {
+		_ = commitAgedCleanup()
 		return context.Cause(ctx)
 	}
 	if injected {
 		qCtx.CommitResponse(snapshot)
+		return nil
 	}
-	return nil
+	return commitAgedCleanup()
 }
 
 func (p *Record) allowedName(candidate *response.BindingCandidate, target string) bool {

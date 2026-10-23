@@ -487,14 +487,14 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 				if err != nil {
 					return nil, err
 				}
-				return wrapConn(uconn, opt.EventObserver), nil
+				return uconn, nil
 			}
 			tlsConn := tls.Client(conn, tlsConfig)
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				tlsConn.Close()
 				return nil, err
 			}
-			return wrapConn(tlsConn, opt.EventObserver), nil
+			return tlsConn, nil
 		}
 
 		if opt.EnablePipeline {
@@ -566,12 +566,28 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to init tcp dialer, %w", err)
 			}
-			t1 := &http.Transport{
-				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { // overwrite server addr
-					c, err := tcpDialer(ctx)
-					c = wrapConn(c, opt.EventObserver)
-					return c, err
-				},
+				transportCtx, cancelTransport := context.WithCancel(context.Background())
+				addonCloser = closerFunc(func() error {
+					cancelTransport()
+					return nil
+				})
+				defer closeIfFuncErr(addonCloser)
+				withHandshakeBudget := func(ctx context.Context) (context.Context, context.CancelFunc) {
+					stepCtx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout)
+					stop := context.AfterFunc(transportCtx, cancel)
+					return stepCtx, func() {
+						stop()
+						cancel()
+					}
+				}
+				t1 := &http.Transport{
+					DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { // overwrite server addr
+						dialCtx, cancel := withHandshakeBudget(ctx)
+						defer cancel()
+						c, err := tcpDialer(dialCtx)
+						c = wrapConn(c, opt.EventObserver)
+						return c, err
+					},
 				TLSClientConfig:     opt.TLSConfig,
 				TLSHandshakeTimeout: tlsHandshakeTimeout,
 				IdleConnTimeout:     idleConnTimeout,
@@ -598,18 +614,22 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 						tlsCfg.NextProtos = []string{"h2", "http/1.1"}
 					}
 				}
-				t1.DialTLSContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-					conn, err := tcpDialer(ctx)
-					if err != nil {
-						return nil, err
+					t1.DialTLSContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+						dialCtx, cancel := withHandshakeBudget(ctx)
+						defer cancel()
+						conn, err := tcpDialer(dialCtx)
+						if err != nil {
+							return nil, err
+						}
+						conn = wrapConn(conn, opt.EventObserver)
+						handshakeCtx, cancelHandshake := withHandshakeBudget(ctx)
+						defer cancelHandshake()
+						uconn, err := utlsClientHandshake(handshakeCtx, conn, tlsCfg, fp, echResolver)
+						if err != nil {
+							return nil, err
+						}
+						return &utlsConn{uconn}, nil
 					}
-					conn = wrapConn(conn, opt.EventObserver)
-					uconn, err := utlsClientHandshake(ctx, conn, tlsCfg, fp, echResolver)
-					if err != nil {
-						return nil, err
-					}
-					return &utlsConn{uconn}, nil
-				}
 			}
 
 			t2, err := http2.ConfigureTransports(t1)
@@ -752,7 +772,8 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 				if err != nil {
 					return nil, err
 				}
-				return dialer.DialContext(ctx, "udp", ua.String())
+				c, err := dialer.DialContext(ctx, "udp", ua.String())
+				return wrapConn(c, opt.EventObserver), err
 			}
 			dialTcpConn, err := newTcpDialer(false, defaultPort)
 			if err != nil {
@@ -760,8 +781,11 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 			}
 			return dnscrypt.NewUpstream(addr, dnscrypt.Opt{
 				UDPDialContext: dialUdpConn,
-				TCPDialContext: dialTcpConn,
-				Logger:         opt.Logger,
+				TCPDialContext: func(ctx context.Context) (net.Conn, error) {
+					c, err := dialTcpConn(ctx)
+					return wrapConn(c, opt.EventObserver), err
+				},
+				Logger: opt.Logger,
 			})
 		case dnsstamps.StampProtoTypeDoH:
 			return NewUpstream("https://"+stamp.ProviderName+stamp.Path, opt)
@@ -799,6 +823,10 @@ func (u *udpWithFallback) Close() error {
 	u.t.Close()
 	return nil
 }
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
 
 type closeGroup struct {
 	closers []io.Closer

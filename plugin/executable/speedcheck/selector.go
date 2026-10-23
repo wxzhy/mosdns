@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_policy"
@@ -234,25 +235,38 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 		deadline = d
 	}
 	cutoff := deadline
-	updateCutoff := func() {
-		cutoff = minTime(cutoff, selectionCutoff(deadline, s.args.Mode, firstPositive, firstSuccess, s.args.SelectionTimeout, s.args.SettleWindow))
-	}
-	resetTimer := func() {
-		updateCutoff()
-		if timer == nil {
-			timer = time.NewTimer(time.Until(cutoff))
-		} else {
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
+	recomputeFirstSuccess := func() {
+		firstSuccess = time.Time{}
+		for ip := range admitted {
+			if p := probes[ip]; p != nil && p.done && validRTT(p.result) {
+				observeEarliest(&firstSuccess, p.completedAt)
 			}
-			timer.Reset(time.Until(cutoff))
 		}
-		timerC = timer.C
 	}
-	resetTimer()
+		updateCutoff := func(allowExpand bool) {
+			next := selectionCutoff(deadline, s.args.Mode, firstPositive, firstSuccess, s.args.SelectionTimeout, s.args.SettleWindow)
+			if allowExpand {
+				cutoff = next
+			} else {
+				cutoff = minTime(cutoff, next)
+			}
+		}
+		resetTimer := func(allowExpand bool) {
+			updateCutoff(allowExpand)
+			if timer == nil {
+				timer = time.NewTimer(time.Until(cutoff))
+			} else {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(time.Until(cutoff))
+			}
+			timerC = timer.C
+		}
+		resetTimer(false)
 	question := qCtx.QQuestion()
 	addressQuery := question.Qclass == dns.ClassINET && (question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA)
 	acceptSource := func(event sourceEvent, launch bool) bool {
@@ -286,38 +300,42 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 					cs.probeAllowed = s.matches(s.args.ProbeMatch, cs)
 					states[event.index] = cs
 					accepted = true
-					if len(c.Addresses) > 0 && observeEarliest(&firstPositive, event.at) {
-						if launch {
-							resetTimer()
-						} else {
-							updateCutoff()
+					if len(c.Addresses) > 0 {
+						observeEarliest(&firstPositive, event.at)
+					}
+						admitted = s.refreshProbes(work, states, probes, startedIPs, probed, launch)
+						recomputeFirstSuccess()
+						if len(c.Addresses) > 0 {
+							if launch {
+								resetTimer(true)
+							} else {
+								updateCutoff(false)
+							}
 						}
 					}
-					admitted = s.refreshProbes(work, states, probes, startedIPs, probed, launch)
+				}
+			}
+			s.metrics.sources.WithLabelValues(s.sources[event.index].Tag, result).Inc()
+			return accepted
+		}
+		acceptProbe := func(event probeEvent, reschedule bool) {
+			p := probes[event.ip]
+			if p == nil || p.generation != event.generation || event.at.After(cutoff) {
+				return
+			}
+			p.result = event.result
+			p.done = true
+			p.cancel = nil
+			p.completedAt = event.at
+			s.metrics.probes.WithLabelValues(string(event.result.Outcome), strconv.FormatBool(event.result.Cached)).Inc()
+			if admitted[event.ip] && validRTT(event.result) && observeEarliest(&firstSuccess, event.at) {
+				if reschedule {
+					resetTimer(false)
+				} else {
+					updateCutoff(false)
 				}
 			}
 		}
-		s.metrics.sources.WithLabelValues(s.sources[event.index].Tag, result).Inc()
-		return accepted
-	}
-	acceptProbe := func(event probeEvent, reschedule bool) {
-		p := probes[event.ip]
-		if p == nil || p.generation != event.generation || event.at.After(cutoff) {
-			return
-		}
-		p.result = event.result
-		p.done = true
-		p.cancel = nil
-		p.completedAt = event.at
-		s.metrics.probes.WithLabelValues(string(event.result.Outcome), strconv.FormatBool(event.result.Cached)).Inc()
-		if admitted[event.ip] && validRTT(event.result) && observeEarliest(&firstSuccess, event.at) {
-			if reschedule {
-				resetTimer()
-			} else {
-				updateCutoff()
-			}
-		}
-	}
 	finish := func() error {
 		if parent.Err() != nil {
 			outcome = "canceled"
@@ -525,7 +543,20 @@ func (s *Selector) classify(ip netip.Addr) ipMetadata {
 			m.labels = append(m.labels, name)
 		}
 	}
+	var probedReaders []*geodata.MMDBIPMatcher
 	for n, matcher := range s.asns {
+		if mmdb, ok := matcher.(*geodata.MMDBIPMatcher); ok {
+			if slices.ContainsFunc(probedReaders, mmdb.SameReader) {
+				continue
+			}
+			probedReaders = append(probedReaders, mmdb)
+			if asn, found := mmdb.LookupASN(ip); found {
+				if same, ok := s.asns[asn].(*geodata.MMDBIPMatcher); ok && mmdb.SameReader(same) {
+					m.asns = append(m.asns, asn)
+				}
+			}
+			continue
+		}
 		if matcher.Match(ip) {
 			m.asns = append(m.asns, n)
 		}

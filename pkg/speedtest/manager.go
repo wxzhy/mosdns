@@ -267,6 +267,12 @@ func (m *Manager) Measure(ctx context.Context, ip netip.Addr, c Config) Result {
 	if len(c.TCPPorts) == 0 && !c.ICMP {
 		return Result{Outcome: Unmeasured, Reason: "disabled"}
 	}
+	if c.ICMP && m.icmpNetwork(ip) == "" {
+		if len(c.TCPPorts) == 0 {
+			return Result{Outcome: Unmeasured, Reason: "icmp_family_unavailable"}
+		}
+		c.ICMP = false
+	}
 	key := makeKey(ip, c)
 	m.mu.Lock()
 	if m.closed {
@@ -400,19 +406,27 @@ func (m *Manager) schedule(ctx context.Context, ip netip.Addr, method probeMetho
 				if queueCtx.Err() != nil {
 					cancel()
 					<-m.active
-					results <- Result{Outcome: Unmeasured, Reason: "queue_deadline"}
+					if ctx.Err() != nil {
+						results <- unmeasuredContext(ctx.Err())
+					} else {
+						results <- Result{Outcome: Unmeasured, Reason: "queue_deadline"}
+					}
 					return
 				}
 				cancel()
 			case <-ctx.Done():
 				<-m.queue
 				cancel()
-				results <- Result{Outcome: Unmeasured, Reason: "queue_deadline"}
+				results <- unmeasuredContext(ctx.Err())
 				return
 			case <-queueCtx.Done():
 				<-m.queue
 				cancel()
-				results <- Result{Outcome: Unmeasured, Reason: "queue_deadline"}
+				if ctx.Err() != nil {
+					results <- unmeasuredContext(ctx.Err())
+				} else {
+					results <- Result{Outcome: Unmeasured, Reason: "queue_deadline"}
+				}
 				return
 			}
 		}

@@ -109,6 +109,7 @@ func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*[]
 		}
 
 		resp, err := c.exchange(ctx, queryPayload)
+		pool.ReleaseBuf(queryPayload)
 		if err != nil {
 			if !isNewConn && retry <= maxRetry {
 				retry++
@@ -214,12 +215,18 @@ func (t *ReuseConnTransport) Close() error {
 	return nil
 }
 
+type reuseWaiter struct {
+	mu        sync.Mutex
+	ch        chan *[]byte
+	abandoned bool
+}
+
 type reusableConn struct {
 	c NetConn
 	t *ReuseConnTransport
 
 	m           sync.Mutex
-	waitingResp chan *[]byte
+	waitingResp *reuseWaiter
 
 	closeOnce   sync.Once
 	closeNotify chan struct{}
@@ -258,11 +265,11 @@ func (c *reusableConn) readLoop() {
 		}
 
 		c.m.Lock()
-		respChan := c.waitingResp
+		waiter := c.waitingResp
 		c.waitingResp = nil
 		c.m.Unlock()
 
-		if respChan == nil {
+		if waiter == nil {
 			pool.ReleaseBuf(resp)
 			c.closeWithErr(errUnexpectedResp)
 			return
@@ -274,10 +281,18 @@ func (c *reusableConn) readLoop() {
 		// before Exchange call returning. Otherwise, Test_ReuseConnTransport may fail.
 		c.t.setIdle(c)
 
-		select {
-		case respChan <- resp:
-		default:
-			panic("bug: respChan has buffer, we shouldn't reach here")
+		waiter.mu.Lock()
+		if waiter.abandoned {
+			waiter.mu.Unlock()
+			pool.ReleaseBuf(resp)
+		} else {
+			select {
+			case waiter.ch <- resp:
+				waiter.mu.Unlock()
+			default:
+				waiter.mu.Unlock()
+				panic("bug: respChan has buffer, we shouldn't reach here")
+			}
 		}
 	}
 }
@@ -310,13 +325,13 @@ func (c *reusableConn) closeWithErrByTransport(err error) {
 }
 
 func (c *reusableConn) exchange(ctx context.Context, q *[]byte) (*[]byte, error) {
-	respChan := make(chan *[]byte, 1)
+	waiter := &reuseWaiter{ch: make(chan *[]byte, 1)}
 	c.m.Lock()
 	if c.waitingResp != nil {
 		c.m.Unlock()
 		panic("bug: reusableConn: concurrent exchange calls")
 	}
-	c.waitingResp = respChan
+	c.waitingResp = waiter
 	c.m.Unlock()
 
 	waitRespTimeout := reuseConnQueryTimeout
@@ -330,12 +345,25 @@ func (c *reusableConn) exchange(ctx context.Context, q *[]byte) (*[]byte, error)
 		return nil, err
 	}
 
+	abandon := func() {
+		waiter.mu.Lock()
+		waiter.abandoned = true
+		select {
+		case resp := <-waiter.ch:
+			pool.ReleaseBuf(resp)
+		default:
+		}
+		waiter.mu.Unlock()
+	}
+
 	select {
-	case resp := <-respChan:
+	case resp := <-waiter.ch:
 		return resp, nil
 	case <-c.closeNotify:
+		abandon()
 		return nil, c.closeErr
 	case <-ctx.Done():
+		abandon()
 		return nil, context.Cause(ctx)
 	}
 }

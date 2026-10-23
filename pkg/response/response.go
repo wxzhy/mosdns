@@ -97,6 +97,10 @@ func Analyze(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Ti
 // analyzeEnvelope shares correlation, independent ownership and EDNS-view
 // validation between address responses and service-binding responses.
 func analyzeEnvelope(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Time) (*Candidate, error) {
+	return analyzeEnvelopeWithClone(query, snapshot, at, true)
+}
+
+func analyzeEnvelopeWithClone(query *dns.Msg, snapshot query_context.ResponseSnapshot, at time.Time, clone bool) (*Candidate, error) {
 	if !snapshot.ReceivedAt.IsZero() {
 		at = snapshot.ReceivedAt
 	}
@@ -123,8 +127,12 @@ func analyzeEnvelope(query *dns.Msg, snapshot query_context.ResponseSnapshot, at
 	if err != nil {
 		return nil, err
 	}
+	owned := snapshot
+	if clone {
+		owned = snapshot.Clone()
+	}
 	c := &Candidate{
-		Snapshot: snapshot.Clone(), ReceivedAt: at, Question: question,
+		Snapshot: owned, ReceivedAt: at, Question: question,
 		Terminal: canonical(question.Name), ViewKey: view.key(), ecs: view,
 		Negative: r.Rcode == dns.RcodeNameError,
 		queryHdr: query.MsgHdr,

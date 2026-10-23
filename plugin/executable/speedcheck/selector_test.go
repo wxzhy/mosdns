@@ -782,3 +782,40 @@ func TestHugeFiniteMultiplierKeepsMeasuredAddressPriority(t *testing.T) {
 		}
 	})
 }
+
+func TestDisplacedEarlyProbeDoesNotShortenBoundedCutoffForAdmittedCandidates(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		primaryIPs := make([]string, maxUniqueIPs)
+		for i := range primaryIPs {
+			primaryIPs[i] = fmt.Sprintf("192.0.2.%d", i+1)
+		}
+		probe := func(ctx context.Context, ip netip.Addr, _ speedtest.Config) speedtest.Result {
+			switch ip.String() {
+			case "198.51.100.1":
+				if !waitDelay(ctx, time.Millisecond) {
+					return speedtest.Result{Outcome: speedtest.Unmeasured}
+				}
+				return speedtest.Result{Outcome: speedtest.Success, RTT: time.Millisecond}
+			case "192.0.2.1":
+				if !waitDelay(ctx, 20*time.Millisecond) {
+					return speedtest.Result{Outcome: speedtest.Unmeasured}
+				}
+				return speedtest.Result{Outcome: speedtest.Success, RTT: 5 * time.Millisecond}
+			default:
+				<-ctx.Done()
+				return speedtest.Result{Outcome: speedtest.Unmeasured}
+			}
+		}
+		s := testSelector(t, Args{Mode: ModeBounded, SelectionTimeout: 300 * time.Millisecond, SettleWindow: 25 * time.Millisecond}, []Source{
+			delayedSource("primary", 10*time.Millisecond, primaryIPs...),
+			delayedSource("secondary", 0, "198.51.100.1"),
+		}, Options{Probe: probe})
+		q := queryContext(false)
+		if err := s.Exec(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+		if got := answerIPs(q); !slices.Equal(got, []string{"192.0.2.1"}) || q.SnapshotResponse().ProbeStatus != query_context.ProbeSucceeded {
+			t.Fatalf("displaced probe cut off primary measurement: got=%v status=%v", got, q.SnapshotResponse().ProbeStatus)
+		}
+	})
+}

@@ -470,3 +470,33 @@ func TestTCPAndICMPMethodsRunTogether(t *testing.T) {
 		}
 	})
 }
+
+func TestSingleFamilyICMPUnavailableFallsBackToTCPAndPreservesFailureCache(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := NewManager(Options{FailureTTL: 5 * time.Second})
+		defer m.Close()
+		m.detectICMP = func() (string, string, error) { return "udp4", "", nil }
+		var calls atomic.Int32
+		m.probe = func(_ context.Context, _ netip.Addr, method probeMethod) Result {
+			calls.Add(1)
+			if method.port == 0 {
+				t.Error("ICMP method should not be scheduled for an unsupported IP family")
+				return Result{Outcome: Unmeasured, Reason: "icmp_family_unavailable"}
+			}
+			return Result{Outcome: Failed, Reason: "network_error"}
+		}
+		v6 := netip.MustParseAddr("2001:db8::1")
+		r := m.Measure(context.Background(), v6, Config{TCPPorts: []uint16{80, 443}, ICMP: true})
+		if r.Outcome != Failed || r.Cached || calls.Load() != 2 {
+			t.Fatalf("expected TCP failure without ICMP scheduling: %#v calls=%d", r, calls.Load())
+		}
+		r = m.Measure(context.Background(), v6, Config{TCPPorts: []uint16{80, 443}, ICMP: true})
+		if r.Outcome != Failed || !r.Cached || calls.Load() != 2 {
+			t.Fatalf("expected cached failure on second call: %#v calls=%d", r, calls.Load())
+		}
+		icmpOnly := m.Measure(context.Background(), v6, Config{TCPPorts: []uint16{}, ICMP: true})
+		if icmpOnly.Outcome != Unmeasured || icmpOnly.Reason != "icmp_family_unavailable" || calls.Load() != 2 {
+			t.Fatalf("expected immediate icmp_family_unavailable without scheduling: %#v calls=%d", icmpOnly, calls.Load())
+		}
+	})
+}
