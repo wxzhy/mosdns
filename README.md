@@ -20,4 +20,6 @@ HTTPS/SVCB 响应处理：[ECH、hint 与 ALPN](docs/https-record.md) · [离线
 
 Windows：[运行与配置](docs/speedcheck-windows.md) · [UDP/TCP 完整示例](examples/speedcheck-windows.yaml)
 
+SmartDNS 部署迁移：[普通/CERNET 配置、数据准备与差异说明](docs/smartdns-migration.md)
+
 代码简化与性能：[复用方案、验证与基准对照](docs/optimization.md)

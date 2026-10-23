@@ -21,6 +21,9 @@ release/
 .vscode/
 .idea/
 
+# Python cache
+__pycache__/
+
 # test utils
 testutils/
 
