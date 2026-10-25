@@ -95,10 +95,21 @@ func (ote *quicReservedExchanger) ExchangeReserved(ctx context.Context, q []byte
 		resp *[]byte
 		err  error
 	}
-	rc := make(chan res, 1)
+	rc := make(chan res)
+	done := make(chan struct{})
+	defer close(done)
+	// If the caller returns on cancellation, the reader may already hold a
+	// pooled response. An unbuffered rc lets the reader release it, mirroring
+	// the DoH exchange, instead of stranding it in a buffered channel.
 	go func() {
 		r, err := dnsutils.ReadRawMsgFromTCP(stream)
-		rc <- res{resp: r, err: err}
+		select {
+		case rc <- res{resp: r, err: err}:
+		case <-done:
+			if r != nil {
+				pool.ReleaseBuf(r)
+			}
+		}
 	}()
 
 	select {
