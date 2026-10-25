@@ -243,30 +243,30 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 			}
 		}
 	}
-		updateCutoff := func(allowExpand bool) {
-			next := selectionCutoff(deadline, s.args.Mode, firstPositive, firstSuccess, s.args.SelectionTimeout, s.args.SettleWindow)
-			if allowExpand {
-				cutoff = next
-			} else {
-				cutoff = minTime(cutoff, next)
-			}
+	updateCutoff := func(allowExpand bool) {
+		next := selectionCutoff(deadline, s.args.Mode, firstPositive, firstSuccess, s.args.SelectionTimeout, s.args.SettleWindow)
+		if allowExpand {
+			cutoff = next
+		} else {
+			cutoff = minTime(cutoff, next)
 		}
-		resetTimer := func(allowExpand bool) {
-			updateCutoff(allowExpand)
-			if timer == nil {
-				timer = time.NewTimer(time.Until(cutoff))
-			} else {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
+	}
+	resetTimer := func(allowExpand bool) {
+		updateCutoff(allowExpand)
+		if timer == nil {
+			timer = time.NewTimer(time.Until(cutoff))
+		} else {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
 				}
-				timer.Reset(time.Until(cutoff))
 			}
-			timerC = timer.C
+			timer.Reset(time.Until(cutoff))
 		}
-		resetTimer(false)
+		timerC = timer.C
+	}
+	resetTimer(false)
 	question := qCtx.QQuestion()
 	addressQuery := question.Qclass == dns.ClassINET && (question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA)
 	acceptSource := func(event sourceEvent, launch bool) bool {
@@ -303,39 +303,39 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 					if len(c.Addresses) > 0 {
 						observeEarliest(&firstPositive, event.at)
 					}
-						admitted = s.refreshProbes(work, states, probes, startedIPs, probed, launch)
-						recomputeFirstSuccess()
-						if len(c.Addresses) > 0 {
-							if launch {
-								resetTimer(true)
-							} else {
-								updateCutoff(false)
-							}
+					admitted = s.refreshProbes(work, states, probes, startedIPs, probed, launch)
+					recomputeFirstSuccess()
+					if len(c.Addresses) > 0 {
+						if launch {
+							resetTimer(true)
+						} else {
+							updateCutoff(false)
 						}
 					}
 				}
 			}
-			s.metrics.sources.WithLabelValues(s.sources[event.index].Tag, result).Inc()
-			return accepted
 		}
-		acceptProbe := func(event probeEvent, reschedule bool) {
-			p := probes[event.ip]
-			if p == nil || p.generation != event.generation || event.at.After(cutoff) {
-				return
-			}
-			p.result = event.result
-			p.done = true
-			p.cancel = nil
-			p.completedAt = event.at
-			s.metrics.probes.WithLabelValues(string(event.result.Outcome), strconv.FormatBool(event.result.Cached)).Inc()
-			if admitted[event.ip] && validRTT(event.result) && observeEarliest(&firstSuccess, event.at) {
-				if reschedule {
-					resetTimer(false)
-				} else {
-					updateCutoff(false)
-				}
+		s.metrics.sources.WithLabelValues(s.sources[event.index].Tag, result).Inc()
+		return accepted
+	}
+	acceptProbe := func(event probeEvent, reschedule bool) {
+		p := probes[event.ip]
+		if p == nil || p.generation != event.generation || event.at.After(cutoff) {
+			return
+		}
+		p.result = event.result
+		p.done = true
+		p.cancel = nil
+		p.completedAt = event.at
+		s.metrics.probes.WithLabelValues(string(event.result.Outcome), strconv.FormatBool(event.result.Cached)).Inc()
+		if admitted[event.ip] && validRTT(event.result) && observeEarliest(&firstSuccess, event.at) {
+			if reschedule {
+				resetTimer(false)
+			} else {
+				updateCutoff(false)
 			}
 		}
+	}
 	finish := func() error {
 		if parent.Err() != nil {
 			outcome = "canceled"
