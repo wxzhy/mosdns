@@ -89,6 +89,9 @@ type Cache struct {
 	closeOnce    sync.Once
 	closeNotify  chan struct{}
 	updatedKey   atomic.Uint64
+	// dumpMu serializes Close's final dump against the dump loop, and guards
+	// the temp-file swap so two dumps never interleave on the same path.
+	dumpMu sync.Mutex
 
 	queryTotal   prometheus.Counter
 	hitTotal     prometheus.Counter
@@ -244,12 +247,14 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 }
 
 func (c *Cache) Close() error {
-	if err := c.dumpCache(); err != nil {
-		c.logger.Error("failed to dump cache", zap.Error(err))
-	}
+	// Stop the dump loop first so its in-flight dump (if any) is the last one;
+	// dumpCache's mutex serializes against it before the final dump below.
 	c.closeOnce.Do(func() {
 		close(c.closeNotify)
 	})
+	if err := c.dumpCache(); err != nil {
+		c.logger.Error("failed to dump cache", zap.Error(err))
+	}
 	return c.backend.Close()
 }
 
@@ -303,15 +308,30 @@ func (c *Cache) dumpCache() error {
 		return nil
 	}
 
-	f, err := os.Create(c.args.DumpFile)
+	c.dumpMu.Lock()
+	defer c.dumpMu.Unlock()
+
+	// Write through a temp file and rename, so a crash or an error mid-dump
+	// leaves the previous dump intact instead of a truncated gzip stream.
+	tmp := c.args.DumpFile + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	en, err := c.writeDump(f)
 	if err != nil {
+		f.Close()
+		os.Remove(tmp)
 		return fmt.Errorf("failed to write dump, %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("failed to close dump, %w", err)
+	}
+	if err := os.Rename(tmp, c.args.DumpFile); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("failed to replace dump, %w", err)
 	}
 	c.logger.Info("cache dumped", zap.Int("entries", en))
 	return nil
