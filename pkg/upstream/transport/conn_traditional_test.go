@@ -22,6 +22,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/rand"
@@ -285,5 +286,71 @@ func TestTraditionalRepeatOnlyUDP(t *testing.T) {
 		if !bytes.Equal(q, make([]byte, 12)) {
 			t.Fatal("query modified")
 		}
+	}
+}
+
+type gatedWriteNetConn struct {
+	net.Conn
+	gate chan struct{}
+}
+
+func (c *gatedWriteNetConn) Write(b []byte) (int, error) {
+	<-c.gate
+	return c.Conn.Write(b)
+}
+
+// A reply that arrives while exchange is briefly inside writeQuery (e.g. its
+// one-second resend tick) must be retained by the per-query channel instead
+// of being discarded by readLoop's non-blocking send.
+func Test_dnsConn_exchange_retains_reply_during_write(t *testing.T) {
+	c1, c2 := net.Pipe()
+	gate := make(chan struct{})
+	dc := NewDnsConn(TraditionalDnsConnOpts{}, &gatedWriteNetConn{Conn: c1, gate: gate})
+	defer dc.Close()
+
+	// Drain the query direction so exchange's (gated) writes can complete;
+	// net.Pipe writes block until the peer reads.
+	go func() {
+		_, _ = io.Copy(io.Discard, c2)
+	}()
+
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	q.Id = 0x1234
+	qb, err := q.Pack()
+	require.NoError(t, err)
+
+	type res struct {
+		resp *[]byte
+		err  error
+	}
+	resCh := make(chan res, 1)
+	go func() {
+		resp, err := dc.exchange(context.Background(), qb)
+		resCh <- res{resp: resp, err: err}
+	}()
+
+	// Wait until exchange has registered its query id and is blocked in
+	// writeQuery on the gate.
+	require.Eventually(t, func() bool { return dc.queueLen() > 0 },
+		2*time.Second, time.Millisecond, "exchange did not register its query")
+
+	// The server replies while exchange is still writing. The first query id
+	// assigned by a fresh connection is 0.
+	resp := bytes.Clone(qb)
+	binary.BigEndian.PutUint16(resp, 0)
+	go func() {
+		_, _ = c2.Write(resp)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	close(gate)
+	select {
+	case r := <-resCh:
+		require.NoError(t, r.err)
+		require.NotNil(t, r.resp)
+		require.Equal(t, uint16(0x1234), binary.BigEndian.Uint16(*r.resp))
+	case <-time.After(2 * time.Second):
+		t.Fatal("exchange did not return the reply that arrived during writeQuery")
 	}
 }
