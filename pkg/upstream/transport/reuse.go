@@ -111,7 +111,7 @@ func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*[]
 		resp, err := c.exchange(ctx, queryPayload)
 		pool.ReleaseBuf(queryPayload)
 		if err != nil {
-			if !isNewConn && retry <= maxRetry {
+			if !isNewConn && retry < maxRetry {
 				retry++
 				continue // retry if c is a reused connection.
 			}
