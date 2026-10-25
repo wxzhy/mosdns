@@ -42,7 +42,7 @@ func newLazyDnsConn(
 	if dialTimeout <= 0 {
 		dialTimeout = defaultDialTimeout
 	}
-	dialCtx, cancelDial := context.WithTimeout(context.Background(), defaultDialTimeout)
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), dialTimeout)
 	lc := &lazyDnsConn{
 		maxConcurrentQuery: maxConcurrentQueryWhileDialing,
 		cancelDial:         cancelDial,
