@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"time"
@@ -108,9 +109,16 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 					}
 					defer pool.ReleaseBuf(r)
 
-					if _, err := c.Write(*r); err != nil {
+					n, err := c.Write(*r)
+					if err == nil && n != len(*r) {
+						err = io.ErrShortWrite
+					}
+					if err != nil {
 						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
-						return
+						// A partial reply corrupts the length-prefixed stream
+						// for every following message. Close instead of letting
+						// the connection linger until its idle timeout.
+						c.Close()
 					}
 				}()
 			}
