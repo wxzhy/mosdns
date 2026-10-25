@@ -58,3 +58,28 @@ func TestMatcher(t *testing.T) {
 		t.Fatalf("want ip 2001:db8:10::1, got %s", got)
 	}
 }
+
+// Reply must hand out copies. An in-place downstream rewrite of one reply
+// (e.g. a ttl plugin) must not poison the matcher's stored records for
+// later replies.
+func TestMatcher_ReplyCopiesRecords(t *testing.T) {
+	m := new(Matcher)
+	if err := m.Load(strings.NewReader("example.com. 300 IN A 192.0.2.1")); err != nil {
+		t.Fatal(err)
+	}
+	q := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+
+	r1 := m.Reply(q)
+	if r1 == nil {
+		t.Fatal("expected a reply")
+	}
+	r1.Answer[0].Header().Ttl = 1
+
+	r2 := m.Reply(q)
+	if r2 == nil {
+		t.Fatal("expected a reply")
+	}
+	if got := r2.Answer[0].Header().Ttl; got != 300 {
+		t.Fatalf("stored record was modified by an earlier reply, ttl = %d", got)
+	}
+}

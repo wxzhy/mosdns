@@ -78,7 +78,12 @@ func (m *Matcher) Reply(q *dns.Msg) *dns.Msg {
 				r = new(dns.Msg)
 				r.SetReply(q)
 			}
-			r.Answer = append(r.Answer, rr...)
+			// The stored records are shared by every reply. Hand out copies so
+			// an in-place downstream rewrite (e.g. a ttl plugin) cannot poison
+			// the matcher's records for later queries.
+			for _, record := range rr {
+				r.Answer = append(r.Answer, dns.Copy(record))
+			}
 		}
 	}
 	return r
