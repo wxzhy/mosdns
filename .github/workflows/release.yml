@@ -24,7 +24,7 @@ jobs:
           python-version: "3.13"
 
       - name: Build
-        run: python ./release.py
+        run: python ./scripts/release.py
         env:
           CGO_ENABLED: "0"
 

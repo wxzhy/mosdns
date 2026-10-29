@@ -798,4 +798,4 @@ TCP/HTTP 监听地址以 `@` 开头时，代码会选择 Unix socket；这是面
 
 配置核对顺序：先检查顶层/插件字段名及依赖定义顺序，再检查单位和快速语法，最后在本机未占用端口启动并做真实查询。程序目前没有独立的“只解析、不启动插件”配置检查命令；`start` 会真实打开文件、数据库和监听 socket。不要把源码中未注册的结构字段或内部常量当成用户配置项。
 
-在仓库根目录运行 `go test . -run TestDocumentedExamplesUseKnownPluginParameters`，可严格解码七份示例，检查未知字段、插件类型及全部顶层注册类型的示例覆盖。全模块/全参数模板只做解码，不加载其外部资源；基础测速、IP 替换和静态回退另有无外网的初始化及 A/AAAA 主链测试，HTTPS/SVCB 离线示例验证实际本机 UDP/TCP 回包。这些检查不代替目标环境中的数据库、证书和网络验证。
+在仓库根目录运行 `go test ./tests/integration -run TestDocumentedExamplesUseKnownPluginParameters`，可严格解码七份示例，检查未知字段、插件类型及全部顶层注册类型的示例覆盖。全模块/全参数模板只做解码，不加载其外部资源；基础测速、IP 替换和静态回退另有无外网的初始化及 A/AAAA 主链测试，HTTPS/SVCB 离线示例验证实际本机 UDP/TCP 回包。这些检查不代替目标环境中的数据库、证书和网络验证。

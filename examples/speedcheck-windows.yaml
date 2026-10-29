@@ -1,9 +1,11 @@
-# Windows: TCP probing works without raw socket privileges.
-# Replace the upstream addresses with DNS servers reachable from your network.
+# Windows 最小 speedcheck 示例：仅用 TCP 80/443 探测，无需原始套接字权限。
+# 平台差异与 ICMP 说明见 docs/speedcheck-windows.md，完整流程见 speedcheck.yaml。
+# 上游地址请替换为本网络可达的 DNS 服务器。
 log:
   level: info
 
 plugins:
+  # 一上游一 forward：forward 内部竞速会提前丢弃其他响应，见 docs/speedcheck.md。
   - tag: upstream_a
     type: forward
     args:
@@ -15,6 +17,7 @@ plugins:
       upstreams:
         - addr: "udp://8.8.8.8"
 
+  # 来源用 sequence 包一层，供 speedcheck 并行调度。
   - tag: source_a
     type: sequence
     args:
@@ -27,14 +30,14 @@ plugins:
   - tag: select_fast_ip
     type: speedcheck
     args:
-      sources: [source_a, source_b]
-      mode: bounded
+      sources: [source_a, source_b]   # 并行查询，按探测得分选优
+      mode: bounded                   # 首个合格正答后限时收尾
       total_timeout: 5s
       selection_timeout: 300ms
       settle_window: 25ms
       probe:
-        tcp_ports: [80, 443]
-        icmp: false
+        tcp_ports: [80, 443]          # Windows 下 TCP 探测即可工作
+        icmp: false                   # true 启用 raw ICMP，启动时检查能力；是否需提升权限取决于系统
         timeout: 300ms
       max_num: 1
       threshold_ms: 100

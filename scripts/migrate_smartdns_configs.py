@@ -219,6 +219,22 @@ class Migration:
     def selectors(self) -> None:
         speed = self.actions["speedcheck"]
         ping = speed.get("ping_config", {})
+        # Probe/label/multiplier 配置对每组相同：共享同一对象，YAML 输出
+        # 锚点与别名，避免三个 selector 重复十几行完全一致的参数。
+        labels = {"private": ["$ip_private"]}
+        weights = []
+        for label, multiplier in speed.get("tag_multipliers", {}).items():
+            labels[label] = [f"$ip_{label}"]
+            weights.append({"tag": label, "multiplier": multiplier})
+        probe = {
+            "tcp_ports": ping.get("port") or [],
+            "icmp": ping.get("ping", True),
+            "timeout": f"{round(ping.get('timeout', 0.3) * 1000)}ms",
+        }
+        asn_multipliers = speed.get("asn_multipliers", {})
+        probe_match = {
+            "labels_exclude": speed["match_ip"].get("ip_exclude", []),
+        }
         for group in ("cn", "global", "default"):
             resolver = self.resolvers[group]
             sources = []
@@ -237,11 +253,6 @@ class Migration:
                         )
                         rules += [rule(f"${target}"), rule("return", "!has_resp")]
                     sources.append(self.sequence(f"source_{group}__{leaf}__{i}", rules))
-            labels = {"private": ["$ip_private"]}
-            weights = []
-            for label, multiplier in speed.get("tag_multipliers", {}).items():
-                labels[label] = [f"$ip_{label}"]
-                weights.append({"tag": label, "multiplier": multiplier})
             self.add(
                 f"select_{group}",
                 "speedcheck",
@@ -253,19 +264,13 @@ class Migration:
                     "total_timeout": f"{resolver['timeout']}s",
                     "selection_timeout": "300ms",
                     "settle_window": "25ms",
-                    "probe": {
-                        "tcp_ports": ping.get("port") or [],
-                        "icmp": ping.get("ping", True),
-                        "timeout": f"{round(ping.get('timeout', 0.3) * 1000)}ms",
-                    },
+                    "probe": probe,
                     "max_num": speed.get("max_num", 1),
                     "threshold_ms": speed.get("threshold", 100),
                     "labels": labels,
                     "tag_multipliers": weights,
-                    "asn_multipliers": speed.get("asn_multipliers", {}),
-                    "probe_match": {
-                        "labels_exclude": speed["match_ip"].get("ip_exclude", [])
-                    },
+                    "asn_multipliers": asn_multipliers,
+                    "probe_match": probe_match,
                 },
             )
 
@@ -450,11 +455,15 @@ def render_config(cfg: dict) -> str:
         "apply_fallback": (
             "名称包含/排除门控保持原顺序，同时检查 qname 和 CNAME；仅在对应路由完成选择后调用。"
         ),
-        "select_cn": (
-            "各组 selector 保留原候选顺序、mode 和超时；不能用先选一份响应的 forward 池代替。\n"
-            "private 只豁免探测，不代表丢弃该地址；其余地址在过滤和替换完成后才进入测速。"
+        "upstream_google_cn": (
+            "非测速上游池：forward 并发竞速，取第一份完整应答，不做逐候选测速；\n"
+            "route_google_cn 先调用 google_ecs 注入 ECS，再查询此池。"
         ),
-        "google_ecs": "以下路由保留原 ECS 设置、标记和上游选择方式。",
+        "google_ecs": (
+            "以下路由保留原 ECS 设置、标记和上游选择方式。\n"
+            "标记编号：1=block 2=proxy 3=google-cn 4=cn 5=global 6=opennic 7=default；\n"
+            "main 依据这些标记为 SVCB/HTTPS 查询选择对应的后处理动作。"
+        ),
         "resolve_base": (
             "保留原分流顺序：广告 → proxy（A/AAAA）→ google-cn → 国内 → 全局 → OpenNIC → 默认。\n"
             "每段 has_resp 后立即 accept；合法 NXDOMAIN 也是响应，不能按“没有地址”继续落入默认路由。"
@@ -464,12 +473,12 @@ def render_config(cfg: dict) -> str:
             "cache 会包裹后续链，在链执行完后保存最终响应，包括 HTTPS 后处理结果。"
         ),
         "resolve_cached": (
-            "HTTPS 的辅助 A/AAAA 查询复用缓存和完整分流、过滤、替换、测速链。\n"
+            "HTTPS 的辅助 A 查询复用缓存和完整分流、过滤、替换、测速链。\n"
             "此入口不执行 main 的 HTTPS 后处理，避免递归；也不能直接改成裸 forward 绕过策略。"
         ),
         "ech_lookup": "ECH 查询使用独立上游池，与辅助 IP 解析的完整策略链分开。",
         "https_cleanup": (
-            "HTTPS 名称门控只控制注入；即使某个名称跳过注入，后面的 hint/H3 清理仍执行。\n"
+            "HTTPS 名称门控控制注入和辅助查询；即使跳过它们，后面的 hint/H3 清理仍执行。\n"
             "因此 inject_* 与 apply_* 两层不能直接合并成同一个带名称条件的动作。"
         ),
         "main": (
@@ -478,8 +487,35 @@ def render_config(cfg: dict) -> str:
         ),
         "dns_tcp": "TCP/UDP 监听器共用 main，监听地址和端口保留原配置。",
     }
+    # 按前缀在首个匹配的插件前插入一次说明，覆盖成组的重复插件。
+    first_tag_comments = {
+        "upstream_": (
+            "上游连接：addr 中的 URL 主机名用于 TLS SNI，dial_addr 只改变拨号目标；\n"
+            "http_host 只改变 HTTP Host，http_method 保留原 GET/POST，三者不能互相替代。\n"
+            "同一服务的多个地址按 dial_addr 展开为独立候选，避免在测速前提前丢掉其他可用响应。"
+        ),
+        "source_": (
+            "source_<路由组>__<上游组>__<序号>：候选来源保持各 resolver 的原动作顺序，\n"
+            "即 上游应答 →（按原配置）全响应过滤 → CDN 替换 → 其他替换，随后交给同组 selector。\n"
+            "任一步之后无响应立即 return 结束该候选，不对原地址先测速。"
+        ),
+        "select_": (
+            "各组 selector 保留原候选顺序、mode 和超时；不能用先选一份响应的 forward 池代替。\n"
+            "probe/labels/倍率配置以锚点共享；修改锚点影响其引用，单组调整时先展开对应别名。\n"
+            "private 只豁免探测，不代表丢弃该地址；其余地址在过滤和替换完成后才进入测速。"
+        ),
+        "apply_": (
+            "替换门控：豁免名单同时检查 qname 和 CNAME，仅 A/AAAA（1/28）参与地址替换；\n"
+            "各名单内容与先后顺序均取自原配置。"
+        ),
+        "process_": (
+            "HTTPS 后处理参数：match_ip 门控注入对象（应答地址命中这些集合才注入 ECH）。\n"
+            "add_ech 开启且满足注入条件时，ech_source 通过独立上游池查询 ech_domain。\n"
+            "enable_subquery 另行控制辅助 A 查询；ip_source 使用 resolve_cached 完整策略链。"
+        ),
+    }
     rendered = []
-    seen_upstream = seen_source = False
+    seen: dict[str, bool] = {}
     for line in yaml.safe_dump(
         cfg, sort_keys=False, allow_unicode=True, width=110
     ).splitlines():
@@ -492,19 +528,12 @@ def render_config(cfg: dict) -> str:
         elif line.startswith("- tag: "):
             tag = line.removeprefix("- tag: ")
             comment = comments.get(tag)
-            if tag.startswith("upstream_") and not seen_upstream:
-                seen_upstream = True
-                comment = (
-                    "上游连接：addr 中的 URL 主机名用于 TLS SNI，dial_addr 只改变拨号目标；\n"
-                    "http_host 只改变 HTTP Host，http_method 保留原 GET/POST，不能互相替代。\n"
-                    "各地址仍作为独立候选，避免在测速前提前丢掉其他可用响应。"
-                )
-            elif tag.startswith("source_") and not seen_source:
-                seen_source = True
-                comment = (
-                    "候选来源保持各 resolver 的原动作顺序：需要过滤/替换的响应先处理，再交给 selector。\n"
-                    "全响应过滤 → CDN 替换 → 测速；中途无响应立即结束该候选，不对原地址先测速。"
-                )
+            if comment is None:
+                for prefix, text in first_tag_comments.items():
+                    if tag.startswith(prefix) and not seen.get(prefix):
+                        seen[prefix] = True
+                        comment = text
+                        break
         if comment:
             rendered.append("")
             rendered.extend("# " + text for text in comment.splitlines())
@@ -525,11 +554,11 @@ def main() -> None:
         raw = (source / name).read_bytes()
         cfg = Migration(yaml.safe_load(raw)).run()
         header = (
-            f"# Migrated from smartdns-test/{name}; SHA256 {hashlib.sha256(raw).hexdigest()}\n"
-            "# Generated by scripts/migrate_smartdns_configs.py; see docs/smartdns-migration.md.\n"
-            "# Run from the mosdns repository root after exporting data/smartdns.\n"
-            "# Contains the original private deployment endpoints; review before sharing.\n"
-            "# ICMP-only probes preserve the old configuration and require ICMP capability.\n"
+            f"# 由 smartdns-test/{name} 迁移而来；源文件 SHA256 {hashlib.sha256(raw).hexdigest()}\n"
+            "# 由 scripts/migrate_smartdns_configs.py 生成；说明见 docs/smartdns-migration.md。\n"
+            "# 需先导出 data/smartdns，再从 mosdns 仓库根目录启动。\n"
+            "# 包含原私有部署端点；对外分享前先审查。\n"
+            "# 仅 ICMP 探测保留旧配置行为；启动时检查能力，权限要求取决于平台与系统策略。\n"
         )
         generated.append(
             (

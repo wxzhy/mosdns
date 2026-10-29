@@ -109,7 +109,7 @@ Windows YAML 路径用单引号或正斜杠，避免双引号中的反斜杠被�
 
 ```powershell
 go test -race -v ./pkg/speedtest -run 'TestWindowsICMP|TestTCPProbe'
-go test -race -v . -run TestWindowsSpeedcheckEndToEnd
+go test -race -v ./tests/integration -run TestWindowsSpeedcheckEndToEnd
 ```
 
 新安装的 Windows 服务默认使用 `NT AUTHORITY\LocalService`，程序与配置需授予读取权限，可写日志和缓存应放到独立目录。安装步骤、ACL 示例和旧服务升级方式见[低权限系统服务](service.md#windows)。终端中的 ICMP 测试不能代替服务账户下的能力检查；安装权限与普通前台运行是两回事。

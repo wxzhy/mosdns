@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import migrate_smartdns_data as migration
+from scripts import migrate_smartdns_data as migration
 
 
 def read_fields(data: bytes) -> list[tuple[int, int, bytes | int]]:
@@ -73,7 +73,7 @@ class GeoSiteExportTests(unittest.TestCase):
             ("selected",),
         )
         self.assertEqual(
-            set(read_sites(data)["selected"]),
+            set(read_sites(data)["SELECTED"]),
             {(0, "needle"), (1, long_regex), (2, "example.test"), (3, "host.test")},
         )
 
@@ -89,9 +89,9 @@ class GeoSiteExportTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(
             read_sites(first),
-            {"a": [(2, "a.test")], "z": [(2, "z.test"), (3, "only.test")]},
+            {"A": [(2, "a.test")], "Z": [(2, "z.test"), (3, "only.test")]},
         )
-        self.assertEqual(list(read_sites(first)), ["a", "z"])
+        self.assertEqual(list(read_sites(first)), ["A", "Z"])
 
     def test_invalid_selected_tags_and_rules(self):
         for tag in ("", ".", "..", "../tag", "ads@cn"):
@@ -104,7 +104,7 @@ class GeoSiteExportTests(unittest.TestCase):
                 migration.encode_geosite({"a": {rule}}, ("a",))
 
     def test_empty_group_is_retained(self):
-        self.assertEqual(read_sites(migration.encode_geosite({"empty": set()}, ("empty",))), {"empty": []})
+        self.assertEqual(read_sites(migration.encode_geosite({"empty": set()}, ("empty",))), {"EMPTY": []})
 
     def test_attribute_tag_is_rejected_before_loading_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -138,7 +138,7 @@ class GeoSiteExportTests(unittest.TestCase):
                     migration.migrate(source, repeat, mode, ("a", "z"), ("github",))
                 dat = (output / "geosite.dat").read_bytes()
                 self.assertEqual(dat, (repeat / "geosite.dat").read_bytes())
-                self.assertEqual(set(read_sites(dat)), {"a", "z"})
+                self.assertEqual(set(read_sites(dat)), {"A", "Z"})
                 self.assertEqual(
                     manifest["outputs"]["geosite.dat"],
                     {"entries": 2, "groups": {tag: len(rules) for tag, rules in groups.items()}, "rules": rule_count, "sha256": hashlib.sha256(dat).hexdigest()},

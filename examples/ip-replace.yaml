@@ -1,36 +1,34 @@
-# Run from the repository directory: mosdns start -c examples/ip-replace.yaml
-# Local-only demonstration: no upstream, GeoIP database, or speedcheck probe.
-# These documentation addresses demonstrate rewriting; do not probe them.
+# ip-replace 本地演示：把命中网段的地址改写到指定基址网段。
+# 从仓库根目录启动：mosdns start -c examples/ip-replace.yaml
+# 纯本地示例：无上游、无 GeoIP 数据库、无测速探测；
+# 文档地址仅演示改写效果，不要对其发起探测。
 log:
   level: info
-  production: false
-include: []
 api:
   http: "127.0.0.1:19091"
 plugins:
+  # 待改写的源网段；正式使用时替换为真实 CDN 网段。
   - tag: cdn_networks
     type: ip_set
     args:
       ips: ["192.0.2.0/24", "2001:db8:20::/48"]
-      sets: []
-      files: []
 
   - tag: demo_hosts
     type: hosts
     args:
       entries:
         - "cdn.ip-replace.invalid 192.0.2.42 2001:db8:20::42"
-      files: []
 
+  # IPv4 按 /24、IPv6 按 /64 改写：保留原地址在前缀内的主机位，
+  # 叠加到对应基址（如 192.0.2.42 → 203.0.113.42）。
+  # 基址中超出前缀长度的主机位会被规范化清除，不参与叠加。
   - tag: replace_cdn
     type: ip_replace
     args:
       replace_map:
         - match_ip: ["$cdn_networks"]
-          exclude_ip: []
-          ipv4_prefixlen: 24        # Default 32; accepts 0..32.
-          ipv6_prefixlen: 64        # Default 128; accepts 0..128.
-          # Host bits in each base are masked off, not added to the old IP.
+          ipv4_prefixlen: 24          # 默认 32；取值 0..32
+          ipv6_prefixlen: 64          # 默认 128；取值 0..128
           ipv4: ["203.0.113.99", "198.51.100.77"]
           ipv6: ["2001:db8:100::99"]
 
@@ -41,7 +39,7 @@ plugins:
       - exec: $replace_cdn
       - matches: ["has_resp"]
         exec: accept
-      - exec: reject 3              # Only the demonstration name is defined.
+      - exec: reject 3                # 演示域之外的名字一律 NXDOMAIN
 
   - tag: udp_listener
     type: udp_server
@@ -53,18 +51,18 @@ plugins:
     args:
       entry: main
       listen: "127.0.0.1:15353"
-      idle_timeout: 10
+      idle_timeout: 10                # 秒
 
-# Production wiring with speedcheck (replace addresses with real networks):
-# Define replace_cdn before source_a/source_b, then call it in every source:
-# source_a.args:
-#   - exec: $upstream_a
-#   - exec: $source_response_filters
-#   - exec: $replace_cdn
-# source_b.args:
-#   - exec: $upstream_b
-#   - exec: $source_response_filters
-#   - exec: $replace_cdn
-# speedcheck.args.sources: [source_a, source_b]
-# Rewriting must precede source publication, not follow speedcheck: only the
-# rewritten addresses should be probed and ranked. Other sources still overlap.
+# 接入 speedcheck 的正式接法（网段换成真实网络）：
+# 在 source_a/source_b 之前定义 replace_cdn，并在每个来源内调用：
+#   source_a.args:
+#     - exec: $upstream_a
+#     - exec: $source_response_filters
+#     - exec: $replace_cdn
+#   source_b.args:
+#     - exec: $upstream_b
+#     - exec: $source_response_filters
+#     - exec: $replace_cdn
+#   speedcheck.args.sources: [source_a, source_b]
+# 改写必须发生在来源发布之前、而不是 speedcheck 之后：
+# 只有改写后的地址才应被探测和排名；各来源之间仍会重叠互补。

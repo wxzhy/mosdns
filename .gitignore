@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+/mosdns
 
 # Test binary, built with `go test -c`
 *.test
@@ -23,11 +24,14 @@ release/
 
 # Python cache
 __pycache__/
+.pytest_cache/
+.ruff_cache/
 
 # test utils
 testutils/
 
 .reference/
+.zcode/
 
 # Local data exported from the original SmartDNS deployment.
 data/smartdns/

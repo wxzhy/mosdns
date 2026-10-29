@@ -1,17 +1,15 @@
-# Offline DNS transformation demonstration. No upstream query or probe leaves
-# this process: HTTPS/ECH data comes from arbitrary, A data from local hosts.
-# Run from repository root: mosdns start -c examples/https-record.yaml
-# The ECHConfigList below has the current 0xfe0d framing, X25519 public key
-# 09 followed by 31 zero bytes, HKDF-SHA256/AES-128-GCM, config_id=66 and
-# public_name=public.https-record.invalid. It is a fixed DNS test fixture.
-# It has no corresponding TLS service and is not a usable CDN configuration.
+# HTTPS/SVCB 记录处理示例：纯离线演示，进程内不发出任何上游查询或探测——
+# HTTPS/ECH 数据来自 arbitrary 固定记录，A 数据来自本地 hosts。
+# 从仓库根目录启动：mosdns start -c examples/https-record.yaml
+# 下方 ECHConfigList 是固定测试数据：0xfe0d 版本、X25519 公钥（09 后跟 31 字节 0）、
+# HKDF-SHA256/AES-128-GCM、config_id=66、public_name=public.https-record.invalid；
+# 它没有对应的 TLS 服务，不能当作可用的 CDN 配置。
 log:
   level: info
-  production: false
-include: []
 api:
   http: "127.0.0.1:19091"
 plugins:
+  # 原始 HTTPS/SVCB 绑定记录：带 hint、不带 hint、SVCB 与 AliasMode 各一条。
   - tag: original_bindings
     type: arbitrary
     args:
@@ -28,9 +26,10 @@ plugins:
       - exec: $original_bindings
       - matches: [has_resp]
         exec: return
-      # Legal NOERROR/NODATA for names with no configured HTTPS/SVCB record.
+      # 未配置 HTTPS/SVCB 记录的名字返回合法的 NOERROR/NODATA。
       - exec: reject 0
 
+  # ECH 来源：返回一条固定的 HTTPS 记录，其 ech 字段即注入内容。
   - tag: local_ech_records
     type: arbitrary
     args:
@@ -42,6 +41,8 @@ plugins:
     args:
       - exec: $local_ech_records
 
+  # 辅助 A 解析链：A 查询可复用完整的地址处理路由；
+  # 本地演示复用既有 selector，并关闭全部实际探测。
   - tag: local_a_records
     type: hosts
     args:
@@ -59,27 +60,27 @@ plugins:
       sources: [local_a_source]
       mode: wait_all
       probe:
-        tcp_ports: []               # Documentation IPs must not be probed.
+        tcp_ports: []                 # 文档地址禁止探测
         icmp: false
         timeout: 300ms
   - tag: ip_lookup
     type: sequence
     args:
-      # A lookups can reuse a complete address-processing route; this local
-      # route uses the existing selector with all actual probes disabled.
       - exec: $select_local_a
 
+  # 绑定记录改写：清 hint/H3、按名称与 IP 门控注入 ECH，
+  # 需要时通过子查询取 A 地址（enable_subquery）。
   - tag: process_bindings
     type: https_record
     args:
       remove_hint: true
       remove_h3: true
-      remove_alpn: ["h3-29"]       # Extra exact protocol IDs, independent of h3.
+      remove_alpn: ["h3-29"]          # 额外的精确协议 ID，与 remove_h3 相互独立
       add_ech: true
       enable_subquery: true
-      ech_source: ech_lookup       # Previously defined named sequence.
+      ech_source: ech_lookup          # 先前定义的命名 sequence
       ech_domain: ech-source.https-record.invalid
-      ip_source: ip_lookup         # Previously defined complete A route.
+      ip_source: ip_lookup            # 先前定义的完整 A 解析链
       match_name: ["domain:https-record.invalid"]
       match_ip: ["192.0.2.0/24"]
       exclude_ip: ["192.0.2.255"]
@@ -106,10 +107,11 @@ plugins:
     args:
       entry: main
       listen: "127.0.0.1:15353"
-      idle_timeout: 10
+      idle_timeout: 10                # 秒
 
-# Query hint.https-record.invalid HTTPS: h2 stays, h3/hints disappear, ECH added.
-# Query hintless.https-record.invalid HTTPS: A for gate-target gates injection.
-# Query nodata.https-record.invalid HTTPS: matching local A permits synthesis.
-# Query alias.https-record.invalid HTTPS: AliasMode stays unchanged.
-# Query svcb.https-record.invalid SVCB: the same ServiceMode policy is supported.
+# 演示查询（对 127.0.0.1:15353 执行）：
+# hint.https-record.invalid HTTPS：h2 保留，h3/hint 被移除并注入 ECH。
+# hintless.https-record.invalid HTTPS：由 gate-target 的 A 解析结果决定是否注入。
+# nodata.https-record.invalid HTTPS：本地 A 匹配后允许合成绑定记录。
+# alias.https-record.invalid HTTPS：AliasMode 记录保持原样不改写。
+# svcb.https-record.invalid SVCB：ServiceMode 策略同样适用。

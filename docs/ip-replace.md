@@ -125,8 +125,8 @@ nslookup -port=15353 -type=AAAA cdn.ip-replace.invalid 127.0.0.1
 在仓库根目录复现主要 Windows 检查：
 
 ```powershell
-go test -race -p 2 ./pkg/query_context ./pkg/response ./plugin/executable/ip_replace ./plugin/executable/speedcheck ./plugin/executable/sequence/fallback ./coremain .
+go test -race -p 2 ./pkg/query_context ./pkg/response ./plugin/executable/ip_replace ./plugin/executable/speedcheck ./plugin/executable/sequence/fallback ./coremain ./tests/integration
 go vet -p 2 ./...
 go test ./plugin/executable/speedcheck -run TestIPReplacementPrecedesStreamingProbe -v
-go test . -run 'TestIPReplace|TestDocumentedExamplesUseKnownPluginParameters' -v
+go test ./tests/integration -run 'TestIPReplace|TestDocumentedExamplesUseKnownPluginParameters' -v
 ```

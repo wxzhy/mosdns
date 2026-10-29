@@ -81,7 +81,7 @@ def encode_geosite(domains: dict[str, set[str]], tags: tuple[str, ...]) -> bytes
             raise ValueError(f"domain tag absent from data: {tag}")
         # The Go loader locates entries by peeking at country_code (field 1).
         # It must precede the repeated domain field, even for an empty group.
-        entry = bytearray(protobuf_bytes_field(1, tag.encode("ascii")))
+        entry = bytearray(protobuf_bytes_field(1, tag.upper().encode("ascii")))
         for expression in sorted(set(domains[tag])):
             kind, separator, value = expression.partition(":")
             if not separator or kind not in DOMAIN_TYPE_NUMBERS or not value:

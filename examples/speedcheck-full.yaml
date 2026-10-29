@@ -1,25 +1,25 @@
-# COMPLETE SPEEDCHECK TEMPLATE. Read docs/speedcheck.md before enabling.
-# Run from repository root; relative paths use the process working directory.
-# Requires the geodata paths below: country data with CN and a MaxMind ASN
-# database. Neither is bundled. Short expressions and numeric ASN rules share
-# these defaults; explicit ext:FILE:CODE expressions always override them.
-# No automatic download occurs. Without these databases initialization fails.
-# For a ready-to-run example without databases, use examples/speedcheck.yaml.
+# speedcheck 全参数模板：逐项演示全部字段，启用前先读 docs/speedcheck.md。
+# 从仓库根目录启动；相对路径按进程工作目录解析。
+# 需要下方 geodata 指定的数据库：含 CN 的 GeoIP 国家库和 MaxMind ASN 库。
+# 两者均不随仓库分发、也不会自动下载，缺失时初始化直接失败。
+# 短表达式（geoip:/asn:）与数字 ASN 规则共用这些默认库；
+# ext:文件:代码 表达式总是逐条覆盖默认库。免数据库示例见 speedcheck.yaml。
 log:
   level: info
 geodata:
   geoip: "./data/Country.mmdb"
   asn: "./data/ASN.mmdb"
 api:
-  http: "127.0.0.1:19091"             # http://127.0.0.1:19091/metrics
+  http: "127.0.0.1:19091"             # GET /metrics：探测与缓存统计
 
 plugins:
+  # ip_set 三种来源：内联网段、文本文件、引用先前定义的 ip_set 标签。
   - tag: preferred_networks
     type: ip_set
     args:
-      ips: ["192.0.2.0/24", "2001:db8::/32"]
+      ips: ["192.0.2.0/24", "2001:db8::/32"]  # 文档演示网段，替换为真实网络
       files: ["examples/data/speedcheck-preferred-ips.txt"]
-      sets: []                        # May reference earlier ip_set tags.
+      sets: []
 
   - tag: blocked_networks
     type: ip_set
@@ -28,6 +28,7 @@ plugins:
       files: []
       sets: []
 
+  # domain_set 同样支持内联表达式、文件与引用既有标签三种来源。
   - tag: skip_source_domains
     type: domain_set
     args:
@@ -42,6 +43,7 @@ plugins:
       files: []
       sets: []
 
+  # 来源级响应过滤：来源序列全部跑完后，幸存响应才进入 speedcheck。
   - tag: source_response_filters
     type: sequence
     args:
@@ -49,9 +51,10 @@ plugins:
         exec: drop_resp
       - matches: ["resp_ip $blocked_networks"]
         exec: drop_resp
-      - matches: ["rcode 2 5"]
+      - matches: ["rcode 2 5"]        # 丢弃 SERVFAIL/REFUSED，保留 NXDOMAIN
         exec: drop_resp
 
+  # 一上游一 forward；单 forward 竞速会丢弃其他候选响应。
   - tag: upstream_a
     type: forward
     args:
@@ -87,47 +90,47 @@ plugins:
   - tag: select_fast_ip
     type: speedcheck
     args:
-      sources: [source_a, source_b]    # Tags without '$'; declaration order wins ties.
-      mode: bounded                  # Alternative: wait_all.
-      total_timeout: 5s
-      selection_timeout: 300ms        # bounded only; starts at first valid positive.
-      settle_window: 25ms             # bounded only; starts once at first RTT success.
+      sources: [source_a, source_b]   # 声明顺序用于得分持平时的裁决
+      mode: bounded                   # 备选：wait_all，等待全部来源与探测
+      total_timeout: 5s               # 总预算，还受父请求截止时间约束
+      selection_timeout: 300ms        # bounded：首个合格正答后的等待上限
+      settle_window: 25ms             # bounded：首个探测成功后的收集窗口
       probe:
-        tcp_ports: [80, 443]          # Explicit [] disables TCP, not the default.
-        icmp: false                  # true: pro-bing; capability checked on startup.
-        timeout: 300ms
-      max_num: 2                     # 1..64; DO=1 preserves the complete source RRset.
-      threshold_ms: 100               # Nonnegative; 0 keeps only equal scores.
-      labels:
+        tcp_ports: [80, 443]          # [] 显式关闭 TCP；省略才是默认 [80,443]
+        icmp: false                   # true 与 TCP 并行发 ICMP，启动时检查能力
+        timeout: 300ms                # 单次探测预算
+      max_num: 2                      # 普通 A/AAAA 输出上限 1..64；DO=1 保留完整来源 RRset
+      threshold_ms: 100               # 额外地址允许的加权分差；有成功 RTT 时 0 要求得分相等
+      labels:                         # 标签名映射到 IP 表达式列表，列表内按 OR 匹配
         preferred: ["$preferred_networks"]
-        domestic: ["geoip:cn"]
+        domestic: ["geoip:cn"]        # 短表达式使用 geodata 默认库
         global: ["0.0.0.0/0", "::/0"]
         blocked: ["$blocked_networks"]
         do_not_probe: ["198.18.0.0/15"]
         file_networks: ["&examples/data/speedcheck-preferred-ips.txt"]
         cloudflare: ["asn:13335"]
-        # Explicit-file alternative overriding geodata.geoip:
-        # domestic: ["ext:./data/other-Country.mmdb:cn"]
-      tag_multipliers:              # First matching label wins; order matters.
+        # 逐条覆盖默认库的写法：ext:./data/other-Country.mmdb:cn
+      tag_multipliers:                # 首个命中标签生效，顺序有意义
         - tag: preferred
           multiplier: 0.8
         - tag: domestic
           multiplier: 1.0
-      asn_multipliers:              # Used only when no tag multiplier matched.
+      asn_multipliers:                # 无标签倍率命中时按 ASN 求倍率
         13335: 0.9
         15169: 1.1
-      candidate_filter:            # Any matching exclude rejects the entire source.
+      candidate_filter:               # 任一 exclude 命中即拒绝整个来源
         labels_include: [global, domestic, preferred]
         labels_exclude: [blocked]
-        asn_include: [13335, 15169] # Labels/ASN includes are OR, excludes take priority.
+        asn_include: [13335, 15169]   # include 之间是 OR；exclude 优先
         asn_exclude: [64512]
-      probe_match:                 # Whole-source rule; unmatched IPs remain valid.
+      probe_match:                    # 整来源规则；未匹配的 IP 仍为合法候选
         labels_include: [global]
         labels_exclude: [do_not_probe]
         asn_include: [13335]
         asn_exclude: [64512]
-      # RTT cache, queue/socket limits and network binding have no YAML options.
+      # RTT 缓存、队列/套接字上限与网络绑定没有 YAML 选项。
 
+  # 静态兜底仅演示域有记录；切勿把所有域名都映射到固定地址。
   - tag: static_fallback_hosts
     type: hosts
     args:
@@ -147,28 +150,28 @@ plugins:
     args:
       primary: select_fast_ip
       secondary: static_fallback
-      threshold: 5000              # Milliseconds; also starts secondary on error.
-      always_standby: false        # true prepares secondary immediately.
+      threshold: 5000                 # 毫秒；primary 出错也立即启用 secondary
+      always_standby: false           # true 表示 secondary 与 primary 同时启动
 
-  # Optional RESPONSE cache: defined here but NOT called by main below.
-  # Enable the cache AND has_resp/accept guard shown in main below.
-  # The guard bypasses speedcheck on a cache hit; cache itself always continues.
+  # 可选响应缓存：此处已定义但下方 main 未启用。
+  # 启用时须同时打开 main 中被注释的 cache + has_resp/accept 守卫，
+  # 命中缓存即跳过测速；cache 本身总会继续执行后续链并保存最终响应。
   - tag: response_cache
     type: cache
     args:
       size: 1024
-      lazy_cache_ttl: 0            # Disable stale answers in this example.
-      dump_file: ""               # Empty disables persistence; otherwise writable file.
-      dump_interval: 600          # Seconds, only meaningful with dump_file.
+      lazy_cache_ttl: 0               # 本示例关闭过期仍答（stale）行为
+      dump_file: ""                   # 空为不持久化；填可写文件路径启用
+      dump_interval: 600              # 秒；仅在配置 dump_file 后有意义
 
   - tag: main
     type: sequence
     args:
-      # - exec: $response_cache    # Enable all three optional lines together.
+      # - exec: $response_cache       # 三行可选配置须同时启用
       # - matches: ["has_resp"]
       #   exec: accept
       - exec: $resolve_with_fallback
-      # Linux ipset/nftset side effects belong here, after address selection.
+      # Linux ipset/nftset 副作用放在选址之后、此处之前
       - exec: accept
 
   - tag: udp_listener
@@ -182,6 +185,6 @@ plugins:
     args:
       entry: main
       listen: "127.0.0.1:15353"
-      idle_timeout: 10            # Seconds.
-      cert: ""                    # Both cert+key empty: plain DNS over TCP.
-      key: ""                     # Supply both paths to serve TLS instead.
+      idle_timeout: 10                # 秒
+      cert: ""                        # cert+key 均为空：明文 DNS over TCP
+      key: ""                         # 两者都填路径则改提供 TLS（DoT）

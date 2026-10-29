@@ -1,14 +1,34 @@
 # 两份 SmartDNS 配置功能验证
 
+## 2026-10-29：GeoData 名称引用与注释
+
+两份配置的 19 个域名集合改为直接引用 `geosite:标签`，插件数分别由 168/114
+降为 149/95；GeoIP/ASN 继续使用名称，仅两个自定义 GitHub IP 集合保留文本。
+三个 selector 的相同参数使用 YAML 锚点共享，路由、上游、超时、过滤、替换、
+测速与 HTTPS 动作顺序均与原迁移配置逐值一致。关键注释由生成器维护。
+
+- 实际 Go GeoSite 解码结果与保留文本逐标签全集比较通过：19 组、229,878 条。
+- 原有 23 个数据输出及输入哈希保持一致；新增 `geosite.dat` 使用相同 runtime
+  后缀规则。24 个输出及 manifest 重复导出均逐字节一致。
+- 6 项 Python 数据打包测试通过，覆盖四种规则类型、稳定排序、标签边界和清单。
+- `MOSDNS_SMARTDNS_LOCAL_DATA=1` 下，`go test -race ./tests/integration -run '^TestSmartdns'
+  -count=1 -timeout=180s` 通过，包括完整初始化、受控策略、真实数据和回环 UDP/TCP。
+  上游查询与测速使用替身，能力检查仅访问回环；本轮没有复测公网可达性。
+
+上级项目的源 YAML 此后已有更新，本轮保留原迁移配置头部的源 SHA-256，未合入
+新增的上游变化。生成器重新运行时会使用指定源目录的当前内容，需按源哈希区分版本。
+
+## 2026-10-20：原迁移验证
+
 2026-10-20，Windows，本仓库当前工作区。两份配置均可启动，功能链检查通过，
 公网主链可以解析；当前网络存在两个不可达上游、`wait_all` 延时和 Google 探测失败。
 CERNET 配置是在本机当前网络测试，并非 CERNET 目标节点验收。
 
 本次没有修改生产插件或两份部署 YAML。新增三份持续回归测试：
 
-- [受控策略与完整主链](../smartdns_policy_test.go)
-- [真实规则/MMDB 策略](../smartdns_realdata_policy_test.go)
-- [真实 UDP/TCP 服务与缓存](../smartdns_wire_test.go)
+- [受控策略与完整主链](../tests/integration/smartdns_policy_test.go)
+- [真实规则/MMDB 策略](../tests/integration/smartdns_realdata_policy_test.go)
+- [真实 UDP/TCP 服务与缓存](../tests/integration/smartdns_wire_test.go)
 
 ## 本地功能
 
@@ -34,8 +54,8 @@ CERNET 配置是在本机当前网络测试，并非 CERNET 目标节点验收�
 
 ```powershell
 $env:MOSDNS_SMARTDNS_LOCAL_DATA = "1"
-go test -race . -run '^TestSmartdns' -count=1 -timeout=180s
-go test . -run '^TestSmartdnsMigrationLocalWire$' -count=3 -timeout=120s
+go test -race ./tests/integration -run '^TestSmartdns' -count=1 -timeout=180s
+go test ./tests/integration -run '^TestSmartdnsMigrationLocalWire$' -count=3 -timeout=120s
 Remove-Item Env:MOSDNS_SMARTDNS_LOCAL_DATA
 go vet ./...
 ```

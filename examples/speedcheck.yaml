@@ -1,28 +1,36 @@
-# Run from the repository directory: mosdns start -c examples/speedcheck.yaml
-# No GeoIP/ASN database is required. Replace upstreams with reachable DNS servers.
-# See speedcheck-full.yaml for every speedcheck field and database-backed rules.
+# speedcheck 基础示例：两上游并行查询 + 响应过滤 + TCP 测速选优 + 静态兜底。
+# 从仓库根目录启动：mosdns start -c examples/speedcheck.yaml
+# 不依赖 GeoIP/ASN 数据库；上游地址请换成自己网络可达的 DNS 服务器。
+# 全部字段演示见 speedcheck-full.yaml，参数说明见 docs/speedcheck.md。
 log:
   level: info
 api:
-  http: "127.0.0.1:19091"             # GET /metrics
+  http: "127.0.0.1:19091"             # GET /metrics：探测与缓存统计
 
 plugins:
+  # ---- 数据集合，供响应过滤与测速标签引用 ----
+
+  # 测速加分的首选网段。此处为文档演示网段，务必替换为真实网络。
   - tag: preferred_networks
     type: ip_set
     args:
-      ips: ["192.0.2.0/24", "2001:db8::/32"] # Documentation ranges; replace.
+      ips: ["192.0.2.0/24", "2001:db8::/32"]
 
+  # 命中即视为无效地址的网段：应答直接丢弃，候选过滤也排除。
   - tag: blocked_networks
     type: ip_set
     args:
       ips: ["0.0.0.0/8", "127.0.0.0/8", "::/128", "::1/128"]
 
+  # 跳过上游查询的名字（本示例的保留演示域，走下方静态兜底）。
   - tag: skip_source_domains
     type: domain_set
     args:
       exps: ["full:fallback.speedcheck.invalid"]
 
-  # A source submits its response only after these response filters finish.
+  # 来源级响应过滤：CNAME 指向封禁域、应答 IP 落在禁用网段、
+  # SERVFAIL/REFUSED 的响应整份丢弃；NXDOMAIN 是合法应答，保留。
+  # 来源序列全部跑完后，幸存的响应才进入 speedcheck 参与测速。
   - tag: source_response_filters
     type: sequence
     args:
@@ -30,8 +38,12 @@ plugins:
         exec: drop_resp
       - matches: ["resp_ip $blocked_networks"]
         exec: drop_resp
-      - matches: ["rcode 2 5"]        # Drop SERVFAIL/REFUSED, preserve NXDOMAIN.
+      - matches: ["rcode 2 5"]
         exec: drop_resp
+
+  # ---- 上游与来源：一上游一 forward，一 forward 一来源 ----
+  # 单个 forward 内部的多上游竞速只保留一份响应；要让每个上游的
+  # 应答都到达测速阶段，必须拆成独立 forward 并包成独立来源。
 
   - tag: upstream_a
     type: forward
@@ -45,7 +57,8 @@ plugins:
       upstreams:
         - addr: "udp://8.8.8.8"
 
-  # One upstream per source lets every source response reach speedcheck.
+  # 来源 = 查上游 + 过滤响应。skip 名单直接 return（不带响应），
+  # 让外层 fallback 接管，而不是真的去查询外部 DNS。
   - tag: source_a
     type: sequence
     args:
@@ -62,31 +75,33 @@ plugins:
       - exec: $upstream_b
       - exec: $source_response_filters
 
+  # ---- 测速选优 ----
   - tag: select_fast_ip
     type: speedcheck
     args:
-      sources: [source_a, source_b]
-      mode: bounded                  # Or wait_all, still queries/probes in parallel.
-      total_timeout: 5s
-      selection_timeout: 300ms
-      settle_window: 25ms
+      sources: [source_a, source_b]   # 声明顺序用于得分持平时的裁决
+      mode: bounded                   # bounded 限时选优；wait_all 等全部来源
+      total_timeout: 5s               # 总预算，还受父请求截止时间约束
+      selection_timeout: 300ms        # bounded：首个合格正答后的等待上限
+      settle_window: 25ms             # bounded：首个探测成功后的收集窗口
       probe:
-        tcp_ports: [80, 443]          # [] disables TCP; omit for [80, 443].
-        icmp: false                  # true enables pro-bing alongside TCP.
-        timeout: 300ms
-      max_num: 1
-      threshold_ms: 100
-      labels:
+        tcp_ports: [80, 443]          # [] 显式关闭 TCP；省略才是默认 [80,443]
+        icmp: false                   # true 与 TCP 并行发 ICMP，启动时检查能力
+        timeout: 300ms                # 单次探测预算
+      max_num: 1                      # 普通 A/AAAA 最多返回的地址数；DO=1 保留完整来源 RRset
+      threshold_ms: 100               # 额外地址与最佳地址允许的加权分差，不改变排序
+      labels:                         # 给地址打标签，供倍率与过滤引用
         preferred: ["$preferred_networks"]
         blocked: ["$blocked_networks"]
-      tag_multipliers:
+      tag_multipliers:                # 首个命中标签生效，顺序有意义
         - tag: preferred
-          multiplier: 0.8
-      candidate_filter:
+          multiplier: 0.8             # 得分 = RTT × 倍率，越小越优先
+      candidate_filter:               # 命中 exclude 的来源整份拒绝
         labels_exclude: [blocked]
-      # probe_match may restrict probes without rejecting otherwise valid answers.
+      # probe_match 可只限制探测对象，不拒绝未探测的合法应答。
 
-  # Only this demonstration name has a static answer; never map all names here.
+  # ---- 静态兜底：全部来源失败时的最终答案 ----
+  # 仅演示域在此有记录；不要把所有域名映射到固定地址。
   - tag: static_fallback_hosts
     type: hosts
     args:
@@ -99,21 +114,21 @@ plugins:
       - exec: $static_fallback_hosts
       - matches: ["has_resp"]
         exec: accept
-      # Other names deliberately have no invented address if every source fails.
+      # 其余名字刻意不发明地址：所有来源失败时保持无响应。
 
   - tag: resolve_with_fallback
     type: fallback
     args:
       primary: select_fast_ip
       secondary: static_fallback
-      threshold: 5000                # Milliseconds; error starts fallback at once.
-      always_standby: false
+      threshold: 5000                 # 毫秒；primary 出错时立即启用 secondary
+      always_standby: false           # true 表示 secondary 与 primary 同时启动
 
   - tag: main
     type: sequence
     args:
       - exec: $resolve_with_fallback
-      # Put ipset/nftset side effects here, after selection (Linux only).
+      # Linux ipset/nftset 副作用应放在选址之后、此处之前
       - exec: accept
 
   - tag: udp_listener
@@ -127,4 +142,4 @@ plugins:
     args:
       entry: main
       listen: "127.0.0.1:15353"
-      idle_timeout: 10                # Seconds.
+      idle_timeout: 10                # 秒

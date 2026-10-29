@@ -164,7 +164,7 @@ HTTPS 处理保留原来的 hint/H3 清理、ECH 注入和辅助 A 查询。名�
 完整策略、真实 UDP/TCP、公网可达性、慢来源与整仓回归结果见
 [两份配置功能验证](smartdns-validation.md)。
 
-`go test . -run TestSmartdnsMigration -count=1` 检查严格参数解码、按顺序的插件引用、
+`go test ./tests/integration -run TestSmartdnsMigration -count=1` 检查严格参数解码、按顺序的插件引用、
 路由、来源过滤、替换后测速和前缀保留。外部 DNS、测速与监听端口用离线替身，
 避免向私人解析配置发送测试流量。数据转换另检查原 trie 成员、MMDB 哈希和稳定导出。
 这些检查不能证明当前网络能访问原上游、代理或相应 CDN 节点；部署后仍需在目标
@@ -174,7 +174,7 @@ HTTPS 处理保留原来的 hint/H3 清理、ECH 注入和辅助 A 查询。名�
 
 ```powershell
 $env:MOSDNS_SMARTDNS_LOCAL_DATA = "1"
-go test -race . -run '^TestSmartdnsMigration' -count=1 -timeout=120s
+go test -race ./tests/integration -run '^TestSmartdnsMigration' -count=1 -timeout=120s
 Remove-Item Env:MOSDNS_SMARTDNS_LOCAL_DATA
 ```
 

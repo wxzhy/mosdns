@@ -48,11 +48,11 @@
 [静态回退示例](../examples/ip-fallback.yaml) 和 [HTTPS/SVCB 示例](../examples/https-record.yaml) 不查询公网，也不探测文档地址。ECH 示例为结构完整的固定测试配置，没有对应 TLS 服务；生产环境需要兼容目标 CDN 的真实 ECH 来源。
 
 ```powershell
-go test -race -p 2 ./pkg/query_context ./pkg/response ./plugin/executable/ip_fallback ./plugin/executable/https_record ./plugin/executable/speedcheck ./plugin/matcher/resp_ip .
+go test -race -p 2 ./pkg/query_context ./pkg/response ./plugin/executable/ip_fallback ./plugin/executable/https_record ./plugin/executable/speedcheck ./plugin/matcher/resp_ip ./tests/integration
 go vet -p 2 ./...
 ```
 
-根包严格解码全部文档示例并检查注册插件覆盖；应用集成检查本地 A/AAAA、HTTPS/SVCB 和 DNS 序列化。逻辑时间与假探测器验证查询/探测重叠、失败与未测量的区别，以及 ECH/A 并行、取消、期限和清理；这些结果不能作为实际 CDN 延时或 TLS/ECH 握手成功的证据。上游原有测试问题仍单独保留，不能将相关包通过表述为整仓测试通过。
+集成测试包严格解码全部文档示例并检查注册插件覆盖，检查本地 A/AAAA、HTTPS/SVCB 和 DNS 序列化。逻辑时间与假探测器验证查询/探测重叠、失败与未测量的区别，以及 ECH/A 并行、取消、期限和清理；这些结果不能作为实际 CDN 延时或 TLS/ECH 握手成功的证据。上游原有测试问题仍单独保留，不能将相关包通过表述为整仓测试通过。
 
 2026-10-20，使用单独导出的 Git 暂存快照验证；快照不含另一任务的 upstream/GeoIP 修改。Go 版本为 1.27.2，结果如下：
 

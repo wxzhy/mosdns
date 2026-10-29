@@ -67,8 +67,8 @@ plugins:
     - asn:33191
 
 # 上游连接：addr 中的 URL 主机名用于 TLS SNI，dial_addr 只改变拨号目标；
-# http_host 只改变 HTTP Host，http_method 保留原 GET/POST，不能互相替代。
-# 各地址仍作为独立候选，避免在测速前提前丢掉其他可用响应。
+# http_host 只改变 HTTP Host，http_method 保留原 GET/POST，三者不能互相替代。
+# 同一服务的多个地址按 dial_addr 展开为独立候选，避免在测速前提前丢掉其他可用响应。
 - tag: upstream_test-tcp_1
   type: forward
   args:
@@ -585,6 +585,9 @@ plugins:
       - 146.75.48.0
       ipv6:
       - '2a04:4e42:7c::'
+
+# 替换门控：豁免名单同时检查 qname 和 CNAME，仅 A/AAAA（1/28）参与地址替换；
+# 各名单内容与先后顺序均取自原配置。
 - tag: apply_replace
   type: sequence
   args:
@@ -714,8 +717,9 @@ plugins:
     exec: return
   - exec: $fallback_google
 
-# 候选来源保持各 resolver 的原动作顺序：需要过滤/替换的响应先处理，再交给 selector。
-# 全响应过滤 → CDN 替换 → 测速；中途无响应立即结束该候选，不对原地址先测速。
+# source_<路由组>__<上游组>__<序号>：候选来源保持各 resolver 的原动作顺序，
+# 即 上游应答 →（按原配置）全响应过滤 → CDN 替换 → 其他替换，随后交给同组 selector。
+# 任一步之后无响应立即 return 结束该候选，不对原地址先测速。
 - tag: source_cn__isp__1
   type: sequence
   args:
@@ -750,6 +754,7 @@ plugins:
   - exec: $upstream_114dns_2
 
 # 各组 selector 保留原候选顺序、mode 和超时；不能用先选一份响应的 forward 池代替。
+# probe/labels/倍率配置以锚点共享；修改锚点影响其引用，单组调整时先展开对应别名。
 # private 只豁免探测，不代表丢弃该地址；其余地址在过滤和替换完成后才进入测速。
 - tag: select_cn
   type: speedcheck
@@ -767,19 +772,19 @@ plugins:
     total_timeout: 2s
     selection_timeout: 300ms
     settle_window: 25ms
-    probe:
+    probe: &id001
       tcp_ports: []
       icmp: true
       timeout: 300ms
     max_num: 1
     threshold_ms: 100
-    labels:
+    labels: &id002
       private:
       - $ip_private
-    tag_multipliers: []
-    asn_multipliers: {}
-    probe_match:
-      labels_exclude: &id001
+    tag_multipliers: &id003 []
+    asn_multipliers: &id004 {}
+    probe_match: &id005
+      labels_exclude:
       - private
 - tag: source_global__hinet__1
   type: sequence
@@ -997,19 +1002,13 @@ plugins:
     total_timeout: 5s
     selection_timeout: 300ms
     settle_window: 25ms
-    probe:
-      tcp_ports: []
-      icmp: true
-      timeout: 300ms
+    probe: *id001
     max_num: 1
     threshold_ms: 100
-    labels:
-      private:
-      - $ip_private
-    tag_multipliers: []
-    asn_multipliers: {}
-    probe_match:
-      labels_exclude: *id001
+    labels: *id002
+    tag_multipliers: *id003
+    asn_multipliers: *id004
+    probe_match: *id005
 - tag: source_default__isp__1
   type: sequence
   args:
@@ -1330,21 +1329,17 @@ plugins:
     total_timeout: 5s
     selection_timeout: 300ms
     settle_window: 25ms
-    probe:
-      tcp_ports: []
-      icmp: true
-      timeout: 300ms
+    probe: *id001
     max_num: 1
     threshold_ms: 100
-    labels:
-      private:
-      - $ip_private
-    tag_multipliers: []
-    asn_multipliers: {}
-    probe_match:
-      labels_exclude: *id001
+    labels: *id002
+    tag_multipliers: *id003
+    asn_multipliers: *id004
+    probe_match: *id005
 
 # 以下路由保留原 ECS 设置、标记和上游选择方式。
+# 标记编号：1=block 2=proxy 3=google-cn 4=cn 5=global 6=opennic 7=default；
+# main 依据这些标记为 SVCB/HTTPS 查询选择对应的后处理动作。
 - tag: google_ecs
   type: ecs_handler
   args:
@@ -1352,6 +1347,9 @@ plugins:
     send: false
     preset: '240b:4001:23c::'
     mask6: 48
+
+# 非测速上游池：forward 并发竞速，取第一份完整应答，不做逐候选测速；
+# route_google_cn 先调用 google_ecs 注入 ECS，再查询此池。
 - tag: upstream_google_cn
   type: forward
   args:
@@ -1466,7 +1464,7 @@ plugins:
     size: 10000
     lazy_cache_ttl: 0
 
-# HTTPS 的辅助 A/AAAA 查询复用缓存和完整分流、过滤、替换、测速链。
+# HTTPS 的辅助 A 查询复用缓存和完整分流、过滤、替换、测速链。
 # 此入口不执行 main 的 HTTPS 后处理，避免递归；也不能直接改成裸 forward 绕过策略。
 - tag: resolve_cached
   type: sequence
@@ -1486,7 +1484,7 @@ plugins:
     - addr: udp://114.114.114.114:53
     - addr: udp://114.114.115.115:53
 
-# HTTPS 名称门控只控制注入；即使某个名称跳过注入，后面的 hint/H3 清理仍执行。
+# HTTPS 名称门控控制注入和辅助查询；即使跳过它们，后面的 hint/H3 清理仍执行。
 # 因此 inject_* 与 apply_* 两层不能直接合并成同一个带名称条件的动作。
 - tag: https_cleanup
   type: https_record
@@ -1495,6 +1493,10 @@ plugins:
     remove_h3: true
     add_ech: false
     enable_subquery: false
+
+# HTTPS 后处理参数：match_ip 门控注入对象（应答地址命中这些集合才注入 ECH）。
+# add_ech 开启且满足注入条件时，ech_source 通过独立上游池查询 ech_domain。
+# enable_subquery 另行控制辅助 A 查询；ip_source 使用 resolve_cached 完整策略链。
 - tag: process_https_cn
   type: https_record
   args:

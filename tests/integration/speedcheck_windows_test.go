@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package integration_test
 
 import (
 	"net"

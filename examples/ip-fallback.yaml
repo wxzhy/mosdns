@@ -1,10 +1,8 @@
-# Local-only demonstration: all DNS answers come from hosts below.
-# No external resolver, database, ping, TCP probe, or response cache is used.
-# Run from the repository directory: mosdns start -c examples/ip-fallback.yaml
+# ip_fallback 本地演示：所有应答都来自下方 hosts，无外部解析。
+# 纯本地示例：不用上游、数据库、ping/TCP 探测和响应缓存。
+# 从仓库根目录启动：mosdns start -c examples/ip-fallback.yaml
 log:
   level: info
-  production: false
-include: []
 api:
   http: "127.0.0.1:19091"
 plugins:
@@ -12,16 +10,18 @@ plugins:
     type: hosts
     args:
       entries:
+        # 探测被禁用，此名字的地址始终“未测量”，演示 no_rtt 兜底。
         - "no-rtt.ip-fallback.invalid 192.0.2.1 2001:db8:1::1"
-        # An AAAA query for this entry produces valid NOERROR/NODATA.
+        # 对它发 AAAA 查询会得到合法的 NOERROR/NODATA，演示 nodata 兜底。
         - "nodata.ip-fallback.invalid 192.0.2.2"
-      files: []
 
   - tag: local_source
     type: sequence
     args:
       - exec: $demo_hosts
 
+  # selector 原样传递 hosts 应答；两类探测都显式关闭，
+  # 让地址保持“未测量”状态，触发下方 ip_fallback 的兜底条件。
   - tag: select_local
     type: speedcheck
     args:
@@ -29,19 +29,20 @@ plugins:
       mode: wait_all
       total_timeout: 5s
       probe:
-        tcp_ports: []              # Explicitly disable TCP and ICMP probes.
-        icmp: false
+        tcp_ports: []                 # [] 显式关闭 TCP 探测
+        icmp: false                   # 同时关闭 ICMP
         timeout: 300ms
       max_num: 1
 
+  # 静态地址兜底：命中 on 条件时替换/补充为固定地址。
+  # 默认 on: [all_probes_failed, nodata]；被禁用的探测算“未测量”，
+  # 不算失败，因此本示例显式加入 no_rtt 才能触发兜底。
   - tag: static_fallback
     type: ip_fallback
     args:
       ipv4: ["203.0.113.42", "198.51.100.42"]
       ipv6: ["2001:db8:ffff::42"]
-      ttl: 60                     # Default 86400; explicit 0 is supported.
-      # Default: [all_probes_failed, nodata]. Disabled probes are unmeasured,
-      # so this example explicitly opts into no_rtt as well as NODATA.
+      ttl: 60                         # 默认 86400；显式 0 也合法
       on: [no_rtt, nodata]
 
   - tag: main
@@ -62,10 +63,10 @@ plugins:
     args:
       entry: main
       listen: "127.0.0.1:15353"
-      idle_timeout: 10
+      idle_timeout: 10                # 秒
 
-# Queries to demonstrate (documentation addresses only):
+# 可用 nslookup 验证（应答均为文档地址）：
 # nslookup -port=15353 -type=A no-rtt.ip-fallback.invalid 127.0.0.1
 # nslookup -port=15353 -type=AAAA no-rtt.ip-fallback.invalid 127.0.0.1
 # nslookup -port=15353 -type=AAAA nodata.ip-fallback.invalid 127.0.0.1
-# Other names have no local entry and no configured external upstream.
+# 其他名字既无本地记录，也未配置外部上游。
