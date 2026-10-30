@@ -8,6 +8,10 @@ import zipfile
 parser = argparse.ArgumentParser()
 parser.add_argument("-upx", action="store_true")
 parser.add_argument("-i", type=int)
+parser.add_argument("--amd64-only", action="store_true",
+                    help="Build only Windows and Linux AMD64 (v1, v2, v3)")
+parser.add_argument("--list-targets", action="store_true",
+                    help="Print the selected release targets without building")
 args = parser.parse_args()
 
 PROJECT_NAME = 'mosdns'
@@ -45,15 +49,37 @@ envs = [
 
     # [['GOOS', 'windows'], ['GOARCH', '386']],
     [['GOOS', 'windows'], ['GOARCH', 'amd64']],
+    [['GOOS', 'linux'], ['GOARCH', 'amd64'], ['GOAMD64', 'v2']],
+    [['GOOS', 'linux'], ['GOARCH', 'amd64'], ['GOAMD64', 'v3']],
+    [['GOOS', 'windows'], ['GOARCH', 'amd64'], ['GOAMD64', 'v2']],
+    [['GOOS', 'windows'], ['GOARCH', 'amd64'], ['GOAMD64', 'v3']],
 ]
+
+
+def target_name(env):
+    return '-'.join([PROJECT_NAME] + [value for _, value in env])
+
+
+def selected_targets():
+    targets = envs
+    if args.amd64_only:
+        targets = [target for target in targets
+                   if ['GOARCH', 'amd64'] in target
+                   and any(pair in target for pair in
+                           (['GOOS', 'windows'], ['GOOS', 'linux']))]
+    if args.i is not None:
+        targets = [targets[args.i]]
+    return targets
 
 
 def go_build():
     logger.info(f'building {PROJECT_NAME}')
 
-    global envs
-    if args.i:
-        envs = [envs[args.i]]
+    targets = selected_targets()
+    if args.list_targets:
+        for target in targets:
+            print(target_name(target))
+        return
 
     VERSION = 'dev/unknown'
     try:
@@ -67,13 +93,18 @@ def go_build():
         logger.exception('failed to generate config template')
         raise
 
-    for env in envs:
+    failures = []
+    for env in targets:
         os_env = os.environ.copy()  # new env
+        os_env['CGO_ENABLED'] = '0'
 
-        s = PROJECT_NAME
+        s = target_name(env)
         for pairs in env:
             os_env[pairs[0]] = pairs[1]  # add env
-            s = s + '-' + pairs[1]
+        if os_env.get('GOARCH') == 'amd64' and not any(
+                pair[0] == 'GOAMD64' for pair in env):
+            # The unqualified AMD64 archive is always the v1 baseline.
+            os_env['GOAMD64'] = 'v1'
         zip_filename = s + '.zip'
 
         suffix = '.exe' if os_env['GOOS'] == 'windows' else ''
@@ -101,14 +132,18 @@ def go_build():
 
         except subprocess.CalledProcessError as e:
             logger.error(f'build {zip_filename} failed: {e.args}')
+            failures.append(zip_filename)
         except Exception:
             logger.exception('unknown err')
+            failures.append(zip_filename)
+    if failures:
+        raise RuntimeError('release builds failed: ' + ', '.join(failures))
 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
 
-    if len(RELEASE_DIR) != 0:
+    if not args.list_targets and len(RELEASE_DIR) != 0:
         if not os.path.exists(RELEASE_DIR):
             os.mkdir(RELEASE_DIR)
         os.chdir(RELEASE_DIR)

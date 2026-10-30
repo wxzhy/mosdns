@@ -28,6 +28,9 @@ jobs:
         env:
           CGO_ENABLED: "0"
 
+      - name: Verify Windows/Linux AMD64 variants
+        run: python ./scripts/verify_release_archives.py
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
