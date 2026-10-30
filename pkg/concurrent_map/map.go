@@ -162,8 +162,8 @@ func (m *shard[K, V]) len() int {
 }
 
 func (m *shard[K, V]) flush() {
-	m.l.RLock()
-	defer m.l.RUnlock()
+	m.l.Lock()
+	defer m.l.Unlock()
 	m.m = make(map[K]V)
 }
 

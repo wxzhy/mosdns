@@ -123,6 +123,24 @@ func (c *Cache[K, V]) Store(key K, v V, expirationTime time.Time) {
 	return
 }
 
+// StoreIf replaces an existing entry only while it still matches predicate.
+// The comparison and replacement are atomic with respect to Get, Store and
+// Flush on the same shard. It never recreates a key removed by Flush.
+func (c *Cache[K, V]) StoreIf(key K, v V, expirationTime time.Time, predicate func(V) bool) bool {
+	if !time.Now().Before(expirationTime) {
+		return false
+	}
+	stored := false
+	c.m.TestAndSet(key, func(existing *elem[V], ok bool) (*elem[V], bool, bool) {
+		if !ok || !time.Now().Before(existing.expirationTime) || predicate == nil || !predicate(existing.v) {
+			return nil, false, false
+		}
+		stored = true
+		return &elem[V]{v: v, expirationTime: expirationTime}, true, false
+	})
+	return stored
+}
+
 func (c *Cache[K, V]) gcLoop(interval time.Duration) {
 	if interval <= 0 {
 		interval = defaultCleanerInterval

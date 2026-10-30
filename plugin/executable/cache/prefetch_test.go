@@ -20,7 +20,7 @@ func TestProactivePrefetchReplacesNearExpiryEntry(t *testing.T) {
 		n := calls.Add(1)
 		r := new(dns.Msg)
 		r.SetReply(q.Q())
-		r.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: q.QQuestion().Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.IPv4(192, 0, 2, byte(n))}}
+		r.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: q.QQuestion().Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 5}, A: net.IPv4(192, 0, 2, byte(n))}}
 		q.SetResponse(r)
 		return nil
 	})
@@ -36,9 +36,6 @@ func TestProactivePrefetchReplacesNearExpiryEntry(t *testing.T) {
 	if !ok || v == nil {
 		t.Fatal("initial response not cached")
 	}
-	now := time.Now()
-	v.expirationTime = now.Add(4 * time.Second)
-	v.storedTime = now.Add(-30 * time.Second)
 	v.hitCount.Store(3)
 	deadline := time.After(4 * time.Second)
 	for {

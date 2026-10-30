@@ -59,12 +59,20 @@ func init() {
 const (
 	defaultLazyUpdateTimeout = time.Second * 5
 	expiredMsgTtl            = 5
+	prefetchWorkerCount      = 4
+	prefetchQueueCapacity    = 64
 
 	minimumChangesToDump   = 1024
 	dumpHeader             = "mosdns_cache_v2"
 	dumpBlockSize          = 128
 	dumpMaximumBlockLength = 1 << 20 // 1M block. 8kb pre entry. Should be enough.
 )
+
+type prefetchCandidate struct {
+	key  key
+	item *item
+	next sequence.ChainWalker
+}
 
 var _ sequence.RecursiveExecutable = (*Cache)(nil)
 
@@ -109,6 +117,8 @@ type Cache struct {
 	capturedNext      atomic.Pointer[sequence.ChainWalker]
 	captureOnce       sync.Once
 	prefetchWG        sync.WaitGroup
+	prefetchJobs      chan prefetchCandidate
+	prefetchPending   sync.Map // key -> struct{}; queued and running jobs
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -280,6 +290,24 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 }
 
 func (c *Cache) startPrefetchLoop() {
+	c.prefetchJobs = make(chan prefetchCandidate, prefetchQueueCapacity)
+	for i := 0; i < prefetchWorkerCount; i++ {
+		c.prefetchWG.Add(1)
+		go func() {
+			defer c.prefetchWG.Done()
+			for {
+				select {
+				case <-c.closeNotify:
+					return
+				case candidate := <-c.prefetchJobs:
+					func() {
+						defer c.prefetchPending.Delete(candidate.key)
+						c.doPrefetch(candidate)
+					}()
+				}
+			}
+		}()
+	}
 	c.prefetchWG.Add(1)
 	go func() {
 		defer c.prefetchWG.Done()
@@ -295,55 +323,87 @@ func (c *Cache) startPrefetchLoop() {
 					continue
 				}
 				now := time.Now()
-				type candidate struct {
-					key  key
-					item *item
-				}
-				var candidates []candidate
-				// Range holds cache map locks; never do I/O or Store inside its callback.
+				// Range holds cache map locks: only enqueue here, never run I/O
+				// or write back inside its callback.
 				_ = c.backend.Range(func(k key, v *item, _ time.Time) error {
 					if v == nil || v.resp == nil || len(v.resp.Question) != 1 {
 						return nil
 					}
 					remaining := v.expirationTime.Sub(now)
 					if remaining > 0 && remaining < time.Duration(c.args.PrefetchBeforeExpire)*time.Second && v.hitCount.Load() >= uint32(c.args.PrefetchMinHits) {
-						candidates = append(candidates, candidate{key: k, item: v})
+						if _, loaded := c.prefetchPending.LoadOrStore(k, struct{}{}); loaded {
+							return nil
+						}
+						candidate := prefetchCandidate{key: k, item: v, next: *next}
+						select {
+						case <-c.closeNotify:
+							c.prefetchPending.Delete(k)
+						case c.prefetchJobs <- candidate:
+						default:
+							// Bounded backlog: try again on the next scan.
+							c.prefetchPending.Delete(k)
+						}
 					}
 					return nil
 				})
-				for _, candidate := range candidates {
-					select {
-					case <-c.closeNotify:
-						return
-					default:
-					}
-					v := candidate.item
-					if v.resp == nil || len(v.resp.Question) != 1 {
-						continue
-					}
-					q := new(dns.Msg)
-					question := v.resp.Question[0]
-					q.SetQuestion(question.Name, question.Qtype)
-					q.Question[0].Qclass = question.Qclass
-					ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
-					qCtx := query_context.NewContext(q)
-					err := next.ExecNext(ctx, qCtx)
-					cancel()
-					if err != nil {
-						c.prefetchFailTotal.Inc()
-						continue
-					}
-					if r := qCtx.R(); r != nil && saveRespToCache(string(candidate.key), r, c.backend, c.args.LazyCacheTTL) {
-						v.hitCount.Store(0)
-						c.updatedKey.Add(1)
-						c.prefetchTotal.Inc()
-					} else {
-						c.prefetchFailTotal.Inc()
-					}
-				}
 			}
 		}
 	}()
+}
+
+func (c *Cache) doPrefetch(candidate prefetchCandidate) {
+	select {
+	case <-c.closeNotify:
+		return
+	default:
+	}
+	v := candidate.item
+	if v == nil || v.resp == nil || len(v.resp.Question) != 1 {
+		return
+	}
+	if current, _, ok := c.backend.Get(candidate.key); !ok || current != v {
+		return
+	}
+	if remaining := time.Until(v.expirationTime); remaining <= 0 ||
+		remaining >= time.Duration(c.args.PrefetchBeforeExpire)*time.Second ||
+		v.hitCount.Load() < uint32(c.args.PrefetchMinHits) {
+		return
+	}
+
+	q := new(dns.Msg)
+	question := v.resp.Question[0]
+	q.SetQuestion(question.Name, question.Qtype)
+	q.Question[0].Qclass = question.Qclass
+	// getMsgKey encodes AD, CD and DO in its first byte; retain those
+	// semantics for requests that use DNSSEC-related cache partitions.
+	if len(candidate.key) > 0 {
+		flags := candidate.key[0]
+		q.AuthenticatedData = flags&1 != 0
+		q.CheckingDisabled = flags&2 != 0
+		if flags&4 != 0 {
+			q.SetEdns0(1232, true)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
+	defer cancel()
+	qCtx := query_context.NewContext(q)
+	if err := candidate.next.ExecNext(ctx, qCtx); err != nil {
+		c.prefetchFailTotal.Inc()
+		c.logger.Debug("proactive prefetch failed", zap.String("qname", question.Name), zap.Error(err))
+		return
+	}
+	select {
+	case <-c.closeNotify:
+		return
+	default:
+	}
+	if r := qCtx.R(); r != nil &&
+		saveRespToCacheIf(string(candidate.key), r, c.backend, c.args.LazyCacheTTL, v) {
+		c.updatedKey.Add(1)
+		c.prefetchTotal.Inc()
+	} else {
+		c.prefetchFailTotal.Inc()
+	}
 }
 
 func (c *Cache) Close() error {

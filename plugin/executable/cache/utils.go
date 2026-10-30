@@ -166,6 +166,12 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 // saveRespToCache saves r to cache backend. It returns false if r
 // should not be cached and was skipped.
 func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int) bool {
+	return saveRespToCacheIf(msgKey, r, backend, lazyCacheTtl, nil)
+}
+
+// expected != nil means a background refresh may only replace that exact
+// cache entry. A concurrent update or Flush must not be undone by prefetch.
+func saveRespToCacheIf(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, expected *item) bool {
 	if r.Truncated != false {
 		return false
 	}
@@ -203,6 +209,11 @@ func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item]
 		resp:           copyNoOpt(r),
 		storedTime:     now,
 		expirationTime: now.Add(msgTtl),
+	}
+	if expected != nil {
+		return backend.StoreIf(key(msgKey), v, now.Add(cacheTtl), func(old *item) bool {
+			return old == expected
+		})
 	}
 	backend.Store(key(msgKey), v, now.Add(cacheTtl))
 	return true

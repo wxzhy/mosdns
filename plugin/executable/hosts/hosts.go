@@ -30,6 +30,12 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"os"
+	"slices"
+	"sync/atomic"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"go.uber.org/zap"
 )
 
 const PluginType = "hosts"
@@ -46,42 +52,79 @@ type Args struct {
 }
 
 type Hosts struct {
-	h *hosts.Hosts
+	h  atomic.Pointer[hosts.Hosts]
+	fw *utils.FileWatcher
 }
 
-func Init(_ *coremain.BP, args any) (any, error) {
-	return NewHosts(args.(*Args))
+func Init(bp *coremain.BP, args any) (any, error) {
+	return newHosts(bp, args.(*Args), 3*time.Second)
 }
 
 func NewHosts(args *Args) (*Hosts, error) {
-	m := domain.NewMixMatcher[*hosts.IPs]()
-	m.SetDefaultMatcher(domain.MatcherFull)
-	for i, entry := range args.Entries {
-		if err := domain.Load[*hosts.IPs](m, entry, hosts.ParseIPs); err != nil {
-			return nil, fmt.Errorf("failed to load entry #%d %s, %w", i, entry, err)
-		}
-	}
-	for i, file := range args.Files {
-		b, err := os.ReadFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file #%d %s, %w", i, file, err)
-		}
-		if err := domain.LoadFromTextReader[*hosts.IPs](m, bytes.NewReader(b), hosts.ParseIPs); err != nil {
-			return nil, fmt.Errorf("failed to load file #%d %s, %w", i, file, err)
-		}
-	}
+	return newHosts(nil, args, 3*time.Second)
+}
 
-	return &Hosts{
-		h: hosts.NewHosts(m),
-	}, nil
+func newHosts(bp *coremain.BP, args *Args, interval time.Duration) (*Hosts, error) {
+	if args == nil {
+		return nil, fmt.Errorf("hosts: missing args")
+	}
+	entries, files := slices.Clone(args.Entries), slices.Clone(args.Files)
+	load := func() (*hosts.Hosts, error) {
+		m := domain.NewMixMatcher[*hosts.IPs]()
+		m.SetDefaultMatcher(domain.MatcherFull)
+		for i, entry := range entries {
+			if err := domain.Load[*hosts.IPs](m, entry, hosts.ParseIPs); err != nil {
+				return nil, fmt.Errorf("failed to load entry #%d %s, %w", i, entry, err)
+			}
+		}
+		for i, file := range files {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read file #%d %s, %w", i, file, err)
+			}
+			if err := domain.LoadFromTextReader[*hosts.IPs](m, bytes.NewReader(b), hosts.ParseIPs); err != nil {
+				return nil, fmt.Errorf("failed to load file #%d %s, %w", i, file, err)
+			}
+		}
+		return hosts.NewHosts(m), nil
+	}
+	h, err := load()
+	if err != nil {
+		return nil, err
+	}
+	p := &Hosts{}
+	p.h.Store(h)
+	if len(files) > 0 {
+		logger := zap.NewNop()
+		if bp != nil {
+			logger = bp.L()
+		}
+		p.fw = utils.StartFileWatcher(files, interval, func(changed []string) {
+			h, err := load()
+			if err != nil {
+				logger.Error("failed to reload hosts", zap.Error(err))
+				return
+			}
+			p.h.Store(h)
+			logger.Info("reloaded hosts", zap.Strings("files", changed))
+		})
+	}
+	return p, nil
+}
+
+func (h *Hosts) Close() error {
+	return h.fw.Close()
 }
 
 func (h *Hosts) Response(q *dns.Msg) *dns.Msg {
-	return h.h.LookupMsg(q)
+	if matcher := h.h.Load(); matcher != nil {
+		return matcher.LookupMsg(q)
+	}
+	return nil
 }
 
 func (h *Hosts) Exec(_ context.Context, qCtx *query_context.Context) error {
-	r := h.h.LookupMsg(qCtx.Q())
+	r := h.Response(qCtx.Q())
 	if r != nil {
 		qCtx.SetResponse(r)
 		qCtx.SetFromHosts()

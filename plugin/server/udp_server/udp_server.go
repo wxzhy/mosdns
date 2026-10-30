@@ -57,7 +57,9 @@ func (s *UdpServer) Close() error {
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
-	return StartServer(bp, args.(*Args))
+	a := args.(*Args)
+	a.init()
+	return StartServer(bp, a)
 }
 
 func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
