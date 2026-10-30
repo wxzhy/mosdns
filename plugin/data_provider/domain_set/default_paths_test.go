@@ -30,13 +30,13 @@ func TestDefaultPathsAreInstanceScoped(t *testing.T) {
 				t.Fatal(err)
 			}
 			for j, name := range []string{"www.first.invalid", "www.second.invalid"} {
-				for _, matcher := range []MatcherGroup{set.GetDomainMatcher().(MatcherGroup), group} {
+				for _, matcher := range []MatcherGroup{*set.mg.Load(), group} {
 					if _, got := matcher.Match(name); got != (i == j) {
 						t.Errorf("instance %d Match(%q) = %v", i, name, got)
 					}
 				}
 			}
-			if group[0] != set.GetDomainMatcher().(MatcherGroup)[0] {
+			if group[0] != (*set.mg.Load())[0] {
 				t.Fatal("same instance default path did not reuse the shared matcher")
 			}
 			// An explicit source must override a configured default, even if the

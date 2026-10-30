@@ -31,13 +31,13 @@ func TestDefaultPathsAreInstanceScoped(t *testing.T) {
 				t.Fatal(err)
 			}
 			for j, ip := range []string{"192.0.2.1", "198.51.100.1"} {
-				for _, matcher := range []MatcherGroup{set.GetIPMatcher().(MatcherGroup), group} {
+				for _, matcher := range []MatcherGroup{*set.mg.Load(), group} {
 					if got := matcher.Match(netip.MustParseAddr(ip)); got != (i == j) {
 						t.Errorf("instance %d Match(%q) = %v", i, ip, got)
 					}
 				}
 			}
-			if group[0] != set.GetIPMatcher().(MatcherGroup)[0] {
+			if group[0] != (*set.mg.Load())[0] {
 				t.Fatal("same instance default path did not reuse the shared matcher")
 			}
 			override, err := CompileExpressions(bp, []string{"ext:" + paths[1-i] + ":test"})

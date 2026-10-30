@@ -72,3 +72,71 @@ func TestParentCancellationReachesSelectorInsideFallback(t *testing.T) {
 		t.Fatal("nested selector retained canceled source")
 	}
 }
+
+func TestFallbackCommitsOnlyWinningBranchMetadata(t *testing.T) {
+	for _, primaryWins := range []bool{true, false} {
+		name := "secondary"
+		if primaryWins {
+			name = "primary"
+		}
+		t.Run(name, func(t *testing.T) {
+			parent := query_context.NewContext(new(dns.Msg).SetQuestion("example.org.", dns.TypeA))
+			parent.AddRuleHit("entry", []string{"qname example.org"}, "$fallback")
+			parent.SetMark(7)
+			ready := make(chan struct{})
+			var primaryBranch, secondaryBranch *query_context.Context
+			prepare := func(c *query_context.Context, tag string) {
+				c.SetResponse(new(dns.Msg).SetReply(c.Q()))
+				c.SetUpstreamSelected("tls://"+tag, "DoT", tag, "forward_"+tag)
+				c.AddRuleHit(tag, []string{"branch " + tag}, "$forward_"+tag)
+				c.DeleteMark(7)
+				c.SetMark(8)
+				c.Q().Question[0].Name = tag + ".example."
+				if tag == "primary" {
+					c.FromHosts = true
+				} else {
+					c.FromArbitrary = true
+					c.SetCacheState(true, true, 60, 5)
+				}
+			}
+			f := &fallback{
+				logger: zap.NewNop(), alwaysStandby: true, fastFallbackDuration: time.Minute,
+				primary: sequence.ExecutableFunc(func(_ context.Context, c *query_context.Context) error {
+					primaryBranch = c
+					prepare(c, "primary")
+					<-ready
+					if !primaryWins {
+						c.SetResponse(nil)
+					}
+					return nil
+				}),
+				secondary: sequence.ExecutableFunc(func(_ context.Context, c *query_context.Context) error {
+					secondaryBranch = c
+					prepare(c, "secondary")
+					close(ready)
+					return nil
+				}),
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := f.Exec(ctx, parent); err != nil {
+				t.Fatal(err)
+			}
+			winner := secondaryBranch
+			if primaryWins {
+				winner = primaryBranch
+			}
+			winner.UpstreamSelected.Tag = "mutated branch"
+			winner.RuleHits[1].Matches[0] = "mutated branch"
+			if parent.UpstreamSelected.Tag != name || len(parent.RuleHits) != 2 || parent.RuleHits[1].Sequence != name || parent.RuleHits[1].Matches[0] != "branch "+name {
+				t.Fatalf("winner metadata lost, aliased or merged with loser: upstream=%+v rules=%+v", parent.UpstreamSelected, parent.RuleHits)
+			}
+			if parent.FromHosts != primaryWins || parent.FromArbitrary == primaryWins || parent.CacheState.Hit == primaryWins {
+				t.Fatalf("winner source/cache state lost: hosts=%v arbitrary=%v cache=%+v", parent.FromHosts, parent.FromArbitrary, parent.CacheState)
+			}
+			if parent.QQuestion().Name != "example.org." || !parent.HasMark(7) || parent.HasMark(8) {
+				t.Fatal("winner metadata copied branch query/marks")
+			}
+		})
+	}
+}

@@ -172,6 +172,11 @@ func (s *Selector) Close() error {
 	return nil
 }
 
+// Flush implements the cache control used by stats_api.
+func (s *Selector) Flush() {
+	s.preferTypOkCache.Flush()
+}
+
 func NewPreferIpv4(bq sequence.BQ) *Selector {
 	return newSelector(bq, dns.TypeA)
 }

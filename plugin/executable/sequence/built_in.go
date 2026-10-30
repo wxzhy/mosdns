@@ -83,11 +83,13 @@ func setupReturn(_ BQ, _ string) (any, error) {
 var _ RecursiveExecutable = (*ActionJump)(nil)
 
 type ActionJump struct {
-	To []*ChainNode
+	To  []*ChainNode
+	tag string
 }
 
 func (a *ActionJump) Exec(ctx context.Context, qCtx *query_context.Context, next ChainWalker) error {
 	w := NewChainWalker(a.To, &next)
+	w.sequenceTag = a.tag
 	return w.ExecNext(ctx, qCtx)
 }
 
@@ -96,17 +98,19 @@ func setupJump(bq BQ, s string) (any, error) {
 	if target == nil {
 		return nil, fmt.Errorf("can not find jump target %s", s)
 	}
-	return &ActionJump{To: target.chain}, nil
+	return &ActionJump{To: target.chain, tag: s}, nil
 }
 
 var _ RecursiveExecutable = (*ActionGoto)(nil)
 
 type ActionGoto struct {
-	To []*ChainNode
+	To  []*ChainNode
+	tag string
 }
 
 func (a ActionGoto) Exec(ctx context.Context, qCtx *query_context.Context, _ ChainWalker) error {
 	w := NewChainWalker(a.To, nil)
+	w.sequenceTag = a.tag
 	return w.ExecNext(ctx, qCtx)
 }
 
@@ -115,7 +119,7 @@ func setupGoto(bq BQ, s string) (any, error) {
 	if gt == nil {
 		return nil, fmt.Errorf("can not find goto target %s", s)
 	}
-	return &ActionGoto{To: gt.chain}, nil
+	return &ActionGoto{To: gt.chain, tag: s}, nil
 }
 
 var _ Matcher = (*MatchAlwaysTrue)(nil)

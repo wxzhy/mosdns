@@ -89,10 +89,16 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 		return nil, err
 	}
 	// Init logger.
-	lg, err := mlog.NewLogger(cfg.Log)
+	lg, closeLog, err := mlog.NewLoggerWithCleanup(cfg.Log)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init logger: %w", err)
 	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			closeLog()
+		}
+	}()
 
 	m := &Mosdns{
 		logger:       lg,
@@ -134,6 +140,7 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
 		go func() {
 			defer done()
+			defer closeLog()
 			<-closeSignal
 			m.logger.Info("starting shutdown sequences")
 			for tag, p := range m.plugins {
@@ -160,6 +167,7 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	}
 	m.logger.Info("all plugins are loaded")
 
+	initialized = true
 	return m, nil
 }
 
@@ -204,6 +212,19 @@ func (m *Mosdns) Logger() *zap.Logger {
 // GetPlugin returns a plugin.
 func (m *Mosdns) GetPlugin(tag string) any {
 	return m.plugins[tag]
+}
+
+type Flusher interface {
+	Flush()
+}
+
+// FlushAllCaches supports the historical stats_api cache control endpoint.
+func (m *Mosdns) FlushAllCaches() {
+	for _, p := range m.plugins {
+		if f, ok := p.(Flusher); ok {
+			f.Flush()
+		}
+	}
 }
 
 // GetMetricsReg returns a prometheus.Registerer with a prefix of "mosdns_"

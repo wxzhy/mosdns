@@ -29,6 +29,11 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"go.uber.org/zap"
 )
 
 const PluginType = "ip_set"
@@ -60,32 +65,65 @@ type Args struct {
 var _ data_provider.IPMatcherProvider = (*IPSet)(nil)
 
 type IPSet struct {
-	mg []netlist.Matcher
+	mg atomic.Pointer[MatcherGroup]
+	fw *utils.FileWatcher
 }
 
 func (d *IPSet) GetIPMatcher() netlist.Matcher {
-	return MatcherGroup(d.mg)
+	return d
 }
+
+func (d *IPSet) Match(ip netip.Addr) bool {
+	if m := d.mg.Load(); m != nil {
+		return m.Match(ip)
+	}
+	return false
+}
+func (d *IPSet) Close() error { return d.fw.Close() }
 
 func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
 	p := &IPSet{}
-
 	var paths geodata.Paths
 	if bp != nil {
 		paths = bp.M().GeodataPaths()
 	}
-	loader := NewListLoader(paths)
-	if err := loader.LoadFromIPsAndFiles(args.IPs, args.Files); err != nil {
+	load := func() (*MatcherGroup, error) {
+		loader := NewListLoader(paths)
+		if err := loader.LoadFromIPsAndFiles(args.IPs, args.Files); err != nil {
+			return nil, err
+		}
+		mg := MatcherGroup(loader.Matchers())
+		for _, tag := range args.Sets {
+			if bp == nil {
+				return nil, fmt.Errorf("missing plugin context for set %s", tag)
+			}
+			provider, ok := bp.M().GetPlugin(tag).(data_provider.IPMatcherProvider)
+			if !ok {
+				return nil, fmt.Errorf("%s is not an IPMatcherProvider", tag)
+			}
+			mg = append(mg, provider.GetIPMatcher())
+		}
+		return &mg, nil
+	}
+	mg, err := load()
+	if err != nil {
 		return nil, err
 	}
-	p.mg = append(p.mg, loader.Matchers()...)
-
-	for _, tag := range args.Sets {
-		provider, _ := bp.M().GetPlugin(tag).(data_provider.IPMatcherProvider)
-		if provider == nil {
-			return nil, fmt.Errorf("%s is not an IPMatcherProvider", tag)
+	p.mg.Store(mg)
+	if len(args.Files) > 0 {
+		logger := zap.NewNop()
+		if bp != nil {
+			logger = bp.L()
 		}
-		p.mg = append(p.mg, provider.GetIPMatcher())
+		p.fw = utils.StartFileWatcher(args.Files, 3*time.Second, func(changed []string) {
+			m, err := load()
+			if err != nil {
+				logger.Error("failed to reload ip_set", zap.Error(err))
+				return
+			}
+			p.mg.Store(m)
+			logger.Info("reloaded ip_set", zap.Strings("files", changed))
+		})
 	}
 	return p, nil
 }

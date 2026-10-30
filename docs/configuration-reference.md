@@ -57,6 +57,8 @@ plugins:
 | --- | --- |
 | `log.level` | 字符串；空值按日志库采用 `info`。可用 `debug`、`info`、`warn`、`error`、`dpanic`、`panic`、`fatal`。 |
 | `log.file` | 字符串；空值写 stderr；非空时写指定文件。 |
+| `log.size` | 文件轮转阈值，默认 `5M`；支持 K/KB、M/MB、G/GB、T/TB，按 1024 进位。无单位按 MiB，如 JSON 字符串 `"1"` 表示 1 MiB。仅文件输出使用。 |
+| `log.backups` | 默认 0，不保留轮转备份；正数限制备份数量，负数保留全部。 |
 | `log.production` | 布尔，默认 `false`；`true` 使用 JSON 日志。 |
 | `include` | YAML 配置文件路径列表，默认空；先递归加载 include 中的插件，再按顺序加载本文件插件。递归加载有深度上限，避免循环 include。子文件的 `log`/`api` 不覆盖主文件设置；子文件不得设置非空 `geodata` 默认路径，即使与根配置相同也报错；空对象与未指定等价。 |
 | `geodata.geosite` | 空；为本实例的 `geosite:` 表达式指定默认 *ray GeoSite dat 文件。未指定时使用工作目录中的 `geosite.dat`。 |
@@ -72,6 +74,8 @@ plugins:
 log:
   level: info
   file: "./mosdns.log"              # 留空则输出到 stderr
+  size: "5M"
+  backups: 0
   production: true
 include:
   - "./providers.yaml"             # 被引用的 providers 先加载
@@ -158,6 +162,28 @@ plugins: []
 ```
 
 未配置对应 `geodata` 路径时，`geosite:` 使用工作目录中的 `geosite.dat`；`geoip:` 依次寻找 `geoip.dat`、`geoip.metadb`、`Country.mmdb`、`geoip.mmdb`；`asn:` 及 speedcheck 数字 ASN 倍率、过滤依次寻找 `ASN.mmdb`、`GeoLite2-ASN.mmdb`、`asn.mmdb`，使用第一个存在的文件。GeoIP 格式按文件内容识别，支持 *ray dat 和 MaxMind；ASN 需要受支持的 ASN 类型 MaxMind 数据库。GeoSite 仅支持 *ray dat，不读取 SmartDNS 的 trie 或文本目录；导出的普通文本仍通过 `domain_set.files` 加载。可用代码及属性由实际数据库决定，多个 `@attr` 使用 AND；ASN 支持纯数字或 `AS` 前缀。数据实现与普通 CIDR matcher 均可在 Windows 使用，它们和下文操作 Linux 防火墙的 `ipset` 动作不同。
+
+### adblock_set：广告域名规则
+
+`adblock_set` 是域名数据提供器，参数为 `files`（文本文件路径列表，默认空）；通过 `matches: qname $tag` 引用，由 sequence 决定返回黑洞地址或拒绝响应。它与 `domain_set` 使用同一 provider 接口，保留 [sbwml 207/208/210 及 229 号补丁](https://github.com/sbwml/luci-app-mosdns/tree/dbdd91ab8ac8b079b6a3ca1a48d99e970d17111b/mosdns/patches) 的解析语义：
+
+- 裸域名匹配自身和子域名；`^example.org`、`full:example.org` 限制为完整匹配，`domain:example.org` 为域名后缀匹配。
+- 支持 `||example.org^`、`@@` 例外、正则和关键词规则，以及 hosts 格式、多域名 hosts 行和行尾注释。
+- 例外规则优先于拦截规则。HTTP 路径、元素隐藏等规则按解析器规则跳过，不参与 DNS 域名匹配。
+
+```yaml
+- tag: blocklist
+  type: adblock_set
+  args:
+    files: ["./rules/blocklist.txt", "./rules/disable-ads.txt"]
+- tag: reject_ads
+  type: sequence
+  args:
+    - matches: qname $blocklist
+      exec: reject 3
+```
+
+初始文件缺失、读取或整份加载失败时初始化失败，无法识别的单条规则按原补丁跳过。文件修改或替换后自动重新加载并切换完整 matcher；重新加载失败保留上一份有效规则。轮询加载器基于 206 号补丁，仅用于本插件；GeoData、`domain_set` 等现有加载语义保持各自定义。
 
 ## sequence 规则与控制流
 
@@ -666,6 +692,48 @@ matcher true 表示本次允许，通过取反拒绝超限；缺少可识别客�
 
 两项均需放在已得到响应的位置；如 cache 命中后提前 accept，则这些动作不会处理缓存命中，应按需要安排控制流。
 
+## stats_api：查询统计与环形日志
+
+顶层插件 `stats_api` 兼容 [sbwml/luci-app-mosdns 的 v5 补丁集](https://github.com/sbwml/luci-app-mosdns/tree/dbdd91ab8ac8b079b6a3ca1a48d99e970d17111b/mosdns/patches) 中的配置、HTTP 接口和统计转储。实现按 216–231 号统计补丁及其查询元数据依赖迁移。
+
+| 字段 | 类型、默认值与行为 |
+| --- | --- |
+| `listen` | 默认空；非空时额外启动该插件自己的 HTTP 服务。通常使用顶层 `api.http` 即可。 |
+| `capacity` | 默认 2000，查询日志最多保留的条数；满后 FIFO 覆盖最旧记录，累计统计继续增长。非正数使用默认值。 |
+| `dump_file` | 默认空，不持久化；非空时启动读取、定时转储，并在关闭时保存。尝试创建父目录，目标目录须可创建或可写。 |
+| `dump_interval` | 默认 600，整数秒；非正数使用默认值。 |
+
+```yaml
+- tag: stats_collector
+  type: stats_api
+  args:
+    capacity: 2000
+    dump_file: "/etc/mosdns/stats.dump"
+    dump_interval: 600
+- tag: main_sequence
+  type: sequence
+  args:
+    - exec: $stats_collector
+    - exec: $lazy_cache        # 需在本 sequence 前定义
+    - matches: has_resp
+      exec: accept
+    - exec: $forward_local     # 需在本 sequence 前定义
+```
+
+该插件递归执行后续链，在返回时记录一次完成的查询，保留原响应与错误。放在 cache 前可覆盖缓存命中及实际解析；cache 的后台刷新从 cache 后继续，不会重复进入该统计入口。上游有效 `NXDOMAIN` 不计作本地拦截；沿用补丁中的 `TIMEOUT`、`ERROR`、`DROPPED` 与拦截判定。超时单独计数，不纳入平均延迟。缓存命中率分母排除拦截、hosts 和 arbitrary 命中。日志包含缓存状态、获胜上游及实际匹配规则；fallback 仅传回获胜分支的元数据。
+
+API 挂在 `/plugins/<tag>`，因此示例对应：
+
+- `GET /plugins/stats_collector/api/v1/stats`：累计查询、拦截、缓存、hosts、arbitrary、超时计数，相应百分比、`avg_latency_ms` 和实时 `qps`。
+- `GET /plugins/stats_collector/api/v1/logs`：`{ "total": ..., "items": [...] }`；支持 `limit`（默认 50，最多 500）、`offset`、`search`、`filter`，最新记录在前。日志字段保留 `domain`、`qtype`、`status`、`is_blocked`、`is_cached`、`elapsed_ms`、`upstream`、`rule` 和 `answers` 等原字段。
+- `GET /plugins/stats_collector/api/v1/top`、`/api/v1/history`：热门域名、客户端、拦截域名和历史统计。
+- `GET /plugins/stats_collector/api/v1/dump`、`POST /plugins/stats_collector/api/v1/load_dump`：导出、恢复 gzip 转储。
+- `POST /plugins/stats_collector/api/v1/logs/clear`、`/api/v1/cache/clear`：清空统计日志或已注册缓存。
+
+同一组接口保留省略 `/api/v1` 的短路径别名，如 `/plugins/stats_collector/stats`、`/plugins/stats_collector/logs`。设置 `listen` 时，插件独立服务直接提供 `/api/v1/*` 及短路径，无 `/plugins/<tag>` 前缀。
+
+转储保留 gzip 名称 `mosdns_stats_v1` 和版本 1 的 `StatsDumpData` JSON 字段；可读取 219 号补丁生成、尚未添加 hosts/arbitrary/timeout 等可选字段的旧转储。重启恢复累计统计、热门列表、历史、日志及序号，减小 capacity 时只保留最新记录。写盘先完成同目录临时文件及同步，再替换旧文件；关闭等待已进入统计器的查询和后台转储完成。无法识别或损坏的已有文件会记录错误、保留原文件，并禁用该实例的持久化，内存统计仍正常。
+
 ## 日志、指标、marks 与延时
 
 | 动作 | 全部用户参数与默认 |
@@ -791,9 +859,9 @@ TCP/HTTP 监听地址以 `@` 开头时，代码会选择 Unix socket；这是面
 
 本页覆盖的注册模块：
 
-- 数据：`domain_set`、`ip_set`。
+- 数据：`domain_set`、`ip_set`、`adblock_set`。
 - 匹配：`client_ip`、`cname`、`env`、`has_resp`、`has_wanted_ans`、`ptr_ip`、`qclass`、`qname`、`qtype`、`random`、`rcode`、`resp_ip`、`string_exp`、`mark`，及 `_true`/`_false`。
-- 执行：`arbitrary`、`black_hole`、`cache`、`debug_print`、`drop_resp`、`dual_selector` 的 `prefer_ipv4`/`prefer_ipv6`、`ecs_handler`/`ecs`、`forward`、`forward_edns0opt`、`hosts`、`https_record`、`ip_fallback`、`ip_replace`、`ipset`、`metrics_collector`、`nftset`、`query_summary`、`rate_limiter`（实际 matcher）、`redirect`、`reverse_lookup`、`sequence`/内置控制流、`fallback`、`sleep`、`ttl`。`speedcheck` 链接至专门参考和完整示例。
+- 执行：`arbitrary`、`black_hole`、`cache`、`debug_print`、`drop_resp`、`dual_selector` 的 `prefer_ipv4`/`prefer_ipv6`、`ecs_handler`/`ecs`、`forward`、`forward_edns0opt`、`hosts`、`https_record`、`ip_fallback`、`ip_replace`、`ipset`、`metrics_collector`、`nftset`、`query_summary`、`rate_limiter`（实际 matcher）、`redirect`、`reverse_lookup`、`sequence`/内置控制流、`fallback`、`sleep`、`stats_api`、`ttl`。`speedcheck` 链接至专门参考和完整示例。
 - 服务：`http_server`、`quic_server`、`tcp_server`、`udp_server`。
 
 配置核对顺序：先检查顶层/插件字段名及依赖定义顺序，再检查单位和快速语法，最后在本机未占用端口启动并做真实查询。程序目前没有独立的“只解析、不启动插件”配置检查命令；`start` 会真实打开文件、数据库和监听 socket。不要把源码中未注册的结构字段或内部常量当成用户配置项。

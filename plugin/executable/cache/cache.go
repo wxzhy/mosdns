@@ -69,15 +69,22 @@ const (
 var _ sequence.RecursiveExecutable = (*Cache)(nil)
 
 type Args struct {
-	Size         int    `yaml:"size"`
-	LazyCacheTTL int    `yaml:"lazy_cache_ttl"`
-	DumpFile     string `yaml:"dump_file"`
-	DumpInterval int    `yaml:"dump_interval"`
+	Size                 int    `yaml:"size"`
+	LazyCacheTTL         int    `yaml:"lazy_cache_ttl"`
+	DumpFile             string `yaml:"dump_file"`
+	DumpInterval         int    `yaml:"dump_interval"`
+	Prefetch             bool   `yaml:"prefetch"`
+	PrefetchBeforeExpire int    `yaml:"prefetch_before_expire"`
+	PrefetchMinHits      int    `yaml:"prefetch_min_hits"`
+	PrefetchScanInterval int    `yaml:"prefetch_scan_interval"`
 }
 
 func (a *Args) init() {
 	utils.SetDefaultUnsignNum(&a.Size, 1024)
 	utils.SetDefaultUnsignNum(&a.DumpInterval, 600)
+	utils.SetDefaultUnsignNum(&a.PrefetchBeforeExpire, 10)
+	utils.SetDefaultUnsignNum(&a.PrefetchMinHits, 3)
+	utils.SetDefaultUnsignNum(&a.PrefetchScanInterval, 5)
 }
 
 type Cache struct {
@@ -93,10 +100,15 @@ type Cache struct {
 	// the temp-file swap so two dumps never interleave on the same path.
 	dumpMu sync.Mutex
 
-	queryTotal   prometheus.Counter
-	hitTotal     prometheus.Counter
-	lazyHitTotal prometheus.Counter
-	size         prometheus.GaugeFunc
+	queryTotal        prometheus.Counter
+	hitTotal          prometheus.Counter
+	lazyHitTotal      prometheus.Counter
+	size              prometheus.GaugeFunc
+	prefetchTotal     prometheus.Counter
+	prefetchFailTotal prometheus.Counter
+	capturedNext      atomic.Pointer[sequence.ChainWalker]
+	captureOnce       sync.Once
+	prefetchWG        sync.WaitGroup
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -163,6 +175,8 @@ func NewCache(args *Args, opts Opts) *Cache {
 			Help:        "The total number of queries that hit the expired cache",
 			ConstLabels: lb,
 		}),
+		prefetchTotal:     prometheus.NewCounter(prometheus.CounterOpts{Name: "prefetch_total", Help: "Successful proactive prefetch operations", ConstLabels: lb}),
+		prefetchFailTotal: prometheus.NewCounter(prometheus.CounterOpts{Name: "prefetch_fail_total", Help: "Failed proactive prefetch operations", ConstLabels: lb}),
 		size: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name:        "size_current",
 			Help:        "Current cache size in records",
@@ -176,12 +190,15 @@ func NewCache(args *Args, opts Opts) *Cache {
 		p.logger.Error("failed to load cache dump", zap.Error(err))
 	}
 	p.startDumpLoop()
+	if p.args.Prefetch {
+		p.startPrefetchLoop()
+	}
 
 	return p
 }
 
 func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
-	for _, collector := range [...]prometheus.Collector{c.queryTotal, c.hitTotal, c.lazyHitTotal, c.size} {
+	for _, collector := range [...]prometheus.Collector{c.queryTotal, c.hitTotal, c.lazyHitTotal, c.prefetchTotal, c.prefetchFailTotal, c.size} {
 		if err := r.Register(collector); err != nil {
 			return err
 		}
@@ -190,6 +207,9 @@ func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
 }
 
 func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
+	if c.args.Prefetch {
+		c.captureOnce.Do(func() { copied := next; c.capturedNext.Store(&copied) })
+	}
 	c.queryTotal.Inc()
 	q := qCtx.Q()
 
@@ -207,6 +227,20 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		c.hitTotal.Inc()
 		cachedResp.Id = q.Id // change msg id
 		qCtx.SetResponse(cachedResp)
+		qCtx.UpstreamSelected = nil
+		qCtx.FromHosts, qCtx.FromArbitrary = false, false
+		if v, _, ok := c.backend.Get(key(msgKey)); ok && v != nil {
+			ttl := int(v.expirationTime.Sub(v.storedTime).Seconds())
+			remaining := max(0, int(time.Until(v.expirationTime).Seconds()))
+			qCtx.SetCacheState(true, lazyHit, ttl, remaining)
+			if c.args.Prefetch {
+				v.hitCount.Add(1)
+			}
+		} else {
+			qCtx.SetCacheState(true, lazyHit, 0, 0)
+		}
+	} else {
+		qCtx.SetCacheState(false, false, 0, 0)
 	}
 
 	err := next.ExecNext(ctx, qCtx)
@@ -223,7 +257,6 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next sequence.ChainWalker) {
 	qCtxCopy := qCtx.Copy()
 	lazyUpdateFunc := func() (any, error) {
-		defer c.lazyUpdateSF.Forget(msgKey)
 		qCtx := qCtxCopy
 
 		c.logger.Debug("start lazy cache update", qCtx.InfoField())
@@ -243,7 +276,74 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 		c.logger.Debug("lazy cache updated", qCtx.InfoField())
 		return nil, nil
 	}
-	c.lazyUpdateSF.DoChan(msgKey, lazyUpdateFunc) // DoChan won't block this goroutine
+	c.lazyUpdateSF.DoChan("lazy:"+msgKey, lazyUpdateFunc) // DoChan won't block this goroutine
+}
+
+func (c *Cache) startPrefetchLoop() {
+	c.prefetchWG.Add(1)
+	go func() {
+		defer c.prefetchWG.Done()
+		ticker := time.NewTicker(time.Duration(c.args.PrefetchScanInterval) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-c.closeNotify:
+				return
+			case <-ticker.C:
+				next := c.capturedNext.Load()
+				if next == nil {
+					continue
+				}
+				now := time.Now()
+				type candidate struct {
+					key  key
+					item *item
+				}
+				var candidates []candidate
+				// Range holds cache map locks; never do I/O or Store inside its callback.
+				_ = c.backend.Range(func(k key, v *item, _ time.Time) error {
+					if v == nil || v.resp == nil || len(v.resp.Question) != 1 {
+						return nil
+					}
+					remaining := v.expirationTime.Sub(now)
+					if remaining > 0 && remaining < time.Duration(c.args.PrefetchBeforeExpire)*time.Second && v.hitCount.Load() >= uint32(c.args.PrefetchMinHits) {
+						candidates = append(candidates, candidate{key: k, item: v})
+					}
+					return nil
+				})
+				for _, candidate := range candidates {
+					select {
+					case <-c.closeNotify:
+						return
+					default:
+					}
+					v := candidate.item
+					if v.resp == nil || len(v.resp.Question) != 1 {
+						continue
+					}
+					q := new(dns.Msg)
+					question := v.resp.Question[0]
+					q.SetQuestion(question.Name, question.Qtype)
+					q.Question[0].Qclass = question.Qclass
+					ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
+					qCtx := query_context.NewContext(q)
+					err := next.ExecNext(ctx, qCtx)
+					cancel()
+					if err != nil {
+						c.prefetchFailTotal.Inc()
+						continue
+					}
+					if r := qCtx.R(); r != nil && saveRespToCache(string(candidate.key), r, c.backend, c.args.LazyCacheTTL) {
+						v.hitCount.Store(0)
+						c.updatedKey.Add(1)
+						c.prefetchTotal.Inc()
+					} else {
+						c.prefetchFailTotal.Inc()
+					}
+				}
+			}
+		}
+	}()
 }
 
 func (c *Cache) Close() error {
@@ -252,6 +352,7 @@ func (c *Cache) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeNotify)
 	})
+	c.prefetchWG.Wait()
 	if err := c.dumpCache(); err != nil {
 		c.logger.Error("failed to dump cache", zap.Error(err))
 	}
@@ -358,6 +459,11 @@ func (c *Cache) Api() *chi.Mux {
 		w.WriteHeader(http.StatusOK)
 	})
 	return r
+}
+
+// Flush implements the cache control used by stats_api.
+func (c *Cache) Flush() {
+	c.backend.Flush()
 }
 
 func (c *Cache) writeDump(w io.Writer) (int, error) {

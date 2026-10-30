@@ -11,6 +11,8 @@
 log:
   level: info
   file: ""
+  size: "5M"                         # 文件轮转阈值；无单位表示 MiB
+  backups: 0                         # 0不保留备份，负数保留全部
   production: false
 include: []
 geodata:
@@ -20,12 +22,23 @@ geodata:
 api:
   http: "127.0.0.1:19091"
 plugins:
+  - tag: stats_collector
+    type: stats_api
+    args:
+      listen: ""                          # 非空时独立提供 /api/v1/*；通常使用顶层 api
+      capacity: 2000
+      dump_file: "./stats.dump"
+      dump_interval: 600                   # 秒；须在所需主链起点 exec: $stats_collector
   - tag: domains_base
     type: domain_set
     args:
       exps: ["full:router.example", "domain:example.org"]
       sets: []
       files: ["./rules/domains.txt"]
+  - tag: ads
+    type: adblock_set
+    args:
+      files: ["./rules/adblock.txt"]  # sequence 中 matches: qname $ads
   - tag: domains_database
     type: domain_set
     args:

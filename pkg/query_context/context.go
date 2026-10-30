@@ -56,6 +56,13 @@ type Context struct {
 	validUntil  time.Time
 	probeStatus ProbeStatus
 
+	// Execution details used by query statistics. Each branch owns its metadata.
+	UpstreamSelected *UpstreamLog
+	RuleHits         []RuleHit
+	CacheState       CacheLog
+	FromHosts        bool
+	FromArbitrary    bool
+
 	// lazy init.
 	kv    map[uint32]any
 	marks map[uint32]struct{}
@@ -183,6 +190,12 @@ type ResponseSnapshot struct {
 	// ProbeStatus describes the eligible address set evaluated by a selector.
 	// It is response state, so branch commits retain it and new responses reset it.
 	ProbeStatus ProbeStatus
+
+	UpstreamSelected *UpstreamLog
+	RuleHits         []RuleHit
+	CacheState       CacheLog
+	FromHosts        bool
+	FromArbitrary    bool
 }
 
 // Clone returns an independently mutable snapshot.
@@ -196,11 +209,18 @@ func (s ResponseSnapshot) Clone() ResponseSnapshot {
 	if s.RespOpt != nil {
 		s.RespOpt = dns.Copy(s.RespOpt).(*dns.OPT)
 	}
+	s.UpstreamSelected = cloneUpstreamLog(s.UpstreamSelected)
+	s.RuleHits = cloneRuleHits(s.RuleHits)
 	return s
 }
 
 func (ctx *Context) SnapshotResponse() ResponseSnapshot {
-	return (ResponseSnapshot{Response: ctx.resp, UpstreamOpt: ctx.upstreamOpt, RespOpt: ctx.respOpt, ReceivedAt: ctx.receivedAt, ValidUntil: ctx.validUntil, ProbeStatus: ctx.probeStatus}).Clone()
+	return (ResponseSnapshot{
+		Response: ctx.resp, UpstreamOpt: ctx.upstreamOpt, RespOpt: ctx.respOpt,
+		ReceivedAt: ctx.receivedAt, ValidUntil: ctx.validUntil, ProbeStatus: ctx.probeStatus,
+		UpstreamSelected: ctx.UpstreamSelected, RuleHits: ctx.RuleHits, CacheState: ctx.CacheState,
+		FromHosts: ctx.FromHosts, FromArbitrary: ctx.FromArbitrary,
+	}).Clone()
 }
 
 // ResponseReceivedAt is the time SetResponse accepted the current DNS response,
@@ -224,6 +244,11 @@ func (ctx *Context) CommitResponse(s ResponseSnapshot) {
 	ctx.receivedAt = s.ReceivedAt
 	ctx.validUntil = s.ValidUntil
 	ctx.probeStatus = s.ProbeStatus
+	ctx.UpstreamSelected = s.UpstreamSelected
+	ctx.RuleHits = s.RuleHits
+	ctx.CacheState = s.CacheState
+	ctx.FromHosts = s.FromHosts
+	ctx.FromArbitrary = s.FromArbitrary
 	if s.Response == nil {
 		ctx.receivedAt = time.Time{}
 		ctx.validUntil = time.Time{}
@@ -279,6 +304,7 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	d.receivedAt = ctx.receivedAt
 	d.validUntil = ctx.validUntil
 	d.probeStatus = ctx.probeStatus
+	d.CopyMetadataFrom(ctx)
 
 	d.kv = maps.Clone(ctx.kv)
 	d.marks = maps.Clone(ctx.marks)

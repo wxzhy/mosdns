@@ -127,6 +127,7 @@ type Forward struct {
 	logger       *zap.Logger
 	us           []*upstreamWrapper
 	tag2Upstream map[string]*upstreamWrapper // for fast tag lookup only.
+	pluginTag    string
 }
 
 type Opts struct {
@@ -148,6 +149,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 		args:         args,
 		logger:       opt.Logger,
 		tag2Upstream: make(map[string]*upstreamWrapper),
+		pluginTag:    opt.MetricsTag,
 	}
 
 	applyGlobal := func(c *UpstreamConfig) {
@@ -231,6 +233,8 @@ func (f *Forward) Exec(ctx context.Context, qCtx *query_context.Context) (err er
 		return err
 	}
 	qCtx.SetResponse(r)
+	qCtx.FromHosts, qCtx.FromArbitrary = false, false
+	qCtx.SetCacheState(false, false, 0, 0)
 	return nil
 }
 
@@ -254,6 +258,8 @@ func (f *Forward) QuickConfigureExec(args string) (any, error) {
 			return err
 		}
 		qCtx.SetResponse(r)
+		qCtx.FromHosts, qCtx.FromArbitrary = false, false
+		qCtx.SetCacheState(false, false, 0, 0)
 		return nil
 	}
 	return execFunc, nil
@@ -289,6 +295,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	type res struct {
 		r   *dns.Msg
 		err error
+		u   *upstreamWrapper
 	}
 
 	resChan := make(chan res)
@@ -301,9 +308,11 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		defer cancel()
 	}
 
+	var lastAttempted *upstreamWrapper
 	r := rand.IntN(len(us))
 	for i := 0; i < concurrent; i++ {
 		u := us[(r+i)%len(us)]
+		lastAttempted = u
 		qc := copyPayload(queryPayload)
 		go func(uqid uint32, question dns.Question) {
 			defer pool.ReleaseBuf(qc)
@@ -342,7 +351,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 				}
 			}
 			select {
-			case resChan <- res{r: r, err: err}:
+			case resChan <- res{r: r, err: err, u: u}:
 			case <-done:
 			}
 		}(qCtx.Id(), qCtx.QQuestion())
@@ -360,12 +369,34 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 			if i < concurrent-1 && r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
 				continue
 			}
+			f.setUpstream(qCtx, res.u)
 			return r, nil
 		case <-ctx.Done():
+			f.setUpstream(qCtx, lastAttempted)
 			return nil, context.Cause(ctx)
 		}
 	}
+	f.setUpstream(qCtx, lastAttempted)
 	return nil, errors.New("all upstream servers failed")
+}
+
+func (f *Forward) setUpstream(qCtx *query_context.Context, u *upstreamWrapper) {
+	if u == nil {
+		return
+	}
+	proto := "UDP"
+	if scheme, _, ok := strings.Cut(u.cfg.Addr, "://"); ok {
+		proto = strings.ToUpper(scheme)
+	}
+	switch proto {
+	case "TLS":
+		proto = "DoT"
+	case "HTTPS", "HTTP", "H3":
+		proto = "DoH"
+	case "QUIC", "DOQ":
+		proto = "DoQ"
+	}
+	qCtx.SetUpstreamSelected(u.cfg.Addr, proto, u.cfg.Tag, f.pluginTag)
 }
 
 func quickSetup(bq sequence.BQ, s string) (any, error) {

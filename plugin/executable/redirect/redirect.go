@@ -25,6 +25,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
@@ -48,11 +52,12 @@ type Args struct {
 }
 
 type Redirect struct {
-	m *domain.MixMatcher[string]
+	m  atomic.Pointer[domain.MixMatcher[string]]
+	fw *utils.FileWatcher
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
-	r, err := NewRedirect(args.(*Args))
+	r, err := NewRedirectWithWatcher(bp, args.(*Args))
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +65,9 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	return r, nil
 }
 
-func NewRedirect(args *Args) (*Redirect, error) {
+func NewRedirect(args *Args) (*Redirect, error) { return NewRedirectWithWatcher(nil, args) }
+func NewRedirectWithWatcher(bp *coremain.BP, args *Args) (*Redirect, error) {
+	r := &Redirect{}
 	parseFunc := func(s string) (p, v string, err error) {
 		f := strings.Fields(s)
 		if len(f) != 2 {
@@ -68,24 +75,48 @@ func NewRedirect(args *Args) (*Redirect, error) {
 		}
 		return f[0], dns.Fqdn(f[1]), nil
 	}
-	m := domain.NewMixMatcher[string]()
-	m.SetDefaultMatcher(domain.MatcherFull)
-	for i, rule := range args.Rules {
-		if err := domain.Load[string](m, rule, parseFunc); err != nil {
-			return nil, fmt.Errorf("failed to load rule #%d %s, %w", i, rule, err)
+	load := func() (*domain.MixMatcher[string], error) {
+		m := domain.NewMixMatcher[string]()
+		m.SetDefaultMatcher(domain.MatcherFull)
+		for i, rule := range args.Rules {
+			if err := domain.Load[string](m, rule, parseFunc); err != nil {
+				return nil, fmt.Errorf("failed to load rule #%d %s, %w", i, rule, err)
+			}
 		}
+		for i, file := range args.Files {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read file #%d %s, %w", i, file, err)
+			}
+			if err := domain.LoadFromTextReader[string](m, bytes.NewReader(b), parseFunc); err != nil {
+				return nil, fmt.Errorf("failed to load file #%d %s, %w", i, file, err)
+			}
+		}
+		return m, nil
 	}
-	for i, file := range args.Files {
-		b, err := os.ReadFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file #%d %s, %w", i, file, err)
-		}
-		if err := domain.LoadFromTextReader[string](m, bytes.NewReader(b), parseFunc); err != nil {
-			return nil, fmt.Errorf("failed to load file #%d %s, %w", i, file, err)
-		}
+	m, err := load()
+	if err != nil {
+		return nil, err
 	}
-	return &Redirect{m: m}, nil
+	r.m.Store(m)
+	if len(args.Files) > 0 {
+		logger := zap.NewNop()
+		if bp != nil {
+			logger = bp.L()
+		}
+		r.fw = utils.StartFileWatcher(args.Files, 3*time.Second, func(changed []string) {
+			m, err := load()
+			if err != nil {
+				logger.Error("failed to reload redirect", zap.Error(err))
+				return
+			}
+			r.m.Store(m)
+			logger.Info("reloaded redirect", zap.Strings("files", changed))
+		})
+	}
+	return r, nil
 }
+func (r *Redirect) Close() error { return r.fw.Close() }
 
 func (r *Redirect) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	q := qCtx.Q()
@@ -94,7 +125,11 @@ func (r *Redirect) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	}
 
 	orgQName := q.Question[0].Name
-	redirectTarget, ok := r.m.Match(orgQName)
+	matcher := r.m.Load()
+	if matcher == nil {
+		return next.ExecNext(ctx, qCtx)
+	}
+	redirectTarget, ok := matcher.Match(orgQName)
 	if !ok {
 		return next.ExecNext(ctx, qCtx)
 	}
@@ -130,5 +165,8 @@ func (r *Redirect) Exec(ctx context.Context, qCtx *query_context.Context, next s
 }
 
 func (r *Redirect) Len() int {
-	return r.m.Len()
+	if m := r.m.Load(); m != nil {
+		return m.Len()
+	}
+	return 0
 }

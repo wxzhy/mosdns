@@ -72,6 +72,7 @@ func NewArbitrary(args *Args) (*Arbitrary, error) {
 func (a *Arbitrary) Exec(_ context.Context, qCtx *query_context.Context) error {
 	if r := a.m.Reply(qCtx.Q()); r != nil {
 		qCtx.SetResponse(r)
+		qCtx.SetFromArbitrary()
 	}
 	return nil
 }

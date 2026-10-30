@@ -84,6 +84,7 @@ func (h *Hosts) Exec(_ context.Context, qCtx *query_context.Context) error {
 	r := h.h.LookupMsg(qCtx.Q())
 	if r != nil {
 		qCtx.SetResponse(r)
+		qCtx.SetFromHosts()
 	}
 	return nil
 }

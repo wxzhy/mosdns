@@ -91,6 +91,7 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		h.warnErr(req, "invalid request", err)
 		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("Bad Request"))
 		return
 	}
 

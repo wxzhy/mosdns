@@ -22,6 +22,7 @@ package plugin
 // data providers
 import (
 	// data provider
+	_ "github.com/IrineSistiana/mosdns/v5/plugin/data_provider/adblock_set"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/data_provider/domain_set"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
 
@@ -65,6 +66,7 @@ import (
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence/fallback"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/sleep"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/speedcheck"
+	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/stats_api"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/ttl"
 
 	// executable and matcher

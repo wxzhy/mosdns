@@ -21,6 +21,7 @@ package cache
 
 import (
 	"hash/maphash"
+	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/cache"
@@ -78,6 +79,7 @@ type item struct {
 	resp           *dns.Msg
 	storedTime     time.Time
 	expirationTime time.Time
+	hitCount       atomic.Uint32
 }
 
 func copyNoOpt(m *dns.Msg) *dns.Msg {

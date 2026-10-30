@@ -27,6 +27,11 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"os"
+	"sync/atomic"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"go.uber.org/zap"
 )
 
 const PluginType = "domain_set"
@@ -58,34 +63,67 @@ type Args struct {
 var _ data_provider.DomainMatcherProvider = (*DomainSet)(nil)
 
 type DomainSet struct {
-	mg []domain.Matcher[struct{}]
+	mg atomic.Pointer[MatcherGroup]
+	fw *utils.FileWatcher
 }
 
 func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
-	return MatcherGroup(d.mg)
+	return d
 }
+
+func (d *DomainSet) Match(s string) (struct{}, bool) {
+	if m := d.mg.Load(); m != nil {
+		return m.Match(s)
+	}
+	return struct{}{}, false
+}
+
+func (d *DomainSet) Close() error { return d.fw.Close() }
 
 // NewDomainSet inits a DomainSet from given args.
 func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
 	ds := &DomainSet{}
-
 	var paths geodata.Paths
 	if bp != nil {
 		paths = bp.M().GeodataPaths()
 	}
-	loader := NewMixLoader(paths)
-	if err := loader.LoadExpsAndFiles(args.Exps, args.Files); err != nil {
+	load := func() (*MatcherGroup, error) {
+		loader := NewMixLoader(paths)
+		if err := loader.LoadExpsAndFiles(args.Exps, args.Files); err != nil {
+			return nil, err
+		}
+		mg := MatcherGroup(loader.Matchers())
+		for _, tag := range args.Sets {
+			if bp == nil {
+				return nil, fmt.Errorf("missing plugin context for set %s", tag)
+			}
+			provider, ok := bp.M().GetPlugin(tag).(data_provider.DomainMatcherProvider)
+			if !ok {
+				return nil, fmt.Errorf("%s is not a DomainMatcherProvider", tag)
+			}
+			mg = append(mg, provider.GetDomainMatcher())
+		}
+		return &mg, nil
+	}
+	mg, err := load()
+	if err != nil {
 		return nil, err
 	}
-	ds.mg = append(ds.mg, loader.Matchers()...)
-
-	for _, tag := range args.Sets {
-		provider, _ := bp.M().GetPlugin(tag).(data_provider.DomainMatcherProvider)
-		if provider == nil {
-			return nil, fmt.Errorf("%s is not a DomainMatcherProvider", tag)
+	ds.mg.Store(mg)
+	if len(args.Files) > 0 {
+		logger := zap.NewNop()
+		if bp != nil {
+			logger = bp.L()
 		}
-		m := provider.GetDomainMatcher()
-		ds.mg = append(ds.mg, m)
+		ds.fw = utils.StartFileWatcher(args.Files, 3*time.Second, func(changed []string) {
+			m, err := load()
+			if err != nil {
+				logger.Error("failed to reload domain_set", zap.Error(err))
+				return
+			}
+			ds.mg.Store(m)
+			logger.Info("reloaded domain_set", zap.Strings("files", changed))
+		})
 	}
 	return ds, nil
 }

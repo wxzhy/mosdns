@@ -449,7 +449,9 @@ func rebuildRecords(anchor *Candidate, records []dns.RR, contributors map[*Candi
 		r.Answer = append(r.Answer, rr)
 	}
 	upstreamOpt, respOpt := rebuiltOpts(anchor, contributors)
-	return query_context.ResponseSnapshot{Response: r, UpstreamOpt: upstreamOpt, RespOpt: respOpt, ReceivedAt: now, ValidUntil: bounds.validUntil}
+	snapshot := query_context.ResponseSnapshot{Response: r, UpstreamOpt: upstreamOpt, RespOpt: respOpt, ReceivedAt: now, ValidUntil: bounds.validUntil}
+	snapshot.CopyMetadataFrom(anchor.Snapshot)
+	return snapshot
 }
 
 func (c *Candidate) address(want Address) (Address, bool) {

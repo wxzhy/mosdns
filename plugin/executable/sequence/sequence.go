@@ -40,6 +40,7 @@ func init() {
 }
 
 type Sequence struct {
+	tag              string
 	chain            []*ChainNode
 	anonymousPlugins []any
 }
@@ -59,6 +60,9 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 func NewSequence(bq BQ, ra []RuleArgs) (*Sequence, error) {
 	s := &Sequence{}
+	if t, ok := bq.(interface{ Tag() string }); ok {
+		s.tag = t.Tag()
+	}
 
 	var rc []RuleConfig
 	for _, ra := range ra {
@@ -73,5 +77,6 @@ func NewSequence(bq BQ, ra []RuleArgs) (*Sequence, error) {
 
 func (s *Sequence) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	walker := NewChainWalker(s.chain, nil)
+	walker.sequenceTag = s.tag
 	return walker.ExecNext(ctx, qCtx)
 }

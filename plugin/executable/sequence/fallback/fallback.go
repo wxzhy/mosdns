@@ -170,7 +170,10 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 		if f.alwaysStandby && r != nil {
 			select {
 			case <-ctx.Done():
+				return
 			case <-primDone:
+				// The primary owns the result even while its snapshot is being copied.
+				return
 			case <-primFailed: // only send secondary result when primary is failed.
 			case <-timer.C: // or timed out.
 			}
