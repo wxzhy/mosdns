@@ -106,12 +106,18 @@ func TestNegativeSOATTLAndCachedClassificationSurviveDump(t *testing.T) {
 	if got := v.expirationTime.Sub(v.storedTime); got != 5*time.Second {
 		t.Fatalf("negative TTL=%v, want 5s", got)
 	}
+	if soa := v.resp.Ns[0].(*dns.SOA); soa.Hdr.Ttl != 5 {
+		t.Fatalf("cached SOA TTL = %d, want 5", soa.Hdr.Ttl)
+	}
 	cacheHit := query_context.NewContext(q.Copy())
 	if err := c.Exec(context.Background(), cacheHit, w); err != nil {
 		t.Fatal(err)
 	}
 	if !cacheHit.CacheState.Hit || !cacheHit.CacheState.LocalNegative {
 		t.Fatal("cached local negative response lost blocked source")
+	}
+	if ttl := cacheHit.R().Ns[0].Header().Ttl; ttl > 5 {
+		t.Fatalf("cached negative response returned SOA TTL %d > 5", ttl)
 	}
 	var data bytes.Buffer
 	if _, err := c.writeDump(&data); err != nil {

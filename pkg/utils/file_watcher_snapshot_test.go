@@ -47,3 +47,38 @@ func TestFileWatcherDetectsInitializationGapAndRetriesFailure(t *testing.T) {
 		t.Fatalf("unexpected reload calls: %d", calls.Load())
 	}
 }
+
+func TestWatcherDetectsSameSizeAndTimestampEdit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.txt")
+	if err := os.WriteFile(path, []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	baseline := SnapshotFileStates([]string{path})
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("bravo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	changed := make(chan struct{}, 1)
+	fw := StartFileWatcherFromSnapshot([]string{path}, baseline, 10*time.Millisecond, func(paths []string) bool {
+		if len(paths) != 1 || paths[0] != path {
+			t.Errorf("unexpected changed paths %v", paths)
+		}
+		select {
+		case changed <- struct{}{}:
+		default:
+		}
+		return true
+	})
+	defer fw.Close()
+	select {
+	case <-changed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("content edit with unchanged file metadata not detected")
+	}
+}

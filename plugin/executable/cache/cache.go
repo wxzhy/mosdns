@@ -79,6 +79,7 @@ var _ sequence.RecursiveExecutable = (*Cache)(nil)
 
 type Args struct {
 	Size                 int    `yaml:"size"`
+	Scope                string `yaml:"scope"`
 	LazyCacheTTL         int    `yaml:"lazy_cache_ttl"`
 	DumpFile             string `yaml:"dump_file"`
 	DumpInterval         int    `yaml:"dump_interval"`
@@ -127,6 +128,9 @@ type Cache struct {
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
+	if scope := args.(*Args).Scope; scope != "" && scope != "shared" && scope != "sequence" {
+		return nil, fmt.Errorf("invalid cache scope %q: want shared or sequence", scope)
+	}
 	c := NewCache(args.(*Args), Opts{
 		Logger:     bp.L(),
 		MetricsTag: bp.Tag(),
@@ -222,11 +226,19 @@ func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
 	return nil
 }
 
+func (c *Cache) queryKey(q *dns.Msg, next sequence.ChainWalker) string {
+	dnsKey := getMsgKey(q)
+	if c.args.Scope == "sequence" {
+		return scopedCacheKey(dnsKey, next.CacheScope())
+	}
+	return dnsKey
+}
+
 func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	c.queryTotal.Inc()
 	q := qCtx.Q()
 
-	msgKey := getMsgKey(q)
+	msgKey := c.queryKey(q, next)
 	if len(msgKey) == 0 { // skip cache
 		return next.ExecNext(ctx, qCtx)
 	}
@@ -262,7 +274,7 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 
 	err := next.ExecNext(ctx, qCtx)
 
-	if r := qCtx.R(); err == nil && r != nil && cachedResp != r && getMsgKey(qCtx.Q()) == msgKey {
+	if r := qCtx.R(); err == nil && r != nil && cachedResp != r && c.queryKey(qCtx.Q(), next) == msgKey {
 		// A failed chain may leave a partial response behind. Never cache it.
 		// Also reject queries whose EDNS options were changed downstream.
 		localNegative := qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)
@@ -300,7 +312,7 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 		}
 
 		r := qCtx.R()
-		if r != nil && err == nil && getMsgKey(qCtx.Q()) == msgKey {
+		if r != nil && err == nil && c.queryKey(qCtx.Q(), next) == msgKey {
 			c.refreshMu.Lock()
 			if generation == c.refreshGeneration && ctx.Err() == nil {
 				localNegative := qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)
@@ -402,8 +414,8 @@ func (c *Cache) doPrefetch(candidate prefetchCandidate) {
 	q.Question[0].Qclass = question.Qclass
 	// getMsgKey encodes AD, CD and DO in its first byte; retain those
 	// semantics for requests that use DNSSEC-related cache partitions.
-	if len(candidate.key) > 0 {
-		flags := candidate.key[0]
+	if dnsKey := rawDNSCacheKey(string(candidate.key)); len(dnsKey) > 0 {
+		flags := dnsKey[0]
 		q.AuthenticatedData = flags&1 != 0
 		q.CheckingDisabled = flags&2 != 0
 		if flags&4 != 0 {
@@ -423,7 +435,7 @@ func (c *Cache) doPrefetch(candidate prefetchCandidate) {
 		return
 	default:
 	}
-	if r := qCtx.R(); r != nil && getMsgKey(qCtx.Q()) == string(candidate.key) &&
+	if r := qCtx.R(); r != nil && c.queryKey(qCtx.Q(), candidate.next) == string(candidate.key) &&
 		saveRespToCacheWithSource(string(candidate.key), r, c.backend, c.args.LazyCacheTTL, v, &candidate.next,
 			qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)) {
 		c.updatedKey.Add(1)
@@ -535,7 +547,7 @@ func (c *Cache) dumpCache() error {
 
 func (c *Cache) Api() *chi.Mux {
 	r := chi.NewRouter()
-	r.Get("/flush", func(w http.ResponseWriter, req *http.Request) {
+	r.Post("/flush", func(w http.ResponseWriter, req *http.Request) {
 		c.Flush()
 	})
 	r.Get("/dump", func(w http.ResponseWriter, req *http.Request) {

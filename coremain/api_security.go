@@ -16,6 +16,13 @@ import (
 // A reverse proxy on loopback must implement its own access control.
 func ProtectAPI(next http.Handler, token string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// DNS rebinding can make an attacker-controlled hostname resolve to
+		// loopback and thus pass the RemoteAddr check. Only literal loopback
+		// names/addresses are accepted without explicit authentication.
+		if token == "" && !isLoopbackAPIHost(r.Host) {
+			http.Error(w, "untrusted management API host", http.StatusForbidden)
+			return
+		}
 		if origin := r.Header.Get("Origin"); origin != "" {
 			u, err := url.Parse(origin)
 			if err != nil || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") || !strings.EqualFold(u.Host, r.Host) {
@@ -44,4 +51,26 @@ func ProtectAPI(next http.Handler, token string) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isLoopbackAPIHost(authority string) bool {
+	if authority == "" {
+		return false
+	}
+	host := authority
+	if strings.HasPrefix(authority, "[") || strings.Count(authority, ":") == 1 {
+		var err error
+		host, _, err = net.SplitHostPort(authority)
+		if err != nil {
+			return false
+		}
+	} else if strings.Contains(authority, ":") {
+		// Reject ambiguous unbracketed IPv6 or malformed authorities.
+		return false
+	}
+	if strings.EqualFold(host, "localhost") || strings.EqualFold(host, "localhost.") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Unmap().IsLoopback()
 }

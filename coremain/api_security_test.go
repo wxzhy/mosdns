@@ -47,3 +47,30 @@ func TestProtectAPI(t *testing.T) {
 		})
 	}
 }
+
+func TestProtectAPIRejectsDNSRebindingHost(t *testing.T) {
+	backend := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	for _, tc := range []struct {
+		host, token, authorization string
+		want                       int
+	}{
+		{"rebind.attacker.example:9091", "", "", http.StatusForbidden},
+		{"127.0.0.1:9091", "", "", http.StatusNoContent},
+		{"[::1]:9091", "", "", http.StatusNoContent},
+		{"localhost:9091", "", "", http.StatusNoContent},
+		{"example.local:9091", "", "", http.StatusForbidden},
+		{"rebind.attacker.example:9091", "secret", "Bearer secret", http.StatusNoContent},
+	} {
+		r := httptest.NewRequest(http.MethodPost, "http://localhost/cache/clear", nil)
+		r.RemoteAddr = "127.0.0.1:5000"
+		r.Host = tc.host
+		r.Header.Set("Origin", "http://"+tc.host)
+		r.Header.Set("Authorization", tc.authorization)
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+		w := httptest.NewRecorder()
+		ProtectAPI(backend, tc.token).ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Errorf("Host %q token=%v: status %d, want %d", tc.host, tc.token != "", w.Code, tc.want)
+		}
+	}
+}

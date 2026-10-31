@@ -1,10 +1,25 @@
 package utils
 
 import (
+	"crypto/sha256"
+	"io"
 	"os"
 	"sync"
 	"time"
 )
+
+const (
+	largeWatchedFile  = 16 << 20
+	largeHashInterval = 30 * time.Second
+)
+
+// FileState combines filesystem metadata and a content fingerprint, so edits
+// that preserve both size and modification time can still be detected.
+type FileState struct {
+	info   os.FileInfo
+	digest [sha256.Size]byte
+	valid  bool
+}
 
 // FileWatcher periodically checks the state of the specified file paths.
 type FileWatcher struct {
@@ -29,12 +44,12 @@ func StartFileWatcher(files []string, interval time.Duration, onChange func(chan
 // SnapshotFileStates must run BEFORE loading the files. Passing its result to
 // StartFileWatcherFromSnapshot closes the gap between initial load and watcher
 // installation: an edit during loading is detected at the first poll.
-func SnapshotFileStates(files []string) map[string]os.FileInfo {
-	states := make(map[string]os.FileInfo, len(files))
+func SnapshotFileStates(files []string) map[string]FileState {
+	states := make(map[string]FileState, len(files))
 	for _, file := range files {
 		if file != "" {
 			if _, ok := states[file]; !ok {
-				states[file] = watchedFileInfo(file)
+				states[file] = readFileState(file)
 			}
 		}
 	}
@@ -43,10 +58,10 @@ func SnapshotFileStates(files []string) map[string]os.FileInfo {
 
 // StartFileWatcherFromSnapshot retries a failed reload on the next poll. The
 // callback returns true ONLY after the new state has been published.
-func StartFileWatcherFromSnapshot(files []string, initial map[string]os.FileInfo, interval time.Duration, onChange func(changedFiles []string) bool) *FileWatcher {
+func StartFileWatcherFromSnapshot(files []string, initial map[string]FileState, interval time.Duration, onChange func(changedFiles []string) bool) *FileWatcher {
 	// Own the path list: callers may reuse their configuration after startup.
 	paths := make([]string, 0, len(files))
-	states := make(map[string]os.FileInfo, len(files))
+	states := make(map[string]FileState, len(files))
 	for _, file := range files {
 		if file == "" {
 			continue
@@ -57,7 +72,7 @@ func StartFileWatcherFromSnapshot(files []string, initial map[string]os.FileInfo
 		if info, exists := initial[file]; exists {
 			states[file] = info
 		} else {
-			states[file] = watchedFileInfo(file)
+			states[file] = readFileState(file)
 		}
 		paths = append(paths, file)
 	}
@@ -75,6 +90,7 @@ func StartFileWatcherFromSnapshot(files []string, initial map[string]os.FileInfo
 		defer close(fw.done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		var lastLargeHash time.Time
 
 		for {
 			select {
@@ -82,13 +98,17 @@ func StartFileWatcherFromSnapshot(files []string, initial map[string]os.FileInfo
 				return
 			case <-ticker.C:
 				var changedFiles []string
-				nextStates := make(map[string]os.FileInfo)
+				nextStates := make(map[string]FileState)
+				hashLarge := time.Since(lastLargeHash) >= largeHashInterval
 				for _, file := range paths {
-					info := watchedFileInfo(file)
-					if !sameWatchedFile(states[file], info) {
-						nextStates[file] = info
+					current := readFileStateIfNeeded(file, states[file], hashLarge)
+					if !sameFileState(states[file], current) {
+						nextStates[file] = current
 						changedFiles = append(changedFiles, file)
 					}
+				}
+				if hashLarge {
+					lastLargeHash = time.Now()
 				}
 				if len(changedFiles) > 0 {
 					select {
@@ -106,6 +126,37 @@ func StartFileWatcherFromSnapshot(files []string, initial map[string]os.FileInfo
 		}
 	}()
 	return fw
+}
+
+func readFileState(file string) FileState {
+	return readFileStateIfNeeded(file, FileState{}, true)
+}
+
+func readFileStateIfNeeded(path string, previous FileState, checkLarge bool) FileState {
+	info := watchedFileInfo(path)
+	state := FileState{info: info}
+	if info == nil {
+		return state
+	}
+	if info.Size() > largeWatchedFile && !checkLarge && sameWatchedFile(previous.info, info) {
+		state.digest, state.valid = previous.digest, previous.valid
+		return state
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return state
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err == nil {
+		copy(state.digest[:], h.Sum(nil))
+		state.valid = true
+	}
+	return state
+}
+
+func sameFileState(a, b FileState) bool {
+	return sameWatchedFile(a.info, b.info) && a.valid == b.valid && (!a.valid || a.digest == b.digest)
 }
 
 func watchedFileInfo(file string) os.FileInfo {

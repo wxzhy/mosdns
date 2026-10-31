@@ -169,3 +169,29 @@ func TestLegacyCacheDumpKeyIsMigratedWithQCLASS(t *testing.T) {
 		t.Fatal("migrated CHAOS entry leaked into IN query cache")
 	}
 }
+
+func TestCacheFlushRequiresPOST(t *testing.T) {
+	c := NewCache(&Args{}, Opts{})
+	defer c.Close()
+	q := cacheSafetyQuery(dns.ClassINET)
+	key := key(getMsgKey(q.Q()))
+	if !saveRespToCache(string(key), cacheTestResponse(q.Q()), c.backend, 0) {
+		t.Fatal("failed to seed cache")
+	}
+	get := httptest.NewRecorder()
+	c.Api().ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/flush", nil))
+	if get.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /flush status=%d, want 405", get.Code)
+	}
+	if _, _, ok := c.backend.Get(key); !ok {
+		t.Fatal("GET /flush cleared the cache")
+	}
+	post := httptest.NewRecorder()
+	c.Api().ServeHTTP(post, httptest.NewRequest(http.MethodPost, "/flush", nil))
+	if post.Code != http.StatusOK {
+		t.Fatalf("POST /flush status=%d, want 200", post.Code)
+	}
+	if _, _, ok := c.backend.Get(key); ok {
+		t.Fatal("POST /flush did not clear the cache")
+	}
+}

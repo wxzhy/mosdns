@@ -20,6 +20,7 @@
 package cache
 
 import (
+	"encoding/binary"
 	"hash/maphash"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,34 @@ import (
 )
 
 type key string
+
+// A scope prefix is intentionally outside the ordinary DNS question key.
+// The format is also preserved in cache dumps to partition restored entries.
+func scopedCacheKey(dnsKey, scope string) string {
+	if dnsKey == "" || scope == "" {
+		return dnsKey
+	}
+	if len(scope) > 65535 {
+		return "" // never silently share an oversize scope
+	}
+	buf := make([]byte, 3+len(scope)+len(dnsKey))
+	buf[0] = 0xfe // outside the 0..7 DNS key flag range
+	binary.BigEndian.PutUint16(buf[1:3], uint16(len(scope)))
+	copy(buf[3:], scope)
+	copy(buf[3+len(scope):], dnsKey)
+	return string(buf)
+}
+
+func rawDNSCacheKey(raw string) string {
+	if len(raw) < 3 || raw[0] != 0xfe {
+		return raw
+	}
+	scopeLen := int(binary.BigEndian.Uint16([]byte(raw[1:3])))
+	if len(raw) <= 3+scopeLen {
+		return "" // corrupted scoped key
+	}
+	return raw[3+scopeLen:]
+}
 
 var seed = maphash.MakeSeed()
 
@@ -282,8 +311,18 @@ func saveRespToCacheWithSource(msgKey string, r *dns.Msg, backend *cache.Cache[k
 	}
 
 	now := time.Now()
+	storedResponse := copyNoOpt(r)
+	if r.Rcode == dns.RcodeNameError || (r.Rcode == dns.RcodeSuccess && len(r.Answer) == 0) {
+		// RFC 2308: the SOA in a cached negative reply must advertise no
+		// longer than the negative cache lifetime, not its original RR TTL.
+		for _, rr := range storedResponse.Ns {
+			if soa, ok := rr.(*dns.SOA); ok {
+				soa.Hdr.Ttl = min(soa.Hdr.Ttl, soa.Minttl)
+			}
+		}
+	}
 	v := &item{
-		resp:           copyNoOpt(r),
+		resp:           storedResponse,
 		storedTime:     now,
 		expirationTime: now.Add(msgTtl),
 		next:           next,

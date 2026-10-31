@@ -54,6 +54,25 @@ func NewChainWalker(chain []*ChainNode, jumpBack *ChainWalker) ChainWalker {
 	}
 }
 
+// CacheScope identifies this continuation for optional per-sequence cache
+// isolation. Named sequences use stable identifiers across process restarts;
+// anonymous callers fall back to a process-local chain identity.
+func (w ChainWalker) CacheScope() string {
+	tag := w.sequenceTag
+	if tag == "" {
+		if len(w.chain) > 0 {
+			tag = fmt.Sprintf("anonymous:%p", w.chain[0])
+		} else {
+			tag = "anonymous:empty"
+		}
+	}
+	scope := fmt.Sprintf("%s:%d", tag, w.p)
+	if w.jumpBack != nil {
+		scope += "/" + w.jumpBack.CacheScope()
+	}
+	return scope
+}
+
 func formatMatchConfig(mc MatchConfig) string {
 	s := mc.Type
 	if mc.Tag != "" {
