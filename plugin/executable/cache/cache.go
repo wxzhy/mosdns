@@ -273,6 +273,13 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	}
 
 	err := next.ExecNext(ctx, qCtx)
+	if err == nil {
+		if normalized := normalizeNegativeSOA(qCtx.R()); normalized != qCtx.R() {
+			snapshot := qCtx.SnapshotResponse()
+			snapshot.Response = normalized
+			qCtx.CommitResponse(snapshot)
+		}
+	}
 
 	if r := qCtx.R(); err == nil && r != nil && cachedResp != r && c.queryKey(qCtx.Q(), next) == msgKey {
 		// A failed chain may leave a partial response behind. Never cache it.
@@ -408,12 +415,13 @@ func (c *Cache) doPrefetch(candidate prefetchCandidate) {
 		return
 	}
 
+	// Prefetch is a DNS-query-level refresh, independent of the client that
+	// populated the shared cache. Never retain or replay a client's metadata.
 	q := new(dns.Msg)
 	question := v.resp.Question[0]
 	q.SetQuestion(question.Name, question.Qtype)
 	q.Question[0].Qclass = question.Qclass
-	// getMsgKey encodes AD, CD and DO in its first byte; retain those
-	// semantics for requests that use DNSSEC-related cache partitions.
+	// Preserve the DNSSEC query flags encoded in the cache key.
 	if dnsKey := rawDNSCacheKey(string(candidate.key)); len(dnsKey) > 0 {
 		flags := dnsKey[0]
 		q.AuthenticatedData = flags&1 != 0
@@ -422,12 +430,12 @@ func (c *Cache) doPrefetch(candidate prefetchCandidate) {
 			q.SetEdns0(1232, true)
 		}
 	}
+	qCtx := query_context.NewContext(q)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
 	defer cancel()
-	qCtx := query_context.NewContext(q)
 	if err := candidate.next.ExecNext(ctx, qCtx); err != nil {
 		c.prefetchFailTotal.Inc()
-		c.logger.Debug("proactive prefetch failed", zap.String("qname", question.Name), zap.Error(err))
+		c.logger.Debug("proactive prefetch failed", zap.String("qname", qCtx.QQuestion().Name), zap.Error(err))
 		return
 	}
 	select {
@@ -718,7 +726,10 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 				storedTime:     storedTime,
 				expirationTime: msgExpTime,
 			}
-			k, localNegative := decodeDumpEntryKey(entry.GetKey(), resp)
+			k, localNegative, err := validateDumpEntryKey(entry.GetKey(), resp)
+			if err != nil {
+				return fmt.Errorf("invalid cache dump entry: %w", err)
+			}
 			i.localNegative = localNegative
 			entries = append(entries, stagedEntry{key: k, value: i, expires: cacheExpTime})
 		}

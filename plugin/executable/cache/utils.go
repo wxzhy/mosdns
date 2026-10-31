@@ -21,6 +21,7 @@ package cache
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/maphash"
 	"sync/atomic"
 	"time"
@@ -170,6 +171,40 @@ func decodeDumpEntryKey(raw []byte, resp *dns.Msg) (key, bool) {
 		return migratedDumpKey(raw[2:], resp), raw[1]&1 != 0
 	}
 	return migratedDumpKey(raw, resp), false
+}
+
+// validateDumpEntryKey accepts the legacy, QCLASS-aware and scoped key
+// layouts, but never trusts a serialized key to identify an unrelated DNS
+// response. Validation runs before any imported entry is published.
+func validateDumpEntryKey(raw []byte, resp *dns.Msg) (key, bool, error) {
+	if resp == nil || !resp.Response || resp.Opcode != dns.OpcodeQuery ||
+		resp.Truncated || len(resp.Question) != 1 {
+		return "", false, fmt.Errorf("invalid cached DNS response")
+	}
+	k, localNegative := decodeDumpEntryKey(raw, resp)
+	encoded := string(k)
+	if len(encoded) > 0 && encoded[0] == 0xfe {
+		if len(encoded) < 4 {
+			return "", false, fmt.Errorf("invalid scoped cache key length")
+		}
+		scopeLen := int(binary.BigEndian.Uint16([]byte(encoded[1:3])))
+		if scopeLen == 0 || len(encoded) <= 3+scopeLen {
+			return "", false, fmt.Errorf("invalid scoped cache key")
+		}
+		encoded = encoded[3+scopeLen:]
+	}
+	question := resp.Question[0]
+	if len(encoded) != 7+len(question.Name) || encoded[0]&^byte(7) != 0 ||
+		binary.BigEndian.Uint16([]byte(encoded[1:3])) != question.Qtype ||
+		binary.BigEndian.Uint16([]byte(encoded[3:5])) != question.Qclass ||
+		int(binary.BigEndian.Uint16([]byte(encoded[5:7]))) != len(question.Name) ||
+		encoded[7:] != question.Name {
+		return "", false, fmt.Errorf("cache key does not match DNS question")
+	}
+	if localNegative && resp.Rcode != dns.RcodeNameError && resp.Rcode != dns.RcodeRefused {
+		return "", false, fmt.Errorf("negative source flag inconsistent with response")
+	}
+	return k, localNegative, nil
 }
 
 func copyNoOpt(m *dns.Msg) *dns.Msg {
@@ -335,4 +370,26 @@ func saveRespToCacheWithSource(msgKey string, r *dns.Msg, backend *cache.Cache[k
 	}
 	backend.Store(key(msgKey), v, now.Add(cacheTtl))
 	return true
+}
+
+// normalizeNegativeSOA clones a negative response only if it needs an SOA
+// TTL correction. The caller must preserve the other QueryContext metadata
+// when committing the copy. Upstream-owned response objects are not mutated.
+func normalizeNegativeSOA(r *dns.Msg) *dns.Msg {
+	if r == nil || (r.Rcode != dns.RcodeNameError && (r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0)) {
+		return r
+	}
+	var normalized *dns.Msg
+	for i, rr := range r.Ns {
+		if soa, ok := rr.(*dns.SOA); ok && soa.Hdr.Ttl > soa.Minttl {
+			if normalized == nil {
+				normalized = r.Copy()
+			}
+			normalized.Ns[i].Header().Ttl = soa.Minttl
+		}
+	}
+	if normalized != nil {
+		return normalized
+	}
+	return r
 }

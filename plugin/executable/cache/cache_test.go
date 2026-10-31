@@ -30,20 +30,18 @@ import (
 func Test_cachePlugin_Dump(t *testing.T) {
 	c := NewCache(&Args{Size: 16 * dumpBlockSize}, Opts{}) // Big enough to create dump fragments.
 
-	resp := new(dns.Msg)
-	resp.SetQuestion("test.", dns.TypeA)
-
 	now := time.Now()
 	hourLater := now.Add(time.Hour)
-	v := &item{
-		resp:           resp,
-		storedTime:     now,
-		expirationTime: hourLater,
-	}
 
-	// Fill the cache
+	// Populate the cache with valid DNS responses and question-derived keys.
+	// A dump whose key contradicts the response question must be rejected.
 	for i := 0; i < 32*dumpBlockSize; i++ {
-		c.backend.Store(key(strconv.Itoa(i)), v, hourLater)
+		q := new(dns.Msg).SetQuestion("test"+strconv.Itoa(i)+".", dns.TypeA)
+		resp := new(dns.Msg).SetReply(q)
+		resp.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 3600},
+		}}
+		c.backend.Store(key(getMsgKey(q)), &item{resp: resp, storedTime: now, expirationTime: hourLater}, hourLater)
 	}
 
 	buf := new(bytes.Buffer)
