@@ -27,6 +27,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/cache"
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"golang.org/x/exp/constraints"
 )
@@ -53,7 +54,19 @@ func getMsgKey(q *dns.Msg) string {
 	)
 
 	question := q.Question[0]
-	buf := make([]byte, 1+2+1+len(question.Name)) // bits + qtype + qname length + qname
+	// EDNS options such as ECS can change an upstream answer. Without a
+	// corresponding partition they must not share ordinary cached responses.
+	// Padding has no bearing on the DNS answer and may safely be ignored.
+	if opt := q.IsEdns0(); opt != nil {
+		for _, option := range opt.Option {
+			if option.Option() != dns.EDNS0PADDING {
+				return ""
+			}
+		}
+	}
+	// QCLASS is part of the DNS question. Include it to prevent IN and
+	// CHAOS/HESIOD queries from sharing cached responses.
+	buf := make([]byte, 1+2+2+2+len(question.Name)) // flags, type, class, name length, name
 	b := byte(0)
 	// RFC 6840 5.7: The AD bit in a query as a signal
 	// indicating that the requester understands and is interested in the
@@ -70,9 +83,37 @@ func getMsgKey(q *dns.Msg) string {
 	buf[0] = b
 	buf[1] = byte(question.Qtype << 8)
 	buf[2] = byte(question.Qtype)
-	buf[3] = byte(len(question.Name))
-	copy(buf[4:], question.Name)
+	buf[3] = byte(question.Qclass >> 8)
+	buf[4] = byte(question.Qclass)
+	buf[5] = byte(len(question.Name) >> 8)
+	buf[6] = byte(len(question.Name))
+	copy(buf[7:], question.Name)
 	return utils.BytesToStringUnsafe(buf)
+}
+
+// migratedDumpKey upgrades the pre-QCLASS layout used by existing
+// mosdns_cache_v2 dumps. The old key contained flags, type, one-byte name
+// length and name; reconstruct the class from the stored DNS question.
+// Unrecognized keys are left unchanged for backward-compatible imports.
+func migratedDumpKey(raw []byte, response *dns.Msg) key {
+	if response == nil || len(response.Question) != 1 {
+		return key(raw)
+	}
+	question := response.Question[0]
+	if len(raw) != 4+len(question.Name) || raw[0]&^byte(7) != 0 ||
+		uint16(raw[1])<<8|uint16(raw[2]) != question.Qtype ||
+		int(raw[3]) != len(question.Name)&0xff ||
+		string(raw[4:]) != question.Name {
+		return key(raw)
+	}
+	q := new(dns.Msg).SetQuestion(question.Name, question.Qtype)
+	q.Question[0].Qclass = question.Qclass
+	q.AuthenticatedData = raw[0]&1 != 0
+	q.CheckingDisabled = raw[0]&2 != 0
+	if raw[0]&4 != 0 {
+		q.SetEdns0(1232, true)
+	}
+	return key(getMsgKey(q))
 }
 
 type item struct {
@@ -80,6 +121,26 @@ type item struct {
 	storedTime     time.Time
 	expirationTime time.Time
 	hitCount       atomic.Uint32
+	next           *sequence.ChainWalker // nil for restored or test-only entries.
+	localNegative  bool
+}
+
+// The v2 dump message has no dedicated source-classification field.
+// Reserve an impossible cache-key first byte (normal flags use only 0..7)
+// for a versioned key envelope, preserving compatibility with old dumps.
+func encodeDumpEntryKey(k key, localNegative bool) []byte {
+	flags := byte(0)
+	if localNegative {
+		flags = 1
+	}
+	return append([]byte{0xff, flags}, []byte(k)...)
+}
+
+func decodeDumpEntryKey(raw []byte, resp *dns.Msg) (key, bool) {
+	if len(raw) > 2 && raw[0] == 0xff && raw[1]&^byte(1) == 0 {
+		return migratedDumpKey(raw[2:], resp), raw[1]&1 != 0
+	}
+	return migratedDumpKey(raw, resp), false
 }
 
 func copyNoOpt(m *dns.Msg) *dns.Msg {
@@ -172,24 +233,40 @@ func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item]
 // expected != nil means a background refresh may only replace that exact
 // cache entry. A concurrent update or Flush must not be undone by prefetch.
 func saveRespToCacheIf(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, expected *item) bool {
+	return saveRespToCacheWithSource(msgKey, r, backend, lazyCacheTtl, expected, nil, false)
+}
+
+// The continuation and source classification are immutable once published.
+func saveRespToCacheWithSource(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, expected *item, next *sequence.ChainWalker, localNegative bool) bool {
 	if r.Truncated != false {
 		return false
 	}
 
 	var msgTtl time.Duration
 	var cacheTtl time.Duration
+	negativeTTL := func() time.Duration {
+		for _, rr := range r.Ns {
+			if soa, ok := rr.(*dns.SOA); ok {
+				return time.Duration(min(soa.Hdr.Ttl, soa.Minttl)) * time.Second
+			}
+		}
+		return 0
+	}
 	switch r.Rcode {
 	case dns.RcodeNameError:
-		msgTtl = time.Second * 30
+		msgTtl = negativeTTL()
 		cacheTtl = msgTtl
 	case dns.RcodeServerFailure:
 		msgTtl = time.Second * 5
 		cacheTtl = msgTtl
 	case dns.RcodeSuccess:
 		minTTL := dnsutils.GetMinimalTTL(r)
-		if len(r.Answer) == 0 { // Empty answer. Set ttl between 0~300.
-			const maxEmtpyAnswerTtl = 300
-			msgTtl = time.Duration(min(minTTL, maxEmtpyAnswerTtl)) * time.Second
+		if len(r.Answer) == 0 && negativeTTL() > 0 {
+			msgTtl = negativeTTL()
+			cacheTtl = msgTtl
+		} else if len(r.Answer) == 0 {
+			// Do not cache an indeterminate empty answer without an SOA.
+			msgTtl = 0
 			cacheTtl = msgTtl
 		} else {
 			msgTtl = time.Duration(minTTL) * time.Second
@@ -209,6 +286,8 @@ func saveRespToCacheIf(msgKey string, r *dns.Msg, backend *cache.Cache[key, *ite
 		resp:           copyNoOpt(r),
 		storedTime:     now,
 		expirationTime: now.Add(msgTtl),
+		next:           next,
+		localNegative:  localNegative,
 	}
 	if expected != nil {
 		return backend.StoreIf(key(msgKey), v, now.Add(cacheTtl), func(old *item) bool {

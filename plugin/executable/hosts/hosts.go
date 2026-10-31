@@ -88,6 +88,7 @@ func newHosts(bp *coremain.BP, args *Args, interval time.Duration) (*Hosts, erro
 		}
 		return hosts.NewHosts(m), nil
 	}
+	initial := utils.SnapshotFileStates(files)
 	h, err := load()
 	if err != nil {
 		return nil, err
@@ -99,14 +100,15 @@ func newHosts(bp *coremain.BP, args *Args, interval time.Duration) (*Hosts, erro
 		if bp != nil {
 			logger = bp.L()
 		}
-		p.fw = utils.StartFileWatcher(files, interval, func(changed []string) {
+		p.fw = utils.StartFileWatcherFromSnapshot(files, initial, interval, func(changed []string) bool {
 			h, err := load()
 			if err != nil {
 				logger.Error("failed to reload hosts", zap.Error(err))
-				return
+				return false
 			}
 			p.h.Store(h)
 			logger.Info("reloaded hosts", zap.Strings("files", changed))
+			return true
 		})
 	}
 	return p, nil

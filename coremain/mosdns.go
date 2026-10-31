@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"sync"
+	"time"
 )
 
 type Mosdns struct {
@@ -114,8 +115,9 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	// Start http api server
 	if httpAddr := cfg.API.HTTP; len(httpAddr) > 0 {
 		httpServer := &http.Server{
-			Addr:    httpAddr,
-			Handler: m.httpMux,
+			Addr:              httpAddr,
+			Handler:           ProtectAPI(m.httpMux, cfg.API.Token),
+			ReadHeaderTimeout: 5 * time.Second,
 		}
 		m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
 			defer done()

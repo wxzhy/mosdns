@@ -32,6 +32,7 @@ import (
 // ParseRules reads AdBlock rules from r and adds them to blacklist and whitelist matchers.
 func ParseRules(r io.Reader, blacklist, whitelist *domain.MixMatcher[struct{}]) error {
 	scanner := bufio.NewScanner(r)
+	valid, invalid := 0, 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || line[0] == '!' || line[0] == '#' {
@@ -46,7 +47,11 @@ func ParseRules(r io.Reader, blacklist, whitelist *domain.MixMatcher[struct{}]) 
 						break
 					}
 					if host != "" && host != "localhost" {
-						_ = blacklist.Add("full:"+host, struct{}{})
+						if err := blacklist.Add("full:"+host, struct{}{}); err != nil {
+							invalid++
+						} else {
+							valid++
+						}
 					}
 				}
 				continue
@@ -85,11 +90,18 @@ func ParseRules(r io.Reader, blacklist, whitelist *domain.MixMatcher[struct{}]) 
 		}
 
 		if err := parseAndAddRule(line, target); err != nil {
-			// Skip invalid rules but maybe we should log them?
+			invalid++
 			continue
 		}
+		valid++
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	if invalid > 0 && valid == 0 {
+		return fmt.Errorf("all %d adblock rules were invalid", invalid)
+	}
+	return nil
 }
 
 func parseAndAddRule(rule string, m *domain.MixMatcher[struct{}]) error {

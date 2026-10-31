@@ -48,5 +48,6 @@ type PluginConfig struct {
 }
 
 type APIConfig struct {
-	HTTP string `yaml:"http"`
+	HTTP  string `yaml:"http"`
+	Token string `yaml:"token"`
 }

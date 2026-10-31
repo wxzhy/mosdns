@@ -451,6 +451,10 @@ func rebuildRecords(anchor *Candidate, records []dns.RR, contributors map[*Candi
 	upstreamOpt, respOpt := rebuiltOpts(anchor, contributors)
 	snapshot := query_context.ResponseSnapshot{Response: r, UpstreamOpt: upstreamOpt, RespOpt: respOpt, ReceivedAt: now, ValidUntil: bounds.validUntil}
 	snapshot.CopyMetadataFrom(anchor.Snapshot)
+	// The anchor is the owner of the synthesized response. Do not union
+	// arbitrary KV from the other contributing address sources: their keys
+	// could conflict, and their marks may describe a different route.
+	snapshot.CopyMarksAndValuesFrom(anchor.Snapshot)
 	return snapshot
 }
 

@@ -113,6 +113,7 @@ func newAdblockSet(bp *coremain.BP, args *Args, interval time.Duration) (*Adbloc
 		return m, nil
 	}
 
+	initial := utils.SnapshotFileStates(files)
 	m, err := loadInner()
 	if err != nil {
 		return nil, err
@@ -120,13 +121,15 @@ func newAdblockSet(bp *coremain.BP, args *Args, interval time.Duration) (*Adbloc
 	ds.matcher.Store(m)
 
 	if len(files) > 0 {
-		ds.fw = utils.StartFileWatcher(files, interval, func(changedFiles []string) {
+		ds.fw = utils.StartFileWatcherFromSnapshot(files, initial, interval, func(changedFiles []string) bool {
 			newM, err := loadInner()
 			if err == nil {
 				ds.matcher.Store(newM)
 				logger.Info("reloaded adblock files", zap.Strings("files", changedFiles))
+				return true
 			} else {
 				logger.Error("failed to reload adblock files", zap.Error(err))
+				return false
 			}
 		})
 	}

@@ -156,12 +156,15 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			qCtx.SetResponse(r)
 			return nil
 		case <-shouldPass:
-			*qCtx = *qCtxOrg // replace qCtx
+			// This branch can also change the query and ServerMeta, unlike a
+			// response-only selector. CopyTo is a full-context replacement
+			// (including marks/KV deletions), not a response-only commit.
+			qCtxOrg.CopyTo(qCtx)
 			return err
 		case <-waitTimeoutTimer.C:
 			// We have been waiting the reference query for too long.
 			// Something may go wrong. We accept the original reply.
-			*qCtx = *qCtxOrg
+			qCtxOrg.CopyTo(qCtx)
 			return err
 		}
 	}

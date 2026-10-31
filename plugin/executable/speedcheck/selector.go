@@ -375,7 +375,10 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 			outcome = "closed"
 			return s.lifetime.Err()
 		}
-		qCtx.CommitResponse(snapshot)
+		// Only the chosen anchor source contributes marks/KV. The response
+		// builder preserves that state even when it combines addresses from
+		// other compatible sources. A failing or losing source cannot leak it.
+		qCtx.CommitResponse(snapshot, query_context.CommitMerge)
 		outcome = kind
 		return nil
 	}

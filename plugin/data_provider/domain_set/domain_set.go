@@ -105,6 +105,7 @@ func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
 		}
 		return &mg, nil
 	}
+	initial := utils.SnapshotFileStates(args.Files)
 	mg, err := load()
 	if err != nil {
 		return nil, err
@@ -115,14 +116,15 @@ func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
 		if bp != nil {
 			logger = bp.L()
 		}
-		ds.fw = utils.StartFileWatcher(args.Files, 3*time.Second, func(changed []string) {
+		ds.fw = utils.StartFileWatcherFromSnapshot(args.Files, initial, 3*time.Second, func(changed []string) bool {
 			m, err := load()
 			if err != nil {
 				logger.Error("failed to reload domain_set", zap.Error(err))
-				return
+				return false
 			}
 			ds.mg.Store(m)
 			logger.Info("reloaded domain_set", zap.Strings("files", changed))
+			return true
 		})
 	}
 	return ds, nil

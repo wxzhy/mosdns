@@ -28,7 +28,7 @@ import (
 func mergedProfileConfig(t *testing.T, path string) coremain.Config {
 	t.Helper()
 	cfg := smartdnsMigrationConfig(t, path)
-	if cfg.Log.Level != "info" || cfg.Log.File != "/var/log/mosdns.log" || cfg.API.HTTP != "0.0.0.0:9091" || len(cfg.Include) != 0 {
+	if cfg.Log.Level != "info" || cfg.Log.File != "/var/log/mosdns.log" || cfg.API.HTTP != "127.0.0.1:9091" || len(cfg.Include) != 0 {
 		t.Fatalf("shared logging/API basics were not merged: log=%+v api=%+v include=%v", cfg.Log, cfg.API, cfg.Include)
 	}
 	if len(cfg.Plugins) == 0 || cfg.Plugins[0].Tag != "stats_collector" || cfg.Plugins[0].Type != "stats_api" {

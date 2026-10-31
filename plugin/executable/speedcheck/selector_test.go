@@ -309,7 +309,7 @@ func TestDisabledProbesKeepUnmeasuredAddresses(t *testing.T) {
 	})
 }
 
-func TestDNSSECWholeSourceAndOnlySnapshotCommit(t *testing.T) {
+func TestDNSSECWholeSourceCommitsWinningBranchState(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		first := delayedSource("one", 0, "192.0.2.1", "192.0.2.2")
 		base := first.Exec
@@ -326,6 +326,8 @@ func TestDNSSECWholeSourceAndOnlySnapshotCommit(t *testing.T) {
 		})
 		s := testSelector(t, Args{Mode: ModeWaitAll}, []Source{first}, Options{Probe: fakeProbe(0, map[string]time.Duration{"192.0.2.1": time.Millisecond, "192.0.2.2": 2 * time.Millisecond}, nil)})
 		q := queryContext(true)
+		q.SetMark(7)
+		q.StoreValue(37, "parent")
 		before := q.Q().Copy()
 		if err := s.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
@@ -333,14 +335,59 @@ func TestDNSSECWholeSourceAndOnlySnapshotCommit(t *testing.T) {
 		if len(answerIPs(q)) != 2 || !q.R().AuthenticatedData || !q.R().Authoritative {
 			t.Fatal("DNSSEC source was rewritten")
 		}
-		if q.HasMark(91) {
-			t.Fatal("child mark escaped")
+		if !q.HasMark(7) || !q.HasMark(91) {
+			t.Fatal("selected source marks were not merged")
 		}
-		if _, ok := q.GetValue(37); ok {
-			t.Fatal("child kv escaped")
+		if value, ok := q.GetValue(37); !ok || value != "child" {
+			t.Fatalf("selected source KV was not merged: %v", value)
 		}
 		if q.Q().String() != before.String() {
 			t.Fatal("parent query mutated")
+		}
+	})
+}
+
+func TestSelectedAddressSourceAloneContributesMarksAndKV(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		key := query_context.RegKey()
+		parentOnly := query_context.RegKey()
+		makeSource := func(tag string, mark uint32, ip string) Source {
+			base := delayedSource(tag, 0, ip)
+			return Source{Tag: tag, Exec: sequence.ExecutableFunc(func(ctx context.Context, branch *query_context.Context) error {
+				if err := base.Exec.Exec(ctx, branch); err != nil {
+					return err
+				}
+				branch.DeleteMark(7)
+				branch.SetMark(mark)
+				branch.StoreValue(key, tag)
+				branch.DeleteValue(parentOnly)
+				return nil
+			})}
+		}
+		s := testSelector(t, Args{Mode: ModeWaitAll, MaxNum: 2, ThresholdMS: floatptr(100)},
+			[]Source{makeSource("slower", 81, "192.0.2.1"), makeSource("winner", 82, "192.0.2.2")},
+			Options{Probe: fakeProbe(0, map[string]time.Duration{
+				"192.0.2.1": 20 * time.Millisecond,
+				"192.0.2.2": time.Millisecond,
+			}, nil)})
+		parent := queryContext(false)
+		parent.SetMark(7)
+		parent.StoreValue(key, "parent")
+		parent.StoreValue(parentOnly, "keep")
+		if err := s.Exec(context.Background(), parent); err != nil {
+			t.Fatal(err)
+		}
+		if got := answerIPs(parent); !slices.Equal(got, []string{"192.0.2.2", "192.0.2.1"}) {
+			t.Fatalf("expected rebuilt answer using both sources: %v", got)
+		}
+		if !parent.HasMark(7) || !parent.HasMark(82) || parent.HasMark(81) {
+			t.Fatal("state leaked from other address source or selected marks were lost")
+		}
+		if got, _ := parent.GetValue(key); got != "winner" {
+			t.Fatalf("wrong anchor KV: %v", got)
+		}
+		if got, _ := parent.GetValue(parentOnly); got != "keep" {
+			t.Fatalf("merge propagated a deletion: %v", got)
 		}
 	})
 }

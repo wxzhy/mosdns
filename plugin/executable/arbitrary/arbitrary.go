@@ -82,6 +82,7 @@ func newArbitrary(bp *coremain.BP, args *Args, interval time.Duration) (*Arbitra
 		}
 		return m, nil
 	}
+	initial := utils.SnapshotFileStates(files)
 	m, err := load()
 	if err != nil {
 		return nil, err
@@ -93,14 +94,15 @@ func newArbitrary(bp *coremain.BP, args *Args, interval time.Duration) (*Arbitra
 		if bp != nil {
 			logger = bp.L()
 		}
-		a.fw = utils.StartFileWatcher(files, interval, func(changed []string) {
+		a.fw = utils.StartFileWatcherFromSnapshot(files, initial, interval, func(changed []string) bool {
 			m, err := load()
 			if err != nil {
 				logger.Error("failed to reload arbitrary", zap.Error(err))
-				return
+				return false
 			}
 			a.m.Store(m)
 			logger.Info("reloaded arbitrary", zap.Strings("files", changed))
+			return true
 		})
 	}
 	return a, nil

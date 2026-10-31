@@ -105,6 +105,7 @@ func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
 		}
 		return &mg, nil
 	}
+	initial := utils.SnapshotFileStates(args.Files)
 	mg, err := load()
 	if err != nil {
 		return nil, err
@@ -115,14 +116,15 @@ func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
 		if bp != nil {
 			logger = bp.L()
 		}
-		p.fw = utils.StartFileWatcher(args.Files, 3*time.Second, func(changed []string) {
+		p.fw = utils.StartFileWatcherFromSnapshot(args.Files, initial, 3*time.Second, func(changed []string) bool {
 			m, err := load()
 			if err != nil {
 				logger.Error("failed to reload ip_set", zap.Error(err))
-				return
+				return false
 			}
 			p.mg.Store(m)
 			logger.Info("reloaded ip_set", zap.Strings("files", changed))
+			return true
 		})
 	}
 	return p, nil

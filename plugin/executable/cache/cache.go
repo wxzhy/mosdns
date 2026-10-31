@@ -113,6 +113,7 @@ type Cache struct {
 	// dumpMu serializes Close's final dump against the dump loop, and guards
 	// the temp-file swap so two dumps never interleave on the same path.
 	dumpMu sync.Mutex
+	dumpWG sync.WaitGroup
 
 	queryTotal        prometheus.Counter
 	hitTotal          prometheus.Counter
@@ -120,8 +121,6 @@ type Cache struct {
 	size              prometheus.GaugeFunc
 	prefetchTotal     prometheus.Counter
 	prefetchFailTotal prometheus.Counter
-	capturedNext      atomic.Pointer[sequence.ChainWalker]
-	captureOnce       sync.Once
 	prefetchWG        sync.WaitGroup
 	prefetchJobs      chan prefetchCandidate
 	prefetchPending   sync.Map // key -> struct{}; queued and running jobs
@@ -224,9 +223,6 @@ func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
 }
 
 func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
-	if c.args.Prefetch {
-		c.captureOnce.Do(func() { copied := next; c.capturedNext.Store(&copied) })
-	}
 	c.queryTotal.Inc()
 	q := qCtx.Q()
 
@@ -236,6 +232,9 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	}
 
 	cachedResp, lazyHit := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
+	// Cache hits intentionally share answers across compatible chains (e.g.
+	// auxiliary A and normal A resolution). Prefetch instead uses the
+	// continuation that actually PRODUCED each entry, never a global first one.
 	if lazyHit {
 		c.lazyHitTotal.Inc()
 		c.doLazyUpdate(msgKey, qCtx, next)
@@ -250,6 +249,7 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 			ttl := int(v.expirationTime.Sub(v.storedTime).Seconds())
 			remaining := max(0, int(time.Until(v.expirationTime).Seconds()))
 			qCtx.SetCacheState(true, lazyHit, ttl, remaining)
+			qCtx.CacheState.LocalNegative = v.localNegative
 			if c.args.Prefetch {
 				v.hitCount.Add(1)
 			}
@@ -262,9 +262,13 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 
 	err := next.ExecNext(ctx, qCtx)
 
-	if r := qCtx.R(); r != nil && cachedResp != r { // pointer compare. r is not cachedResp
-		saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
-		c.updatedKey.Add(1)
+	if r := qCtx.R(); err == nil && r != nil && cachedResp != r && getMsgKey(qCtx.Q()) == msgKey {
+		// A failed chain may leave a partial response behind. Never cache it.
+		// Also reject queries whose EDNS options were changed downstream.
+		localNegative := qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)
+		if saveRespToCacheWithSource(msgKey, r, c.backend, c.args.LazyCacheTTL, nil, &next, localNegative) {
+			c.updatedKey.Add(1)
+		}
 	}
 	return err
 }
@@ -296,10 +300,11 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 		}
 
 		r := qCtx.R()
-		if r != nil && err == nil {
+		if r != nil && err == nil && getMsgKey(qCtx.Q()) == msgKey {
 			c.refreshMu.Lock()
 			if generation == c.refreshGeneration && ctx.Err() == nil {
-				if saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL) {
+				localNegative := qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)
+				if saveRespToCacheWithSource(msgKey, r, c.backend, c.args.LazyCacheTTL, nil, &next, localNegative) {
 					c.updatedKey.Add(1)
 				}
 			}
@@ -343,15 +348,11 @@ func (c *Cache) startPrefetchLoop() {
 			case <-c.closeNotify:
 				return
 			case <-ticker.C:
-				next := c.capturedNext.Load()
-				if next == nil {
-					continue
-				}
 				now := time.Now()
 				// Range holds cache map locks: only enqueue here, never run I/O
 				// or write back inside its callback.
 				_ = c.backend.Range(func(k key, v *item, _ time.Time) error {
-					if v == nil || v.resp == nil || len(v.resp.Question) != 1 {
+					if v == nil || v.resp == nil || v.next == nil || len(v.resp.Question) != 1 {
 						return nil
 					}
 					remaining := v.expirationTime.Sub(now)
@@ -359,7 +360,7 @@ func (c *Cache) startPrefetchLoop() {
 						if _, loaded := c.prefetchPending.LoadOrStore(k, struct{}{}); loaded {
 							return nil
 						}
-						candidate := prefetchCandidate{key: k, item: v, next: *next}
+						candidate := prefetchCandidate{key: k, item: v, next: *v.next}
 						select {
 						case <-c.closeNotify:
 							c.prefetchPending.Delete(k)
@@ -422,8 +423,9 @@ func (c *Cache) doPrefetch(candidate prefetchCandidate) {
 		return
 	default:
 	}
-	if r := qCtx.R(); r != nil &&
-		saveRespToCacheIf(string(candidate.key), r, c.backend, c.args.LazyCacheTTL, v) {
+	if r := qCtx.R(); r != nil && getMsgKey(qCtx.Q()) == string(candidate.key) &&
+		saveRespToCacheWithSource(string(candidate.key), r, c.backend, c.args.LazyCacheTTL, v, &candidate.next,
+			qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)) {
 		c.updatedKey.Add(1)
 		c.prefetchTotal.Inc()
 	} else {
@@ -443,6 +445,7 @@ func (c *Cache) Close() error {
 	})
 	c.prefetchWG.Wait()
 	c.lazyWG.Wait()
+	c.dumpWG.Wait()
 	if err := c.dumpCache(); err != nil {
 		c.logger.Error("failed to dump cache", zap.Error(err))
 	}
@@ -471,7 +474,9 @@ func (c *Cache) startDumpLoop() {
 	if len(c.args.DumpFile) == 0 {
 		return
 	}
+	c.dumpWG.Add(1)
 	go func() {
+		defer c.dumpWG.Done()
 		ticker := time.NewTicker(time.Duration(c.args.DumpInterval) * time.Second)
 		defer ticker.Stop()
 		for {
@@ -598,7 +603,7 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 			return fmt.Errorf("failed to pack msg, %w", err)
 		}
 		e := &CachedEntry{
-			Key:                 []byte(k),
+			Key:                 encodeDumpEntryKey(k, v.localNegative),
 			CacheExpirationTime: cacheExpirationTime.Unix(),
 			MsgExpirationTime:   v.expirationTime.Unix(),
 			MsgStoredTime:       v.storedTime.Unix(),
@@ -627,6 +632,9 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 // readDump reads dumped data from r. It returns the number of bytes read,
 // number of entries read and any error encountered.
 func (c *Cache) readDump(r io.Reader) (int, error) {
+	c.refreshMu.Lock()
+	generation := c.refreshGeneration
+	c.refreshMu.Unlock()
 	en := 0
 	gr, err := gzip.NewReader(r)
 	if err != nil {
@@ -635,6 +643,16 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 	if gr.Name != dumpHeader {
 		return en, fmt.Errorf("invalid or old cache dump, header is %s, want %s", gr.Name, dumpHeader)
 	}
+
+	// Decode and validate the whole stream before touching the live cache.
+	// A later corrupt block or gzip checksum must not leave an import half
+	// applied. Keep staging bounded by the configured cache capacity.
+	type stagedEntry struct {
+		key     key
+		value   *item
+		expires time.Time
+	}
+	entries := make([]stagedEntry, 0)
 
 	var errReadHeaderEOF = errors.New("")
 	readBlock := func() error {
@@ -664,6 +682,9 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 			return fmt.Errorf("failed to decode block data, %w", err)
 		}
 
+		if len(block.GetEntries()) > max(1024, c.args.Size)-len(entries) {
+			return fmt.Errorf("cache dump exceeds configured capacity")
+		}
 		en += len(block.GetEntries())
 		for _, entry := range block.GetEntries() {
 			cacheExpTime := time.Unix(entry.GetCacheExpirationTime(), 0)
@@ -685,7 +706,9 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 				storedTime:     storedTime,
 				expirationTime: msgExpTime,
 			}
-			c.backend.Store(key(entry.GetKey()), i, cacheExpTime)
+			k, localNegative := decodeDumpEntryKey(entry.GetKey(), resp)
+			i.localNegative = localNegative
+			entries = append(entries, stagedEntry{key: k, value: i, expires: cacheExpTime})
 		}
 		return nil
 	}
@@ -703,5 +726,22 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 	if err != nil {
 		return en, err
 	}
-	return en, gr.Close()
+	if err := gr.Close(); err != nil {
+		return en, err
+	}
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	if c.refreshGeneration != generation {
+		return en, fmt.Errorf("cache dump import interrupted by flush or shutdown")
+	}
+	select {
+	case <-c.closeNotify:
+		return en, fmt.Errorf("cache is closing")
+	default:
+	}
+	for _, entry := range entries {
+		c.backend.Store(entry.key, entry.value, entry.expires)
+	}
+	c.updatedKey.Add(uint64(len(entries)))
+	return en, nil
 }

@@ -1643,5 +1643,5 @@ plugins:
     entry: main
     listen: '[::]:5335'
 api:
-  http: 0.0.0.0:9091
+  http: 127.0.0.1:9091
 include: []

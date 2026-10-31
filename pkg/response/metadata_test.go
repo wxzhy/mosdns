@@ -18,6 +18,14 @@ func withTestMetadata(s query_context.ResponseSnapshot, tag string) query_contex
 	return s
 }
 
+func withTestBranchState(q *dns.Msg, snapshot query_context.ResponseSnapshot, mark, key uint32, value string) query_context.ResponseSnapshot {
+	branch := query_context.NewContext(q.Copy())
+	branch.CommitResponse(snapshot)
+	branch.SetMark(mark)
+	branch.StoreValue(key, value)
+	return branch.SnapshotResponse()
+}
+
 func assertRebuiltMetadata(t *testing.T, got *query_context.ResponseSnapshot, source query_context.ResponseSnapshot) {
 	t.Helper()
 	if got.UpstreamSelected == nil || got.UpstreamSelected.Tag != "anchor" || len(got.RuleHits) != 1 || got.RuleHits[0].Sequence != "anchor" || got.RuleHits[0].Matches[0] != "qname example.test" || got.CacheState != source.CacheState || !got.FromArbitrary || got.FromHosts {
@@ -38,13 +46,16 @@ func TestRebuiltAddressResponsesRetainOnlyAnchorMetadata(t *testing.T) {
 		t.Run(operation, func(t *testing.T) {
 			q := testQuery("example.test.", dns.TypeA)
 			s := withTestMetadata(testSnapshot(t, q, "example.test. 60 IN A 192.0.2.1"), "anchor")
+			key := query_context.RegKey()
+			s = withTestBranchState(q, s, 91, key, "anchor")
 			anchor := testCandidate(t, q, s, testNow)
 			now := testNow.Add(time.Second)
 			var got query_context.ResponseSnapshot
 			var err error
 			switch operation {
 			case "select":
-				other := testCandidate(t, q, withTestMetadata(testSnapshot(t, q, "example.test. 60 IN A 192.0.2.2"), "other"), testNow)
+				otherState := withTestBranchState(q, withTestMetadata(testSnapshot(t, q, "example.test. 60 IN A 192.0.2.2"), "other"), 92, key, "other")
+				other := testCandidate(t, q, otherState, testNow)
 				got, err = Rebuild(anchor, []SelectedAddress{{Candidate: other, Address: other.Addresses[0]}}, now)
 			case "replace":
 				got, err = ReplaceAddresses(anchor, []netip.Addr{netip.MustParseAddr("192.0.2.3")}, now)
@@ -55,6 +66,16 @@ func TestRebuiltAddressResponsesRetainOnlyAnchorMetadata(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertRebuiltMetadata(t, &got, anchor.Snapshot)
+			parent := query_context.NewContext(q.Copy())
+			parent.SetMark(7)
+			parent.StoreValue(key, "parent")
+			parent.CommitResponse(got, query_context.CommitMerge)
+			if !parent.HasMark(7) || !parent.HasMark(91) || parent.HasMark(92) {
+				t.Fatal("rebuilt response lost anchor marks or merged another source")
+			}
+			if value, ok := parent.GetValue(key); !ok || value != "anchor" {
+				t.Fatalf("rebuilt response lost anchor KV: %v", value)
+			}
 		})
 	}
 }
@@ -62,6 +83,8 @@ func TestRebuiltAddressResponsesRetainOnlyAnchorMetadata(t *testing.T) {
 func TestSynthesizedBindingsRetainAnchorMetadata(t *testing.T) {
 	q := testQuery("example.test.", dns.TypeHTTPS)
 	s := withTestMetadata(testSnapshot(t, q), "anchor")
+	key := query_context.RegKey()
+	s = withTestBranchState(q, s, 37, key, "binding")
 	candidate, err := AnalyzeBindings(q, s, testNow)
 	if err != nil {
 		t.Fatal(err)
@@ -71,4 +94,12 @@ func TestSynthesizedBindingsRetainAnchorMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertRebuiltMetadata(t, &got, candidate.Snapshot)
+	parent := query_context.NewContext(q.Copy())
+	parent.CommitResponse(got, query_context.CommitMerge)
+	if !parent.HasMark(37) {
+		t.Fatal("synthesized binding lost anchor mark")
+	}
+	if value, _ := parent.GetValue(key); value != "binding" {
+		t.Fatalf("synthesized binding lost anchor KV: %v", value)
+	}
 }

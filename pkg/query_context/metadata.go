@@ -1,6 +1,9 @@
 package query_context
 
-import "slices"
+import (
+	"maps"
+	"slices"
+)
 
 type UpstreamLog struct {
 	Addr     string
@@ -16,10 +19,11 @@ type RuleHit struct {
 }
 
 type CacheLog struct {
-	Hit          bool
-	LazyHit      bool
-	TTL          int
-	RemainingTTL int
+	Hit           bool
+	LazyHit       bool
+	TTL           int
+	RemainingTTL  int
+	LocalNegative bool
 }
 
 func (ctx *Context) AddRuleHit(seq string, matches []string, exec string) {
@@ -68,6 +72,16 @@ func (s *ResponseSnapshot) CopyMetadataFrom(src ResponseSnapshot) {
 	s.CacheState = src.CacheState
 	s.FromHosts = src.FromHosts
 	s.FromArbitrary = src.FromArbitrary
+}
+
+// CopyMarksAndValuesFrom copies the selected source's branch state without
+// changing DNS response or statistics metadata. This is intentionally separate
+// from CopyMetadataFrom: a response rewrite must explicitly choose which
+// candidate owns the resulting marks and values.
+// KV values are opaque and are not deep-copied (as with Context.CopyTo).
+func (s *ResponseSnapshot) CopyMarksAndValuesFrom(src ResponseSnapshot) {
+	s.marks = maps.Clone(src.marks)
+	s.kv = maps.Clone(src.kv)
 }
 
 func cloneUpstreamLog(src *UpstreamLog) *UpstreamLog {

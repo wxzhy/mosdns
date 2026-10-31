@@ -14,11 +14,11 @@
 | 203 HTTP 非法请求 | 已有显式 HTTP 400 响应，直接回归覆盖错误请求。 |
 | 204 黑洞地址洗牌 | 已有请求内地址副本和洗牌，结合 229 避免修改共享配置。 |
 | 205、209、212、215 日志 | 已有格式化时间、文件轮转、外部截断保护，默认 5 MiB、0 备份；补充尺寸乘法溢出拒绝及合法备份时间戳校验，避免清理无关文件。 |
-| 206 文本规则重载 | 已有文件轮询及 matcher 原子切换，覆盖 domain/ip/adblock 集合、redirect、hosts 和 arbitrary。返回加载错误时保留有效旧数据，关闭等待回调结束；解析器跳过无效行并不属于返回错误。另有建立监视基线的窗口，见功能复核。GeoData 数据库仍按其加载缓存语义处理。 |
+| 206 文本规则重载 | 文件轮询与 matcher 原子切换覆盖 domain/ip/adblock 集合、redirect、hosts 和 arbitrary。现在加载前记录文件状态，避免初始化窗口漏更新；失败时保留旧匹配器并持续重试。广告文件全无效时拒绝覆盖，合法空文件仍可清空。GeoData 数据库仍按其独立加载缓存语义处理。 |
 | 207、208、210 广告规则 | 已有实际 `adblock_set` provider，支持原补丁的 ABP、hosts、多域名、例外和裸域名/完整匹配语义，含 229 的解析修复；已修复原生正则末尾 `$` 锚点误删。 |
 | 211 查询日志 | 核查时仅统计元数据完整，逐查询日志入口和协议传递缺失。本次补齐 UDP/TCP/DoT/DoH/DoQ 协议、Info 单次查询日志、Debug 规则明细、上游/缓存/答案/耗时等字段。日志级别按实例判断，避免跨实例全局级别耦合。 |
-| 213、214 缓存预取 | 已有命中计数、后台预取和加载恢复；另含有界并发、去重、刷新前复查及条件写回。已补缓存转储存储时间、旧转储 TTL 兼容恢复及 lazy 刷新与 Flush/Close 的代际和取消保护；预取首次捕获 continuation 的多调用位置限制仍存在，默认不启用预取。 |
-| 216–224、226、228、230、231 统计 | 已有历史 API 与短路径别名、环形日志、热门与历史、QPS、v1 gzip 转储，以及缓存分母、hosts/arbitrary、超时、合法负响应和 loopback 分类。已修正被拦截请求的缓存命中率计数、执行错误时 SERVFAIL 的日志状态及内联插件 Flush 可达性；历史导入影响 QPS 等次级问题见复核记录。 |
+| 213、214 缓存预取 | 有界并发、去重、条件写回及 Flush/Close 代际保护；修复转储恢复 TTL、QCLASS 键、失败结果写回、旧转储迁移及损坏转储部分提交。预取由每个缓存条目保存其生成时的 continuation，不再全局首次捕获；前台、lazy 和预取统一拒绝 ECS 等键不匹配写回。兼容序列间仍共享缓存，严格策略隔离的边界见 [cache-behavior](cache-behavior.md)。 |
+| 216–224、226、228、230、231 统计 | 已有历史 API、环形日志、热门与历史、实时 QPS、v1 gzip 转储、缓存分母、hosts/arbitrary、超时和 loopback 分类。已修正缓存命中率计数、SERVFAIL 日志、内联插件 Flush、历史导入影响 QPS、旧统计转储异常计数、负缓存来源及 DST 重复小时分桶。 |
 | 225、227 fallback 元数据 | `ResponseSnapshot` 现在同时持有独立复制的 marks/KV；`CommitResponse` 可显式使用 `CommitMerge`（marks 并集、KV 同键覆盖）或 `CommitReplace`（marks/KV 全量替换，包括删除）。fallback 采用 `CommitMerge`，落败或失败分支不提交状态；其他调用未指定模式时保持原有仅响应提交和父状态隔离语义。保留获胜分支 EDNS、有效期和统计元数据及 always_standby 竞态修复。 |
 | 229 并发与默认值 | 已有 concurrent_map 清空修复、黑洞并发安全、正常插件入口的监听器默认超时及相关解析修复；日志 JSON 模式保持 JSON 输出。已补充 HTTP/QUIC 的失败路径及关闭时的监听器资源回收；Linux 实机端口释放仍需部署验证。 |
 
@@ -27,7 +27,7 @@
 合并至 [普通配置](../examples/smartdns/config.yaml) 和
 [CERNET 配置](../examples/smartdns/config-cernet.yaml) 的内容为：
 
-1. `log.level: info`、`log.file: /var/log/mosdns.log`、API `0.0.0.0:9091`、空 include。
+1. `log.level: info`、`log.file: /var/log/mosdns.log`、管理 API 默认 `127.0.0.1:9091`、空 include；远程访问需配置鉴权和 HTTPS 代理。
 2. `stats_collector`：capacity 2000、600 秒转储，在 `main` 缓存之前执行一次。
 3. 复用 `response_cache`：size 20000、lazy 保留期 86400 秒、600 秒转储。
 4. 普通配置使用 `stats.dump`、`cache.dump`；CERNET 使用 `stats-cernet.dump`、`cache-cernet.dump`，均在 `/etc/mosdns/`。

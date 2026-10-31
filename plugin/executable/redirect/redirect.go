@@ -94,6 +94,7 @@ func NewRedirectWithWatcher(bp *coremain.BP, args *Args) (*Redirect, error) {
 		}
 		return m, nil
 	}
+	initial := utils.SnapshotFileStates(args.Files)
 	m, err := load()
 	if err != nil {
 		return nil, err
@@ -104,14 +105,15 @@ func NewRedirectWithWatcher(bp *coremain.BP, args *Args) (*Redirect, error) {
 		if bp != nil {
 			logger = bp.L()
 		}
-		r.fw = utils.StartFileWatcher(args.Files, 3*time.Second, func(changed []string) {
+		r.fw = utils.StartFileWatcherFromSnapshot(args.Files, initial, 3*time.Second, func(changed []string) bool {
 			m, err := load()
 			if err != nil {
 				logger.Error("failed to reload redirect", zap.Error(err))
-				return
+				return false
 			}
 			r.m.Store(m)
 			logger.Info("reloaded redirect", zap.Strings("files", changed))
+			return true
 		})
 	}
 	return r, nil

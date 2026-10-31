@@ -61,6 +61,7 @@ var _ sequence.RecursiveExecutable = (*StatsAPI)(nil)
 
 type Args struct {
 	Listen       string `yaml:"listen"`
+	Token        string `yaml:"token"`
 	Capacity     int    `yaml:"capacity"`
 	DumpFile     string `yaml:"dump_file"`
 	DumpInterval int    `yaml:"dump_interval"`
@@ -452,7 +453,8 @@ func NewHistoryStats() *HistoryStats {
 }
 
 func (h *HistoryStats) Record(t time.Time, isBlocked, isCached bool) {
-	tHour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location()).Unix()
+	// UTC-based hour keys distinguish repeated local hours during DST fall-back.
+	tHour := t.UTC().Truncate(time.Hour).Unix()
 
 	h.mu.RLock()
 	bucket, ok := h.points[tHour]
@@ -490,14 +492,14 @@ func (h *HistoryStats) GetHistory(numPoints int) []HistoryPoint {
 		numPoints = 24
 	}
 	now := time.Now()
-	nowHour := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+	nowHour := now.UTC().Truncate(time.Hour)
 	res := make([]HistoryPoint, 0, numPoints)
 
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	for i := numPoints - 1; i >= 0; i-- {
-		slotTime := nowHour.Add(time.Duration(-i) * time.Hour)
+		slotTime := nowHour.Add(time.Duration(-i) * time.Hour).In(now.Location())
 		slotUnix := slotTime.Unix()
 
 		var total, blocked, cached uint64
@@ -580,7 +582,10 @@ type StatsAPI struct {
 	topStats     *TopStats
 	historyStats *HistoryStats
 
-	totalQueries     atomic.Uint64
+	totalQueries atomic.Uint64
+	// Live query count is intentionally not persisted: importing historical
+	// counters must not look like traffic to the real-time QPS sampler.
+	liveQueries      atomic.Uint64
 	blockedQueries   atomic.Uint64
 	cachedQueries    atomic.Uint64
 	hostsQueries     atomic.Uint64
@@ -674,7 +679,7 @@ func NewStatsAPI(args *Args, logger *zap.Logger) *StatsAPI {
 	if len(args.Listen) > 0 {
 		srv := &http.Server{
 			Addr:              args.Listen,
-			Handler:           s.Router(),
+			Handler:           coremain.ProtectAPI(s.Router(), args.Token),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 		s.httpServer = srv
@@ -692,19 +697,6 @@ func NewStatsAPI(args *Args, logger *zap.Logger) *StatsAPI {
 
 func (s *StatsAPI) Router() *chi.Mux {
 	r := chi.NewRouter()
-
-	r.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			if req.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			next.ServeHTTP(w, req)
-		})
-	})
 
 	r.Get("/api/v1/stats", s.handleStats)
 	r.Get("/api/v1/logs", s.handleLogs)
@@ -964,6 +956,16 @@ func (s *StatsAPI) readDump(r io.Reader) error {
 	if data.Version != 1 {
 		return fmt.Errorf("unsupported stats dump version: %d", data.Version)
 	}
+	if data.BlockedQueries > data.TotalQueries ||
+		data.CachedQueries > data.TotalQueries ||
+		data.HostsQueries > data.TotalQueries ||
+		data.ArbitraryQueries > data.TotalQueries ||
+		data.TimeoutQueries > data.TotalQueries ||
+		data.LatencyQueries > data.TotalQueries {
+		return fmt.Errorf("invalid stats dump: query counters exceed total")
+	}
+	// Older v1 dumps may count the same request in multiple categories.
+	// Keep compatibility while rejecting individually impossible counters.
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
@@ -1073,6 +1075,9 @@ func (s *StatsAPI) startDumpLoop() {
 }
 
 func (s *StatsAPI) startQPSLoop() {
+	// Capture the baseline before spawning the goroutine so queries that
+	// happen immediately after startup are not silently omitted.
+	lastTotal := s.liveQueries.Load()
 	s.loops.Add(1)
 	go func() {
 		defer s.loops.Done()
@@ -1082,12 +1087,11 @@ func (s *StatsAPI) startQPSLoop() {
 		const windowSize = 5
 		history := make([]uint64, windowSize)
 		timestamps := make([]int64, windowSize)
-		lastTotal := s.totalQueries.Load()
 
 		for {
 			select {
 			case now := <-ticker.C:
-				curTotal := s.totalQueries.Load()
+				curTotal := s.liveQueries.Load()
 				var delta uint64
 				if curTotal >= lastTotal {
 					delta = curTotal - lastTotal
@@ -1146,6 +1150,7 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	s.totalQueries.Add(1)
+	s.liveQueries.Add(1)
 	s.updatedCount.Add(1)
 
 	var clientIP string
@@ -1216,7 +1221,7 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			status = fmt.Sprintf("RCODE%d", r.Rcode)
 		}
 
-		if !hasUpstream && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused) &&
+		if (!hasUpstream || qCtx.CacheState.LocalNegative) && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused) &&
 			qQuestion.Qtype != dns.TypeHTTPS && qQuestion.Qtype != dns.TypeSVCB {
 			isBlocked = true
 		}

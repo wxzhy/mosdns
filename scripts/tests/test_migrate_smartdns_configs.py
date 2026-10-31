@@ -55,7 +55,7 @@ class MigrationServicesTest(unittest.TestCase):
                 cfg = self.load(name)
                 suffix = "-cernet" if profile_for(name) == "cernet" else ""
                 self.assertEqual(cfg["log"], {"level": "info", "file": "/var/log/mosdns.log"})
-                self.assertEqual(cfg["api"], {"http": "0.0.0.0:9091"})
+                self.assertEqual(cfg["api"], {"http": "127.0.0.1:9091"})
                 self.assertEqual(cfg["include"], [])
                 plugins = {p["tag"]: p for p in cfg["plugins"]}
                 self.assertEqual(len(plugins), len(cfg["plugins"]))

@@ -17,6 +17,33 @@ type FileWatcher struct {
 // If any file modification time changes or a file is missing, onChange is triggered.
 // Note: onChange must be safe to run concurrently with other components.
 func StartFileWatcher(files []string, interval time.Duration, onChange func(changedFiles []string)) *FileWatcher {
+	if onChange == nil {
+		return nil
+	}
+	return StartFileWatcherFromSnapshot(files, nil, interval, func(changed []string) bool {
+		onChange(changed)
+		return true
+	})
+}
+
+// SnapshotFileStates must run BEFORE loading the files. Passing its result to
+// StartFileWatcherFromSnapshot closes the gap between initial load and watcher
+// installation: an edit during loading is detected at the first poll.
+func SnapshotFileStates(files []string) map[string]os.FileInfo {
+	states := make(map[string]os.FileInfo, len(files))
+	for _, file := range files {
+		if file != "" {
+			if _, ok := states[file]; !ok {
+				states[file] = watchedFileInfo(file)
+			}
+		}
+	}
+	return states
+}
+
+// StartFileWatcherFromSnapshot retries a failed reload on the next poll. The
+// callback returns true ONLY after the new state has been published.
+func StartFileWatcherFromSnapshot(files []string, initial map[string]os.FileInfo, interval time.Duration, onChange func(changedFiles []string) bool) *FileWatcher {
 	// Own the path list: callers may reuse their configuration after startup.
 	paths := make([]string, 0, len(files))
 	states := make(map[string]os.FileInfo, len(files))
@@ -27,7 +54,11 @@ func StartFileWatcher(files []string, interval time.Duration, onChange func(chan
 		if _, seen := states[file]; seen {
 			continue
 		}
-		states[file] = watchedFileInfo(file)
+		if info, exists := initial[file]; exists {
+			states[file] = info
+		} else {
+			states[file] = watchedFileInfo(file)
+		}
 		paths = append(paths, file)
 	}
 	if len(paths) == 0 || onChange == nil {
@@ -51,10 +82,11 @@ func StartFileWatcher(files []string, interval time.Duration, onChange func(chan
 				return
 			case <-ticker.C:
 				var changedFiles []string
+				nextStates := make(map[string]os.FileInfo)
 				for _, file := range paths {
 					info := watchedFileInfo(file)
 					if !sameWatchedFile(states[file], info) {
-						states[file] = info
+						nextStates[file] = info
 						changedFiles = append(changedFiles, file)
 					}
 				}
@@ -64,7 +96,11 @@ func StartFileWatcher(files []string, interval time.Duration, onChange func(chan
 						return
 					default:
 					}
-					onChange(changedFiles)
+					if onChange(changedFiles) {
+						for _, f := range changedFiles {
+							states[f] = nextStates[f]
+						}
+					}
 				}
 			}
 		}
