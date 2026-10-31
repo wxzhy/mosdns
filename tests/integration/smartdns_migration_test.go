@@ -23,6 +23,7 @@ import (
 	forward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/speedcheck"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/stats_api"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/tcp_server"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/udp_server"
 	"github.com/go-viper/mapstructure/v2"
@@ -154,6 +155,8 @@ func smartdnsMigrationInstance(t *testing.T, cfg coremain.Config, answer func(st
 			}
 			a.IPs = ips
 		case *cache.Args:
+			a.DumpFile = ""
+		case *stats_api.Args:
 			a.DumpFile = ""
 		case *forward.Args:
 			tag := p.Tag
@@ -453,6 +456,8 @@ func TestSmartdnsMigrationLocalData(t *testing.T) {
 				case *tcp_server.Args:
 					a.Listen = "127.0.0.1:0"
 				case *cache.Args:
+					a.DumpFile = ""
+				case *stats_api.Args:
 					a.DumpFile = ""
 				}
 				cfg.Plugins[i].Args = args

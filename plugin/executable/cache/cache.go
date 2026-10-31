@@ -34,6 +34,7 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/cache"
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
@@ -98,12 +99,17 @@ func (a *Args) init() {
 type Cache struct {
 	args *Args
 
-	logger       *zap.Logger
-	backend      *cache.Cache[key, *item]
-	lazyUpdateSF singleflight.Group
-	closeOnce    sync.Once
-	closeNotify  chan struct{}
-	updatedKey   atomic.Uint64
+	logger            *zap.Logger
+	backend           *cache.Cache[key, *item]
+	lazyUpdateSF      singleflight.Group
+	refreshMu         sync.Mutex
+	refreshGeneration uint64
+	lazyWG            sync.WaitGroup
+	lazyCtx           context.Context
+	lazyCancel        context.CancelFunc
+	closeOnce         sync.Once
+	closeNotify       chan struct{}
+	updatedKey        atomic.Uint64
 	// dumpMu serializes Close's final dump against the dump loop, and guards
 	// the temp-file swap so two dumps never interleave on the same path.
 	dumpMu sync.Mutex
@@ -196,6 +202,7 @@ func NewCache(args *Args, opts Opts) *Cache {
 		}),
 	}
 
+	p.lazyCtx, p.lazyCancel = context.WithCancel(context.Background())
 	if err := p.loadDump(); err != nil {
 		p.logger.Error("failed to load cache dump", zap.Error(err))
 	}
@@ -265,12 +272,22 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 // doLazyUpdate starts a new goroutine to execute next node and update the cache in the background.
 // It has an inner singleflight.Group to de-duplicate same msgKey.
 func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next sequence.ChainWalker) {
+	c.refreshMu.Lock()
+	select {
+	case <-c.closeNotify:
+		c.refreshMu.Unlock()
+		return
+	default:
+	}
+	generation := c.refreshGeneration
+	c.lazyWG.Add(1)
+	c.refreshMu.Unlock()
 	qCtxCopy := qCtx.Copy()
 	lazyUpdateFunc := func() (any, error) {
 		qCtx := qCtxCopy
 
 		c.logger.Debug("start lazy cache update", qCtx.InfoField())
-		ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
+		ctx, cancel := context.WithTimeout(c.lazyCtx, defaultLazyUpdateTimeout)
 		defer cancel()
 
 		err := next.ExecNext(ctx, qCtx)
@@ -279,14 +296,22 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 		}
 
 		r := qCtx.R()
-		if r != nil {
-			saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
-			c.updatedKey.Add(1)
+		if r != nil && err == nil {
+			c.refreshMu.Lock()
+			if generation == c.refreshGeneration && ctx.Err() == nil {
+				if saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL) {
+					c.updatedKey.Add(1)
+				}
+			}
+			c.refreshMu.Unlock()
 		}
 		c.logger.Debug("lazy cache updated", qCtx.InfoField())
 		return nil, nil
 	}
-	c.lazyUpdateSF.DoChan("lazy:"+msgKey, lazyUpdateFunc) // DoChan won't block this goroutine
+	go func() {
+		defer c.lazyWG.Done()
+		_, _, _ = c.lazyUpdateSF.Do("lazy:"+msgKey, lazyUpdateFunc)
+	}()
 }
 
 func (c *Cache) startPrefetchLoop() {
@@ -410,9 +435,14 @@ func (c *Cache) Close() error {
 	// Stop the dump loop first so its in-flight dump (if any) is the last one;
 	// dumpCache's mutex serializes against it before the final dump below.
 	c.closeOnce.Do(func() {
+		c.refreshMu.Lock()
 		close(c.closeNotify)
+		c.refreshGeneration++
+		c.lazyCancel()
+		c.refreshMu.Unlock()
 	})
 	c.prefetchWG.Wait()
+	c.lazyWG.Wait()
 	if err := c.dumpCache(); err != nil {
 		c.logger.Error("failed to dump cache", zap.Error(err))
 	}
@@ -501,7 +531,7 @@ func (c *Cache) dumpCache() error {
 func (c *Cache) Api() *chi.Mux {
 	r := chi.NewRouter()
 	r.Get("/flush", func(w http.ResponseWriter, req *http.Request) {
-		c.backend.Flush()
+		c.Flush()
 	})
 	r.Get("/dump", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("content-type", "application/octet-stream")
@@ -523,7 +553,10 @@ func (c *Cache) Api() *chi.Mux {
 
 // Flush implements the cache control used by stats_api.
 func (c *Cache) Flush() {
+	c.refreshMu.Lock()
+	c.refreshGeneration++
 	c.backend.Flush()
+	c.refreshMu.Unlock()
 }
 
 func (c *Cache) writeDump(w io.Writer) (int, error) {
@@ -568,6 +601,7 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 			Key:                 []byte(k),
 			CacheExpirationTime: cacheExpirationTime.Unix(),
 			MsgExpirationTime:   v.expirationTime.Unix(),
+			MsgStoredTime:       v.storedTime.Unix(),
 			Msg:                 msg,
 		}
 		block.Entries = append(block.Entries, e)
@@ -638,6 +672,12 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 			resp := new(dns.Msg)
 			if err := resp.Unpack(entry.GetMsg()); err != nil {
 				return fmt.Errorf("failed to decode dns msg, %w", err)
+			}
+			// Older v2 dumps omitted msg_stored_time. Reconstruct its age
+			// from the original minimum TTL and the remaining expiration.
+			// Without this, SubtractTTL treats the entry as decades old.
+			if entry.GetMsgStoredTime() == 0 {
+				storedTime = msgExpTime.Add(-time.Duration(dnsutils.GetMinimalTTL(resp)) * time.Second)
 			}
 
 			i := &item{

@@ -15,6 +15,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/cache"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/stats_api"
 	"github.com/IrineSistiana/mosdns/v5/plugin/matcher/qname"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/tcp_server"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/udp_server"
@@ -43,6 +44,8 @@ func TestSmartdnsMigrationLocalWire(t *testing.T) {
 					a.Listen = smartdnsWireFreeAddress(t, "tcp")
 					addresses["tcp"] = a.Listen
 				case *cache.Args:
+					a.DumpFile = ""
+				case *stats_api.Args:
 					a.DumpFile = ""
 				}
 				cfg.Plugins[i].Args = args

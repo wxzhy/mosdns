@@ -28,7 +28,7 @@ func TestHistoricalLogSizeAndDefaults(t *testing.T) {
 			}
 		})
 	}
-	for _, input := range []string{"1B", "invalid", "1.5M", "M"} {
+	for _, input := range []string{"1B", "invalid", "1.5M", "M", "8796093022208M", "-8796093022209M", "8388608T"} {
 		if _, err := ParseSize(input); err == nil {
 			t.Errorf("invalid size accepted: %q", input)
 		}

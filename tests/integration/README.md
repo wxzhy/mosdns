@@ -11,6 +11,7 @@
 | `https_record_config_test.go` | HTTPS/SVCB 离线示例的 UDP/TCP 回包 |
 | `legacy_config_test.go` | 历史文本规则配置、DoH/DoT 分流、主备、缓存、统计与持久化 |
 | `luci_config_test.go` | LuCI 原始 JSON 的 39 插件、日志轮转参数、广告规则和 UDP/TCP 路由 |
+| `merged_profile_test.go` | 两份迁移配置的统计入口、共享缓存、HTTPS 辅助查询及转储重启 |
 | `smartdns_migration_test.go` | 迁移配置解码、路由、过滤、替换及共享 fixture |
 | `smartdns_policy_test.go` | 缓存、CNAME、DO、负响应、回退和 HTTPS 辅助查询 |
 | `smartdns_realdata_policy_test.go` | 真实数据库规则、MMDB 策略及 DAT 与文本等价 |

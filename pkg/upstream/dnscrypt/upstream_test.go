@@ -24,8 +24,11 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -52,7 +55,7 @@ func startTestServer(t testing.TB, h dnscrypt.Handler, constructions ...dnscrypt
 		t.Fatal(err)
 	}
 
-	startServer := func(proto dnscrypt.Proto, addr netip.AddrPort) *dnscrypt.Server {
+	startServer := func(proto dnscrypt.Proto, addr netip.AddrPort) (*dnscrypt.Server, error) {
 		t.Helper()
 		s, err := dnscrypt.NewServer(&dnscrypt.ServerConfig{
 			Handler:      h,
@@ -63,27 +66,66 @@ func startTestServer(t testing.TB, h dnscrypt.Handler, constructions ...dnscrypt
 			Proto:        proto,
 		})
 		if err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 		if err := s.Start(context.Background()); err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+
+	// UDP's ephemeral port can be unavailable to TCP, especially with Windows
+	// protocol-specific excluded ranges. Hold the actual TCP listener while
+	// acquiring UDP, rather than releasing probe sockets before binding again.
+	const maxBindAttempts = 32
+	var lastBindErr error
+	for range maxBindAttempts {
+		srvTCP, err := startServer(dnscrypt.ProtoTCP, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0))
+		if err != nil {
+			if !retryableTestServerBind(err) {
+				t.Fatal(err)
+			}
+			lastBindErr = err
+			continue
+		}
+		addrStr := srvTCP.LocalAddr().String()
+		srvUDP, err := startServer(dnscrypt.ProtoUDP, netip.MustParseAddrPort(addrStr))
+		if err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			shutdownErr := srvTCP.Shutdown(ctx)
+			cancel()
+			if shutdownErr != nil {
+				t.Fatalf("release partial DNSCrypt server: %v (bind error: %v)", shutdownErr, err)
+			}
+			if !retryableTestServerBind(err) {
+				t.Fatal(err)
+			}
+			lastBindErr = err
+			continue
+		}
+		t.Cleanup(func() { _ = srvTCP.Shutdown(context.Background()) })
+		t.Cleanup(func() { _ = srvUDP.Shutdown(context.Background()) })
+		stamp, err := rc.CreateStamp(addrStr)
+		if err != nil {
 			t.Fatal(err)
 		}
-		return s
+		return stamp.String()
 	}
+	t.Fatalf("could not bind a shared TCP/UDP loopback port after %d attempts: %v", maxBindAttempts, lastBindErr)
+	return ""
+}
 
-	srvUDP := startServer(dnscrypt.ProtoUDP, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0))
-	t.Cleanup(func() { _ = srvUDP.Shutdown(context.Background()) })
-
-	addrStr := srvUDP.LocalAddr().String()
-	stamp, err := rc.CreateStamp(addrStr)
-	if err != nil {
-		t.Fatal(err)
+func retryableTestServerBind(err error) bool {
+	var syscallErr *os.SyscallError
+	if !errors.As(err, &syscallErr) || syscallErr.Syscall != "bind" {
+		return false
 	}
-
-	srvTCP := startServer(dnscrypt.ProtoTCP, netip.MustParseAddrPort(addrStr))
-	t.Cleanup(func() { _ = srvTCP.Shutdown(context.Background()) })
-
-	return stamp.String()
+	if errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
+		return true
+	}
+	// syscall.E* constants on Windows are synthetic; Winsock returns its own
+	// WSAEACCES (10013) and WSAEADDRINUSE (10048) codes instead.
+	return runtime.GOOS == "windows" && (errors.Is(err, syscall.Errno(10013)) || errors.Is(err, syscall.Errno(10048)))
 }
 
 // testHandler replies to the query. If truncateUDP is true, udp replies

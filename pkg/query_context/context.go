@@ -175,9 +175,8 @@ func (ctx *Context) UpstreamOpt() *dns.OPT {
 	return ctx.upstreamOpt
 }
 
-// ResponseSnapshot owns a response and its separate EDNS state. It deliberately
-// excludes query, marks and arbitrary plugin state, so a branch can only commit
-// its response to the parent query.
+// ResponseSnapshot owns a response, EDNS state, and a copy of context marks
+// and KV. Committing the latter requires explicit CommitMerge/CommitReplace.
 type ResponseSnapshot struct {
 	Response    *dns.Msg
 	UpstreamOpt *dns.OPT
@@ -196,6 +195,8 @@ type ResponseSnapshot struct {
 	CacheState       CacheLog
 	FromHosts        bool
 	FromArbitrary    bool
+	marks            map[uint32]struct{}
+	kv               map[uint32]any
 }
 
 // Clone returns an independently mutable snapshot.
@@ -211,6 +212,8 @@ func (s ResponseSnapshot) Clone() ResponseSnapshot {
 	}
 	s.UpstreamSelected = cloneUpstreamLog(s.UpstreamSelected)
 	s.RuleHits = cloneRuleHits(s.RuleHits)
+	s.marks = maps.Clone(s.marks)
+	s.kv = maps.Clone(s.kv)
 	return s
 }
 
@@ -220,6 +223,7 @@ func (ctx *Context) SnapshotResponse() ResponseSnapshot {
 		ReceivedAt: ctx.receivedAt, ValidUntil: ctx.validUntil, ProbeStatus: ctx.probeStatus,
 		UpstreamSelected: ctx.UpstreamSelected, RuleHits: ctx.RuleHits, CacheState: ctx.CacheState,
 		FromHosts: ctx.FromHosts, FromArbitrary: ctx.FromArbitrary,
+		marks: ctx.marks, kv: ctx.kv,
 	}).Clone()
 }
 
@@ -227,9 +231,23 @@ func (ctx *Context) SnapshotResponse() ResponseSnapshot {
 // before any subsequent filtering or waits in the source sequence.
 func (ctx *Context) ResponseReceivedAt() time.Time { return ctx.receivedAt }
 
-// CommitResponse copies only response state, retaining the parent's query view
-// and plugin state. Neither the caller nor another subscriber can mutate it.
-func (ctx *Context) CommitResponse(s ResponseSnapshot) {
+// CommitMode controls how snapshot marks and KV are applied.
+type CommitMode uint8
+
+const (
+	// CommitMerge unions marks and overwrites matching KV keys, without
+	// propagating deletions (the original fallback patch 225 semantics).
+	CommitMerge CommitMode = iota
+	// CommitReplace replaces the entire marks and KV maps, including deletions.
+	CommitReplace
+)
+
+// CommitResponse always commits an independently owned DNS response and
+// metadata. With no mode it retains the parent's marks/KV for backward
+// compatibility with response-only selectors. Explicit CommitMerge or
+// CommitReplace also commits the snapshot's marks/KV.
+// The query itself is never replaced.
+func (ctx *Context) CommitResponse(s ResponseSnapshot, mode ...CommitMode) {
 	s = s.Clone()
 	if s.Response != nil {
 		for opt := popOpt(s.Response); opt != nil; opt = popOpt(s.Response) {
@@ -262,6 +280,32 @@ func (ctx *Context) CommitResponse(s ResponseSnapshot) {
 		if ctx.respOpt == nil {
 			ctx.respOpt = newOpt()
 			setDo(ctx.respOpt, ctx.clientOpt.Do())
+		}
+	}
+	if len(mode) > 0 {
+		switch mode[0] {
+		case CommitMerge:
+			if len(s.marks) > 0 {
+				if ctx.marks == nil {
+					ctx.marks = make(map[uint32]struct{}, len(s.marks))
+				}
+				for mark := range s.marks {
+					ctx.marks[mark] = struct{}{}
+				}
+			}
+			if len(s.kv) > 0 {
+				if ctx.kv == nil {
+					ctx.kv = make(map[uint32]any, len(s.kv))
+				}
+				for key, value := range s.kv {
+					ctx.kv[key] = value
+				}
+			}
+		case CommitReplace:
+			ctx.marks = s.marks
+			ctx.kv = s.kv
+		default:
+			panic("unknown response commit mode")
 		}
 	}
 }
@@ -352,22 +396,7 @@ func (ctx *Context) DeleteMark(m uint32) {
 
 // MarshalLogObject implements zapcore.ObjectMarshaler.
 func (ctx *Context) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
-	encoder.AddUint32("uqid", ctx.id)
-
-	if clientAddr := ctx.ServerMeta.ClientAddr; clientAddr.IsValid() {
-		zap.Stringer("client", clientAddr).AddTo(encoder)
-	}
-
-	question := ctx.query.Question[0]
-	encoder.AddString("qname", question.Name)
-	encoder.AddUint16("qtype", question.Qtype)
-	encoder.AddUint16("qclass", question.Qclass)
-
-	if r := ctx.resp; r != nil {
-		encoder.AddInt("rcode", r.Rcode)
-	}
-	encoder.AddDuration("elapsed", time.Since(ctx.startTime))
-	return nil
+	return ctx.marshalQueryLog(encoder, ctx.resp, false)
 }
 
 func addNewAndSwapOldOpt(m *dns.Msg) *dns.OPT {

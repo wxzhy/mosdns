@@ -67,11 +67,12 @@ func ParseRules(r io.Reader, blacklist, whitelist *domain.MixMatcher[struct{}]) 
 			continue
 		}
 
-		// Strip options (e.g., $important, $third-party)
-		if idx := strings.LastIndex(line, "$"); idx != -1 {
-			// Check if it's a regex or something else.
-			// In ABP, $ marks the start of options.
-			line = line[:idx]
+		// A dollar sign is a regexp anchor in native regexp: and /.../
+		// patterns. Only ABP-style rules may have $options.
+		if !strings.HasPrefix(line, "regexp:") && !strings.HasPrefix(line, "/") {
+			if idx := strings.IndexByte(line, '$'); idx != -1 {
+				line = line[:idx]
+			}
 		}
 
 		if line == "" {

@@ -56,10 +56,15 @@ type QuicServer struct {
 	args *Args
 
 	l *quic.Listener
+	transport *quic.Transport
+	conn net.PacketConn
 }
 
 func (s *QuicServer) Close() error {
-	return s.l.Close()
+	err := s.l.Close()
+	_ = s.transport.Close()
+	_ = s.conn.Close()
+	return err
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -117,6 +122,7 @@ func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
 	quicListener, err := qt.Listen(tlsConfig, quicConfig)
 	if err != nil {
 		qt.Close()
+		uc.Close()
 		return nil, fmt.Errorf("failed to listen quic, %w", err)
 	}
 	bp.L().Info("quic server started", zap.Stringer("addr", quicListener.Addr()))
@@ -130,5 +136,7 @@ func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
 	return &QuicServer{
 		args: args,
 		l:    quicListener,
+		transport: qt,
+		conn: uc,
 	}, nil
 }

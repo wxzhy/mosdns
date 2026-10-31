@@ -52,6 +52,16 @@ func (s *Sequence) Close() error {
 	return nil
 }
 
+// Flush forwards cache clearing to inline plugins, which are not registered
+// in Mosdns.plugins and would otherwise survive the stats_api clear request.
+func (s *Sequence) Flush() {
+	for _, plugin := range s.anonymousPlugins {
+		if flusher, ok := plugin.(interface{ Flush() }); ok {
+			flusher.Flush()
+		}
+	}
+}
+
 type Args = []RuleArgs
 
 func Init(bp *coremain.BP, args any) (any, error) {

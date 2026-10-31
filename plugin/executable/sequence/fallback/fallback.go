@@ -194,7 +194,7 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			if r == nil { // One of goroutines finished but failed.
 				continue
 			}
-			qCtx.CommitResponse(*r)
+			qCtx.CommitResponse(*r, query_context.CommitMerge)
 			return nil
 		}
 	}

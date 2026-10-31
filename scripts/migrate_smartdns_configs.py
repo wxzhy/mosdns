@@ -8,6 +8,7 @@ The source is read-only. Runtime mosdns needs only the YAML and exported data.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import ipaddress
 from pathlib import Path
@@ -24,9 +25,50 @@ def rule(exec_: str, *matches: str) -> dict:
     return {"matches": list(matches), "exec": exec_} if matches else {"exec": exec_}
 
 
+def merge_example_services(cfg: dict, *, profile: str = "default") -> dict:
+    """Merge runtime services into an existing policy without changing routing."""
+    if profile not in ("default", "cernet"):
+        raise ValueError(f"unknown deployment profile {profile!r}")
+    merged = copy.deepcopy(cfg)
+    plugins = merged["plugins"]
+    by_tag = {plugin["tag"]: plugin for plugin in plugins}
+    if len(by_tag) != len(plugins):
+        raise ValueError("duplicate plugin tags in migrated configuration")
+    cache = by_tag.get("response_cache")
+    main = by_tag.get("main")
+    if cache is None or cache["type"] != "cache" or main is None or main["type"] != "sequence":
+        raise ValueError("migrated configuration needs response_cache and main")
+    suffix = "-cernet" if profile == "cernet" else ""
+    stats = by_tag.get("stats_collector")
+    if stats is None:
+        stats = {"tag": "stats_collector", "type": "stats_api", "args": {}}
+    elif stats["type"] != "stats_api":
+        raise ValueError("stats_collector is already used by another plugin type")
+    stats["args"].update(
+        capacity=2000, dump_file=f"/etc/mosdns/stats{suffix}.dump", dump_interval=600
+    )
+    cache["args"].update(
+        size=20000,
+        lazy_cache_ttl=86400,
+        dump_file=f"/etc/mosdns/cache{suffix}.dump",
+        dump_interval=600,
+    )
+    main["args"] = [rule("$stats_collector")] + [
+        item for item in main["args"] if item != rule("$stats_collector")
+    ]
+    merged["plugins"] = [stats] + [p for p in plugins if p["tag"] != "stats_collector"]
+    merged.setdefault("log", {}).update(level="info", file="/var/log/mosdns.log")
+    merged.setdefault("api", {})["http"] = "0.0.0.0:9091"
+    merged.setdefault("include", [])
+    return merged
+
+
 class Migration:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, *, profile: str = "default"):
+        if profile not in ("default", "cernet"):
+            raise ValueError(f"unknown deployment profile {profile!r}")
         self.cfg = cfg
+        self.profile = profile
         self.plugins: list[dict] = []
         self.nameservers = {x["name"]: x for x in cfg["nameservers"]}
         self.resolvers = {x["name"]: x for x in cfg["resolvers"]}
@@ -419,7 +461,7 @@ class Migration:
         self.selectors()
         self.routes()
         self.https_and_listeners()
-        return {
+        return merge_example_services({
             "log": {"level": "info"},
             "geodata": {
                 "geosite": "./data/smartdns/geosite.dat",
@@ -427,12 +469,16 @@ class Migration:
                 "asn": "./data/smartdns/ASN.mmdb",
             },
             "plugins": self.plugins,
-        }
+        }, profile=self.profile)
 
 
 def render_config(cfg: dict) -> str:
     """Add comments to the normal YAML dump without changing its policy graph."""
     comments = {
+        "stats_collector": (
+            "示例基础功能：仅在主入口最前方统计，包含缓存命中；不统计 HTTPS 辅助查询。\n"
+            "正常关闭及定时转储保留统计，普通/CERNET 使用各自文件，避免切换配置时混用。"
+        ),
         "ip_cloudflare": (
             "IP 集合保留原标签：GeoIP/ASN 使用上面的默认库；GitHub 两个自定义集合仍读原导出文本。"
         ),
@@ -469,7 +515,8 @@ def render_config(cfg: dict) -> str:
             "每段 has_resp 后立即 accept；合法 NXDOMAIN 也是响应，不能按“没有地址”继续落入默认路由。"
         ),
         "response_cache": (
-            "主入口和 HTTPS 辅助解析共用此缓存，关闭 lazy cache。\n"
+            "复用迁移配置原有的共享缓存，合入示例的容量、lazy 保留期及持久化。\n"
+            "普通/CERNET 使用不同转储文件；过期命中以 TTL 5 秒返回并后台刷新。\n"
             "cache 会包裹后续链，在链执行完后保存最终响应，包括 HTTPS 后处理结果。"
         ),
         "resolve_cached": (
@@ -482,7 +529,7 @@ def render_config(cfg: dict) -> str:
             "因此 inject_* 与 apply_* 两层不能直接合并成同一个带名称条件的动作。"
         ),
         "main": (
-            "总入口：先查共享缓存，未命中再分流；非 NOERROR 响应到此结束，不再执行 HTTPS 后处理。\n"
+            "总入口：先统计，再查共享缓存，未命中按原策略分流；非 NOERROR 响应不执行 HTTPS 后处理。\n"
             "SVCB/HTTPS 按原路由标记执行对应动作，保留各条规则及其顺序；缓存命中不重复处理。"
         ),
         "dns_tcp": "TCP/UDP 监听器共用 main，监听地址和端口保留原配置。",
@@ -545,14 +592,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path("../smartdns-test"))
     parser.add_argument("--output", type=Path, default=Path("examples/smartdns"))
+    parser.add_argument(
+        "--merge-existing", action="store_true",
+        help="merge example runtime services into existing output YAML, preserving its policy",
+    )
     args = parser.parse_args()
     source, output = args.source.resolve(), args.output.resolve()
     if output == source or output.is_relative_to(source):
         parser.error("output must not be inside the read-only source tree")
     generated = []
     for name in ("config.yaml", "config-cernet.yaml"):
+        profile = "cernet" if name == "config-cernet.yaml" else "default"
+        if args.merge_existing:
+            text = (output / name).read_text(encoding="utf-8")
+            # Preserve the recorded source provenance rather than replacing it
+            # with a possibly changed sibling SmartDNS checkout.
+            prefix = []
+            for line in text.splitlines(keepends=True):
+                if not line.startswith("#"):
+                    break
+                prefix.append(line)
+            generated.append((name, "".join(prefix) + render_config(
+                merge_example_services(yaml.safe_load(text), profile=profile)
+            )))
+            continue
         raw = (source / name).read_bytes()
-        cfg = Migration(yaml.safe_load(raw)).run()
+        cfg = Migration(yaml.safe_load(raw), profile=profile).run()
         header = (
             f"# 由 smartdns-test/{name} 迁移而来；源文件 SHA256 {hashlib.sha256(raw).hexdigest()}\n"
             "# 由 scripts/migrate_smartdns_configs.py 生成；说明见 docs/smartdns-migration.md。\n"

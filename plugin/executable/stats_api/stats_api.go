@@ -1164,9 +1164,6 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	}
 
 	isCached := qCtx.CacheState.Hit || qCtx.CacheState.LazyHit
-	if isCached {
-		s.cachedQueries.Add(1)
-	}
 
 	hasUpstream := isCached || qCtx.UpstreamSelected != nil
 
@@ -1190,7 +1187,16 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		isTimeout = true
 	}
 
-	if r == nil {
+	if err != nil {
+		// Preserve the historical TIMEOUT classification, but never report
+		// a stale NOERROR response when the execution ultimately failed.
+		status = "SERVFAIL"
+		if isTimeout && r == nil {
+			status = "TIMEOUT"
+		}
+		answers = answers[:0]
+		isBlocked = false
+	} else if r == nil {
 		if isTimeout {
 			status = "TIMEOUT"
 			isBlocked = false
@@ -1258,6 +1264,12 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 	if isBlocked {
 		s.blockedQueries.Add(1)
+	}
+
+	// Excluded local/blocked responses must not increase the numerator
+	// of the cache-hit percentage for eligible DNS responses.
+	if isCached && !isBlocked && !qCtx.FromHosts && !qCtx.FromArbitrary {
+		s.cachedQueries.Add(1)
 	}
 
 	if isTimeout {

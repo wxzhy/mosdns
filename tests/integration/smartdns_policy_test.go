@@ -21,6 +21,7 @@ import (
 	forward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/speedcheck"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/stats_api"
 	"github.com/miekg/dns"
 )
 
@@ -35,6 +36,7 @@ type smartdnsPolicyCall struct {
 // The synthetic database entries exercise policy, not database classification.
 type smartdnsPolicyFixture struct {
 	plugins map[string]any
+	close   func()
 	mu      sync.Mutex
 	calls   []smartdnsPolicyCall
 	probes  []netip.Addr
@@ -51,6 +53,13 @@ func smartdnsPolicyInstance(t *testing.T, cfg coremain.Config, answer func(strin
 // Both modes replace network I/O and never bind deployment listener ports.
 func smartdnsPolicyInstanceWithData(t *testing.T, cfg coremain.Config, answer func(string, *dns.Msg) *dns.Msg, probe speedcheck.ProbeFunc, realData bool) *smartdnsPolicyFixture {
 	t.Helper()
+	return smartdnsPolicyInstanceWithDumps(t, cfg, answer, probe, realData, "")
+}
+
+// Persistence tests opt into their own directory. All ordinary fixtures disable
+// both dump writers so deployment paths in the examples never become test I/O.
+func smartdnsPolicyInstanceWithDumps(t *testing.T, cfg coremain.Config, answer func(string, *dns.Msg) *dns.Msg, probe speedcheck.ProbeFunc, realData bool, dumpDir string) *smartdnsPolicyFixture {
+	t.Helper()
 	f := &smartdnsPolicyFixture{plugins: make(map[string]any), answer: answer, probe: probe}
 	dir := t.TempDir()
 	if !realData {
@@ -58,17 +67,21 @@ func smartdnsPolicyInstanceWithData(t *testing.T, cfg coremain.Config, answer fu
 	}
 	m := coremain.NewTestMosdnsWithPlugins(f.plugins, cfg.Geodata)
 	var closers []io.Closer
-	t.Cleanup(func() {
-		for _, c := range slices.Backward(closers) {
-			if err := c.Close(); err != nil {
+	var closeOnce sync.Once
+	f.close = func() {
+		closeOnce.Do(func() {
+			for _, c := range slices.Backward(closers) {
+				if err := c.Close(); err != nil {
+					t.Error(err)
+				}
+			}
+			m.CloseWithErr(nil)
+			if err := m.GetSafeClose().WaitClosed(); err != nil {
 				t.Error(err)
 			}
-		}
-		m.CloseWithErr(nil)
-		if err := m.GetSafeClose().WaitClosed(); err != nil {
-			t.Error(err)
-		}
-	})
+		})
+	}
+	t.Cleanup(f.close)
 	for _, p := range cfg.Plugins {
 		args := smartdnsMigrationArgs(t, p)
 		bp := coremain.NewBP(p.Tag, m)
@@ -93,7 +106,17 @@ func smartdnsPolicyInstanceWithData(t *testing.T, cfg coremain.Config, answer fu
 			}
 			a.IPs = ips
 		case *cache.Args:
-			a.DumpFile = ""
+			if dumpDir == "" {
+				a.DumpFile = ""
+			} else {
+				a.DumpFile = filepath.Join(dumpDir, filepath.Base(a.DumpFile))
+			}
+		case *stats_api.Args:
+			if dumpDir == "" {
+				a.DumpFile = ""
+			} else {
+				a.DumpFile = filepath.Join(dumpDir, filepath.Base(a.DumpFile))
+			}
 		case *forward.Args:
 			tag := p.Tag
 			instance = sequence.ExecutableFunc(func(ctx context.Context, q *query_context.Context) error {

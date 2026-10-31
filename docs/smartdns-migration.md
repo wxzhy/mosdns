@@ -20,7 +20,10 @@ CERNET 的代理 IPv6 `2001:db8::64` 仍是原配置的占位地址。
 & ..\smartdns-test\.venv\Scripts\python.exe scripts/migrate_smartdns_data.py `
   --source ..\smartdns-test --output data/smartdns
 
-# YAML 已随项目提供；需要根据旧配置重新生成时运行：
+# 将示例基础功能合并到已有迁移 YAML，保持其解析策略和来源记录：
+& ..\smartdns-test\.venv\Scripts\python.exe scripts/migrate_smartdns_configs.py --merge-existing
+
+# 需要重新读取 SmartDNS 源文件并完整生成时运行：
 & ..\smartdns-test\.venv\Scripts\python.exe scripts/migrate_smartdns_configs.py
 
 go build -o mosdns.exe .
@@ -32,6 +35,33 @@ go build -o mosdns.exe .
 Linux/OpenWrt 部署时复制所选 YAML、`data/smartdns` 和对应平台的 mosdns。
 仍从包含 `data` 的工作目录启动，例如 `./mosdns start -c config.yaml`。
 规则路径相对于启动工作目录，不相对于 YAML 所在目录。
+
+`--merge-existing` 直接读取 `examples/smartdns` 中已有的两份 YAML，不读取可能已经变化的
+SmartDNS 源文件；保留原源文件哈希、所有 GeoData 引用、路由、上游、过滤、CDN 改写、
+测速及 HTTPS 动作。重复执行不会增加插件或重复统计入口。默认生成模式会重新读取
+`--source` 指定的原配置，仍先完成两份渲染后再写入输出。
+
+## 合入示例的基础功能
+
+两份迁移配置都保留原 `main` 和共享 `response_cache`，没有再增加一层独立缓存或替换
+国内/国外解析策略。`stats_collector` 定义在前，且只在 `main` 第一条执行，包含最终缓存
+命中；HTTPS 辅助入口 `resolve_cached`、上游候选和 lazy 后台刷新不重复计入用户查询。
+
+| 功能 | 普通配置 | CERNET 配置 |
+|---|---|---|
+| 日志 | `info`，`/var/log/mosdns.log` | 同左 |
+| API | `0.0.0.0:9091` | 同左 |
+| 统计 | 2000 条日志，`/etc/mosdns/stats.dump`，转储间隔 600 秒 | `/etc/mosdns/stats-cernet.dump`，其余相同 |
+| 响应缓存 | 20000 条，`lazy_cache_ttl: 86400`，`/etc/mosdns/cache.dump`，转储间隔 600 秒 | `/etc/mosdns/cache-cernet.dump`，其余相同 |
+
+不同转储路径避免切换普通/CERNET 配置时加载另一套策略产生的答案。过期缓存命中返回
+TTL 5 秒并后台重新解析；后台刷新仍经过原分流、选址和 HTTPS 后处理。cache 的周期转储
+还受累计更新次数门槛约束，正常关闭会保存最终状态。统计 API 路径为
+`/plugins/stats_collector/api/v1/stats`，历史短路径 `/plugins/stats_collector/stats` 也保留。
+
+以上路径沿用提供的示例。直接启动时运行账户须能写入日志和转储目录；使用本仓库带
+`ProtectSystem=strict` 的低权限 systemd 服务时，将日志改为 `/var/log/mosdns/mosdns.log`，
+将转储改到 `/var/lib/mosdns/` 下对应的独立文件，使用服务已开放的可写目录。
 
 两份配置已统一数据库路径，路由和动作以 GeoData 集合名称引用规则：
 
@@ -86,7 +116,7 @@ probe:
 
 ```mermaid
 flowchart LR
-    A[请求与最终响应缓存] --> B[按原始域名分流]
+    A[查询统计与最终响应缓存] --> B[按原始域名分流]
     B --> C[并行来源查询]
     C --> D[各来源必需过滤]
     D --> E[CDN IP 替换]
@@ -140,7 +170,7 @@ HTTPS 处理保留原来的 hint/H3 清理、ECH 注入和辅助 A 查询。名�
   中的第一个 114DNS 地址；响应 ECH 注入使用两条 114DNS 并行查询。
   iij/hinet 原先隐含的 curl `ech: true` 是机会式自动 ECH，当前没有同等选项，
   这两组只保留普通 TLS。Chrome 指纹复用 uTLS 的配置，不保证与 curl-cffi 逐字节一致。
-- 保留容量 10000 的最终响应缓存，TTL 按 DNS 响应计算；命中后不重新测速。
+- 复用最终响应缓存，合入示例的容量 20000、lazy 保留期和转储；正常 TTL 按 DNS 响应计算，正常命中后不重新测速。
   不重复建立原每个 resolver 的独立响应缓存。禁用最终响应缓存时，删除 `main`
   和 `resolve_cached` 开头的 `$response_cache` 及其后缓存命中 `has_resp/accept`
   两条规则。探测 RTT 缓存仍生效。

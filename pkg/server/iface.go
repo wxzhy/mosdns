@@ -26,4 +26,5 @@ type QueryMeta struct {
 	ClientAddr netip.Addr
 	ServerName string
 	UrlPath    string
+	Protocol   string
 }

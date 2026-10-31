@@ -91,8 +91,10 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 
 				// Try to get server name from tls conn.
 				var serverName string
+				protocol := "TCP"
 				if tlsConn, ok := c.(*tls.Conn); ok {
 					serverName = tlsConn.ConnectionState().ServerName
+					protocol = "DoT"
 				}
 
 				// handle query
@@ -102,7 +104,7 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 					if ok {
 						clientAddr = ta.AddrPort().Addr()
 					}
-					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName}, pool.PackTCPBuffer)
+					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName, Protocol: protocol}, pool.PackTCPBuffer)
 					if r == nil {
 						c.Close() // abort the connection
 						return

@@ -5,6 +5,7 @@
 # ICMP-only probes preserve the old configuration and require ICMP capability.
 log:
   level: info
+  file: /var/log/mosdns.log
 
 # 域名直接使用 geosite:标签，默认库为导出的 runtime 兼容 bundle。
 # 不要用原始 GeoSite dat 替换它而声称匹配语义不变；typed 模式是另行选择的语义调整。
@@ -13,6 +14,15 @@ geodata:
   geoip: ./data/smartdns/Country.mmdb
   asn: ./data/smartdns/ASN.mmdb
 plugins:
+
+# 示例基础功能：仅在主入口最前方统计，包含缓存命中；不统计 HTTPS 辅助查询。
+# 正常关闭及定时转储保留统计，普通/CERNET 使用各自文件，避免切换配置时混用。
+- tag: stats_collector
+  type: stats_api
+  args:
+    capacity: 2000
+    dump_file: /etc/mosdns/stats.dump
+    dump_interval: 600
 
 # IP 集合保留原标签：GeoIP/ASN 使用上面的默认库；GitHub 两个自定义集合仍读原导出文本。
 - tag: ip_cloudflare
@@ -1456,13 +1466,16 @@ plugins:
     - has_resp
     exec: accept
 
-# 主入口和 HTTPS 辅助解析共用此缓存，关闭 lazy cache。
+# 复用迁移配置原有的共享缓存，合入示例的容量、lazy 保留期及持久化。
+# 普通/CERNET 使用不同转储文件；过期命中以 TTL 5 秒返回并后台刷新。
 # cache 会包裹后续链，在链执行完后保存最终响应，包括 HTTPS 后处理结果。
 - tag: response_cache
   type: cache
   args:
-    size: 10000
-    lazy_cache_ttl: 0
+    size: 20000
+    lazy_cache_ttl: 86400
+    dump_file: /etc/mosdns/cache.dump
+    dump_interval: 600
 
 # HTTPS 的辅助 A 查询复用缓存和完整分流、过滤、替换、测速链。
 # 此入口不执行 main 的 HTTPS 后处理，避免递归；也不能直接改成裸 forward 绕过策略。
@@ -1582,11 +1595,12 @@ plugins:
   - exec: $inject_https_twitter
   - exec: $https_cleanup
 
-# 总入口：先查共享缓存，未命中再分流；非 NOERROR 响应到此结束，不再执行 HTTPS 后处理。
+# 总入口：先统计，再查共享缓存，未命中按原策略分流；非 NOERROR 响应不执行 HTTPS 后处理。
 # SVCB/HTTPS 按原路由标记执行对应动作，保留各条规则及其顺序；缓存命中不重复处理。
 - tag: main
   type: sequence
   args:
+  - exec: $stats_collector
   - exec: $response_cache
   - matches:
     - has_resp
@@ -1628,3 +1642,6 @@ plugins:
   args:
     entry: main
     listen: '[::]:5335'
+api:
+  http: 0.0.0.0:9091
+include: []

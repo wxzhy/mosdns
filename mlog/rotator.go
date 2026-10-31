@@ -174,10 +174,15 @@ func (r *Rotator) cleanupBackups() {
 		}
 		n := entry.Name()
 		if strings.HasPrefix(n, prefix) && strings.HasSuffix(n, ext) {
-			// Basic validation of the timestamp length
+			// Only consider backups with a valid timestamp in our exact
+			// generated format. A same-length unrelated filename must
+			// never be removed as a backup.
 			timestamp := n[len(prefix) : len(n)-len(ext)]
 			if len(timestamp) == 23 {
-				backups = append(backups, filepath.Join(dir, n))
+				if parsed, err := time.Parse("2006-01-02T15-04-05.000", timestamp); err == nil &&
+					parsed.Format("2006-01-02T15-04-05.000") == timestamp {
+					backups = append(backups, filepath.Join(dir, n))
+				}
 			}
 		}
 	}
@@ -244,16 +249,21 @@ func ParseSize(s string) (int64, error) {
 		return 0, err
 	}
 
+	var multiplier int64
 	switch unit {
 	case "K", "KB":
-		return val * 1024, nil
+		multiplier = 1 << 10
 	case "M", "MB":
-		return val * 1024 * 1024, nil
+		multiplier = 1 << 20
 	case "G", "GB":
-		return val * 1024 * 1024 * 1024, nil
+		multiplier = 1 << 30
 	case "T", "TB":
-		return val * 1024 * 1024 * 1024 * 1024, nil
+		multiplier = 1 << 40
 	default:
 		return 0, fmt.Errorf("invalid size unit: %s", unit)
 	}
+	if val > (1<<63-1)/multiplier || val < (-1<<63)/multiplier {
+		return 0, fmt.Errorf("log size overflows int64: %s", s)
+	}
+	return val * multiplier, nil
 }

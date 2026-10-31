@@ -61,10 +61,13 @@ type HttpServer struct {
 	args *Args
 
 	server *http.Server
+	listener net.Listener
 }
 
 func (s *HttpServer) Close() error {
-	return s.server.Close()
+	err := s.server.Close()
+	_ = s.listener.Close()
+	return err
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -116,6 +119,7 @@ func StartServer(bp *coremain.BP, args *Args) (*HttpServer, error) {
 		MaxUploadBufferPerConnection: 65535,
 		MaxUploadBufferPerStream:     65535,
 	}); err != nil {
+		l.Close()
 		return nil, fmt.Errorf("failed to setup http2 server, %w", err)
 	}
 
@@ -131,5 +135,6 @@ func StartServer(bp *coremain.BP, args *Args) (*HttpServer, error) {
 	return &HttpServer{
 		args:   args,
 		server: hs,
+		listener: l,
 	}, nil
 }

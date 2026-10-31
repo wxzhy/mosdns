@@ -131,6 +131,13 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 		h.opts.Logger.Error("internal err: failed to pack resp msg", qCtx.InfoField(), zap.Error(err))
 		return nil
 	}
+	level := zap.InfoLevel
+	if h.opts.Logger.Core().Enabled(zap.DebugLevel) {
+		level = zap.DebugLevel
+	}
+	if entry := h.opts.Logger.Check(level, "query log"); entry != nil {
+		entry.Write(zap.Inline(qCtx.QueryLogObject(resp, level == zap.DebugLevel)))
+	}
 	return payload
 }
 

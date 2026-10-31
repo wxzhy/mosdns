@@ -2,6 +2,7 @@ package fallback
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -39,7 +40,7 @@ func TestFallbackPreservesSelectedResponseState(t *testing.T) {
 		t.Fatal(err)
 	}
 	if parent.UpstreamOpt() == nil || parent.UpstreamOpt().UDPSize() != 1400 || len(parent.RespOpt().Option) != 1 || parent.ResponseReceivedAt() != received || !parent.HasMark(7) {
-		t.Fatal("fallback lost selected snapshot state or copied branch marks")
+		t.Fatal("fallback lost selected snapshot state or inherited marks")
 	}
 }
 
@@ -83,6 +84,12 @@ func TestFallbackCommitsOnlyWinningBranchMetadata(t *testing.T) {
 			parent := query_context.NewContext(new(dns.Msg).SetQuestion("example.org.", dns.TypeA))
 			parent.AddRuleHit("entry", []string{"qname example.org"}, "$fallback")
 			parent.SetMark(7)
+			valueKey := query_context.RegKey()
+			untouchedKey := query_context.RegKey()
+			primaryOnlyKey := query_context.RegKey()
+			secondaryOnlyKey := query_context.RegKey()
+			parent.StoreValue(valueKey, "parent")
+			parent.StoreValue(untouchedKey, "keep")
 			ready := make(chan struct{})
 			var primaryBranch, secondaryBranch *query_context.Context
 			prepare := func(c *query_context.Context, tag string) {
@@ -90,7 +97,18 @@ func TestFallbackCommitsOnlyWinningBranchMetadata(t *testing.T) {
 				c.SetUpstreamSelected("tls://"+tag, "DoT", tag, "forward_"+tag)
 				c.AddRuleHit(tag, []string{"branch " + tag}, "$forward_"+tag)
 				c.DeleteMark(7)
-				c.SetMark(8)
+				mark := uint32(8)
+				if tag == "secondary" {
+					mark = 9
+				}
+				c.SetMark(mark)
+				c.StoreValue(valueKey, tag)
+				c.DeleteValue(untouchedKey)
+				if tag == "primary" {
+					c.StoreValue(primaryOnlyKey, tag)
+				} else {
+					c.StoreValue(secondaryOnlyKey, tag)
+				}
 				c.Q().Question[0].Name = tag + ".example."
 				if tag == "primary" {
 					c.FromHosts = true
@@ -128,15 +146,63 @@ func TestFallbackCommitsOnlyWinningBranchMetadata(t *testing.T) {
 			}
 			winner.UpstreamSelected.Tag = "mutated branch"
 			winner.RuleHits[1].Matches[0] = "mutated branch"
+			winner.StoreValue(valueKey, "mutated branch")
+			winner.SetMark(10)
 			if parent.UpstreamSelected.Tag != name || len(parent.RuleHits) != 2 || parent.RuleHits[1].Sequence != name || parent.RuleHits[1].Matches[0] != "branch "+name {
 				t.Fatalf("winner metadata lost, aliased or merged with loser: upstream=%+v rules=%+v", parent.UpstreamSelected, parent.RuleHits)
 			}
 			if parent.FromHosts != primaryWins || parent.FromArbitrary == primaryWins || parent.CacheState.Hit == primaryWins {
 				t.Fatalf("winner source/cache state lost: hosts=%v arbitrary=%v cache=%+v", parent.FromHosts, parent.FromArbitrary, parent.CacheState)
 			}
-			if parent.QQuestion().Name != "example.org." || !parent.HasMark(7) || parent.HasMark(8) {
-				t.Fatal("winner metadata copied branch query/marks")
+			winnerMark, loserMark := uint32(9), uint32(8)
+			if primaryWins {
+				winnerMark, loserMark = 8, 9
+			}
+			if parent.QQuestion().Name != "example.org." || !parent.HasMark(7) || !parent.HasMark(winnerMark) || parent.HasMark(loserMark) || parent.HasMark(10) {
+				t.Fatal("fallback did not merge only the winning branch marks")
+			}
+			value, _ := parent.GetValue(valueKey)
+			untouched, _ := parent.GetValue(untouchedKey)
+			if value != name || untouched != "keep" {
+				t.Fatalf("fallback merged wrong KV: winner=%v untouched=%v", value, untouched)
+			}
+			winnerKey, loserKey := secondaryOnlyKey, primaryOnlyKey
+			if primaryWins {
+				winnerKey, loserKey = primaryOnlyKey, secondaryOnlyKey
+			}
+			if value, ok := parent.GetValue(winnerKey); !ok || value != name {
+				t.Fatal("winner-only KV was not merged")
+			}
+			if _, ok := parent.GetValue(loserKey); ok {
+				t.Fatal("losing branch KV leaked into the parent")
 			}
 		})
+	}
+}
+
+func TestFallbackFailedBranchesDoNotMergeState(t *testing.T) {
+	parent := query_context.NewContext(new(dns.Msg).SetQuestion("fail.example.", dns.TypeA))
+	key := query_context.RegKey()
+	parent.SetMark(7)
+	parent.StoreValue(key, "parent")
+	failed := func(mark uint32) sequence.ExecutableFunc {
+		return sequence.ExecutableFunc(func(_ context.Context, q *query_context.Context) error {
+			q.SetMark(mark)
+			q.StoreValue(key, "failed")
+			return errors.New("failed branch")
+		})
+	}
+	f := &fallback{
+		logger: zap.NewNop(), alwaysStandby: true, fastFallbackDuration: time.Millisecond,
+		primary: failed(8), secondary: failed(9),
+	}
+	if err := f.Exec(context.Background(), parent); !errors.Is(err, ErrFailed) {
+		t.Fatalf("fallback returned %v, want ErrFailed", err)
+	}
+	if !parent.HasMark(7) || parent.HasMark(8) || parent.HasMark(9) {
+		t.Fatal("failed branch leaked a mark")
+	}
+	if value, _ := parent.GetValue(key); value != "parent" {
+		t.Fatal("failed branch changed parent KV")
 	}
 }
