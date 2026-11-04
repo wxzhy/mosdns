@@ -147,7 +147,7 @@ func (dc *TraditionalDnsConn) exchange(ctx context.Context, q []byte) (*[]byte, 
 
 	var resend <-chan time.Time
 	if !dc.isTcp {
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(udpResendInterval)
 		resend = ticker.C
 		defer ticker.Stop()
 	}

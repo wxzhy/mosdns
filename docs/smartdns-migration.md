@@ -83,7 +83,7 @@ geodata:
 关键处理链的注释随配置生成器一起维护，重新生成 YAML 也会保留。两份配置分别
 省去 19 个域名集合中间插件，路由、过滤、替换与动作顺序保持不变。
 
-测速保留旧配置的 **仅 ICMP**：`probe.tcp_ports: []`、`icmp: true`、超时 300ms。
+测速保留旧配置的 **仅 ICMP**：`probe.tcp_ports: []`、`icmp: true`、超时 200ms。
 Windows 需使用允许 raw ICMP 的权限运行；Linux 优先使用非特权接口，必要时
 使用允许 raw ICMP 的权限。仅 ICMP 且能力不可用时启动报错。若希望降低权限要求，
 将三个 `select_cn/global/default` 的 `probe` 一致改为：
@@ -92,7 +92,7 @@ Windows 需使用允许 raw ICMP 的权限运行；Linux 优先使用非特权�
 probe:
   tcp_ports: [80, 443]
   icmp: false
-  timeout: 300ms
+  timeout: 200ms
 ```
 
 这会改用 TCP 建连 RTT，选址结果可能与原 ICMP 不同。也可同时启用两种方法。
@@ -151,9 +151,9 @@ HTTPS 处理保留原来的 hint/H3 清理、ECH 注入和辅助 A 查询。名�
 
 ## 有意保留与不能逐项等价的行为
 
-- 普通 `cn.wait_all=false` 映射为 `bounded`：首个正响应后最多收集 300ms，首次
-  测速成功后收集 25ms。旧程序直接采用首个完成测速的来源，结果和延时可能不同。
-  其他测速组为 `wait_all`，cn 总预算 2s，global/default 为 5s；仍受父截止时间限制。
+- 各测速组统一映射为 `bounded` 限时选优：`cn` 首响应收集窗口 250ms、总预算 1500ms；
+  `global`/`default` 首响应收集窗口 300ms、总预算 2500ms，首次测速成功后收集 25ms，
+  避免慢或不可达上游把整次查询拖满总超时；仍受父截止时间限制。
 - 每个测速来源只查询一个上游。原 aiodns 地址列表和 HTTP hosts 地址池展开并行，
   不再随机挑一个拨号地址，也不逐项模拟 aiodns 的 tries/轮询退避。Google-cn、
   OpenNIC、ECH 查询不需要地址测速，使用独立完整响应 forward 池。

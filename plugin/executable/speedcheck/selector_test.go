@@ -866,3 +866,57 @@ func TestDisplacedEarlyProbeDoesNotShortenBoundedCutoffForAdmittedCandidates(t *
 		}
 	})
 }
+
+func TestBoundedNegativeResponseDoesNotWaitForTotalTimeout(t *testing.T) {
+	t.Run("negative_only_finishes_at_selection_timeout", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			neg := delayedSource("neg", 10*time.Millisecond)
+			dead := delayedSource("dead", 5*time.Second, "192.0.2.9")
+			s := testSelector(t, Args{
+				Mode:             ModeBounded,
+				TotalTimeout:     2500 * time.Millisecond,
+				SelectionTimeout: 250 * time.Millisecond,
+				SettleWindow:     25 * time.Millisecond,
+			}, []Source{neg, dead}, Options{})
+			q := queryContext(false)
+			start := time.Now()
+			if err := s.Exec(context.Background(), q); err != nil {
+				t.Fatal(err)
+			}
+			if elapsed := time.Since(start); elapsed != 260*time.Millisecond {
+				t.Fatalf("bounded negative waited %s, want 260ms", elapsed)
+			}
+			if q.R() == nil || q.R().Rcode != dns.RcodeSuccess || len(q.R().Answer) != 0 {
+				t.Fatalf("unexpected negative response: %v", q.R())
+			}
+			synctest.Wait()
+		})
+	})
+	t.Run("positive_within_negative_window_expands_cutoff", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			neg := delayedSource("neg", 10*time.Millisecond)
+			pos := delayedSource("pos", 100*time.Millisecond, "192.0.2.1")
+			dead := delayedSource("dead", 5*time.Second, "192.0.2.9")
+			s := testSelector(t, Args{
+				Mode:             ModeBounded,
+				TotalTimeout:     2500 * time.Millisecond,
+				SelectionTimeout: 250 * time.Millisecond,
+				SettleWindow:     25 * time.Millisecond,
+			}, []Source{neg, pos, dead}, Options{
+				Probe: fakeProbe(20*time.Millisecond, map[string]time.Duration{"192.0.2.1": 20 * time.Millisecond}, nil),
+			})
+			q := queryContext(false)
+			start := time.Now()
+			if err := s.Exec(context.Background(), q); err != nil {
+				t.Fatal(err)
+			}
+			if elapsed := time.Since(start); elapsed != 145*time.Millisecond {
+				t.Fatalf("positive after negative took %s, want 145ms", elapsed)
+			}
+			if got := answerIPs(q); !slices.Equal(got, []string{"192.0.2.1"}) {
+				t.Fatalf("got %v, want [192.0.2.1]", got)
+			}
+			synctest.Wait()
+		})
+	})
+}

@@ -62,8 +62,12 @@ func networkFailure(ctx context.Context, err error) Result {
 // does not imply that elevation is required on every Windows installation.
 // Keep the families separate because IPv6 can be disabled independently.
 func detectICMP() (v4, v6 string, err error) {
-	var errs []error
-	for _, family := range []int{4, 6} {
+	type detectRes struct {
+		network string
+		errs    []error
+	}
+	probeFamily := func(family int) detectRes {
+		var res detectRes
 		networks := []string{"ip4:icmp"}
 		ip := netip.MustParseAddr("127.0.0.1")
 		if family == 6 {
@@ -77,22 +81,23 @@ func detectICMP() (v4, v6 string, err error) {
 			}
 		}
 		for _, network := range networks {
-			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 			result := probeICMP(ctx, ip, network)
 			cancel()
 			if result.Outcome != Success {
-				errs = append(errs, fmt.Errorf("%s local ICMP capability: %s", network, result.Reason))
+				res.errs = append(res.errs, fmt.Errorf("%s local ICMP capability: %s", network, result.Reason))
 				continue
 			}
-			if family == 4 {
-				v4 = network
-			} else {
-				v6 = network
-			}
+			res.network = network
 			break
 		}
+		return res
 	}
-	return v4, v6, errors.Join(errs...)
+	ch6 := make(chan detectRes, 1)
+	go func() { ch6 <- probeFamily(6) }()
+	r4 := probeFamily(4)
+	r6 := <-ch6
+	return r4.network, r6.network, errors.Join(append(r4.errs, r6.errs...)...)
 }
 
 func newICMPPinger(ip netip.Addr, network string) *probing.Pinger {

@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	quicQueryTimeout = time.Second * 6
+	quicQueryTimeout = time.Second * 4
 )
 
 const (

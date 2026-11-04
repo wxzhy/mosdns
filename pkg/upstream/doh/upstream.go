@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	defaultDoHTimeout = time.Second * 6
+	defaultDoHTimeout = time.Second * 4
 )
 
 var nopLogger = zap.NewNop()

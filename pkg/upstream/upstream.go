@@ -51,7 +51,7 @@ import (
 )
 
 const (
-	tlsHandshakeTimeout = time.Second * 3
+	tlsHandshakeTimeout = time.Second * 2
 
 	// Maximum number of concurrent queries in one pipeline connection.
 	// See RFC 7766 7. Response Reordering.
@@ -334,21 +334,22 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 	useUTLS := len(opt.UTLSFingerprint) > 0 || len(opt.ECHConfigList) > 0
 	var fp *utls.ClientHelloID
 	var echResolver *echConfigResolver
+	var echCloser io.Closer
 	if useUTLS {
 		fp, err = getFingerprint(opt.UTLSFingerprint)
 		if err != nil {
 			return nil, err
 		}
 		if len(opt.ECHConfigList) > 0 {
-			echResolver, err = newECHConfigResolver(opt.ECHConfigList, opt.Logger)
+			echResolver, echCloser, err = acquireECHConfigResolver(opt.ECHConfigList, opt.Logger)
 			if err != nil {
 				return nil, err
 			}
 			defer func() {
 				if err != nil {
-					echResolver.Close()
+					echCloser.Close()
 				} else {
-					upstream = &upstreamWithClose{Upstream: upstream, closers: []io.Closer{echResolver}}
+					upstream = &upstreamWithClose{Upstream: upstream, closers: []io.Closer{echCloser}}
 				}
 			}()
 		}
@@ -477,13 +478,20 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 		}
 
 		dialNetConn := func(ctx context.Context) (transport.NetConn, error) {
+			var resolveECH func(context.Context) []byte
+			if useUTLS && echResolver != nil {
+				resolveECH = echResolver.startGetConfigList(ctx)
+			}
 			conn, err := tcpDialer(ctx)
 			if err != nil {
+				if resolveECH != nil {
+					resolveECH(nil)
+				}
 				return nil, err
 			}
 			conn = wrapConn(conn, opt.EventObserver)
 			if useUTLS {
-				uconn, err := utlsClientHandshake(ctx, conn, tlsConfig, fp, echResolver)
+				uconn, err := utlsClientHandshakeWithECH(ctx, conn, tlsConfig, fp, echResolver, resolveECH)
 				if err != nil {
 					return nil, err
 				}
@@ -566,28 +574,28 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to init tcp dialer, %w", err)
 			}
-				transportCtx, cancelTransport := context.WithCancel(context.Background())
-				addonCloser = closerFunc(func() error {
-					cancelTransport()
-					return nil
-				})
-				defer closeIfFuncErr(addonCloser)
-				withHandshakeBudget := func(ctx context.Context) (context.Context, context.CancelFunc) {
-					stepCtx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout)
-					stop := context.AfterFunc(transportCtx, cancel)
-					return stepCtx, func() {
-						stop()
-						cancel()
-					}
+			transportCtx, cancelTransport := context.WithCancel(context.Background())
+			addonCloser = closerFunc(func() error {
+				cancelTransport()
+				return nil
+			})
+			defer closeIfFuncErr(addonCloser)
+			withHandshakeBudget := func(ctx context.Context) (context.Context, context.CancelFunc) {
+				stepCtx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout)
+				stop := context.AfterFunc(transportCtx, cancel)
+				return stepCtx, func() {
+					stop()
+					cancel()
 				}
-				t1 := &http.Transport{
-					DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { // overwrite server addr
-						dialCtx, cancel := withHandshakeBudget(ctx)
-						defer cancel()
-						c, err := tcpDialer(dialCtx)
-						c = wrapConn(c, opt.EventObserver)
-						return c, err
-					},
+			}
+			t1 := &http.Transport{
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { // overwrite server addr
+					dialCtx, cancel := withHandshakeBudget(ctx)
+					defer cancel()
+					c, err := tcpDialer(dialCtx)
+					c = wrapConn(c, opt.EventObserver)
+					return c, err
+				},
 				TLSClientConfig:     opt.TLSConfig,
 				TLSHandshakeTimeout: tlsHandshakeTimeout,
 				IdleConnTimeout:     idleConnTimeout,
@@ -614,22 +622,29 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 						tlsCfg.NextProtos = []string{"h2", "http/1.1"}
 					}
 				}
-					t1.DialTLSContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-						dialCtx, cancel := withHandshakeBudget(ctx)
-						defer cancel()
-						conn, err := tcpDialer(dialCtx)
-						if err != nil {
-							return nil, err
-						}
-						conn = wrapConn(conn, opt.EventObserver)
-						handshakeCtx, cancelHandshake := withHandshakeBudget(ctx)
-						defer cancelHandshake()
-						uconn, err := utlsClientHandshake(handshakeCtx, conn, tlsCfg, fp, echResolver)
-						if err != nil {
-							return nil, err
-						}
-						return &utlsConn{uconn}, nil
+				t1.DialTLSContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var resolveECH func(context.Context) []byte
+					if echResolver != nil {
+						resolveECH = echResolver.startGetConfigList(ctx)
 					}
+					dialCtx, cancel := withHandshakeBudget(ctx)
+					defer cancel()
+					conn, err := tcpDialer(dialCtx)
+					if err != nil {
+						if resolveECH != nil {
+							resolveECH(nil)
+						}
+						return nil, err
+					}
+					conn = wrapConn(conn, opt.EventObserver)
+					handshakeCtx, cancelHandshake := withHandshakeBudget(ctx)
+					defer cancelHandshake()
+					uconn, err := utlsClientHandshakeWithECH(handshakeCtx, conn, tlsCfg, fp, echResolver, resolveECH)
+					if err != nil {
+						return nil, err
+					}
+					return &utlsConn{uconn}, nil
+				}
 			}
 
 			t2, err := http2.ConfigureTransports(t1)
@@ -639,7 +654,7 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 			t2.MaxHeaderListSize = 4 * 1024
 			t2.MaxReadFrameSize = 16 * 1024
 			t2.ReadIdleTimeout = time.Second * 30
-			t2.PingTimeout = time.Second * 5
+			t2.PingTimeout = time.Second * 3
 			t = t1
 		}
 

@@ -33,7 +33,7 @@ import (
 
 const (
 	// Most servers will send SERVFAIL after 3~5s. If no resp, connection may be dead.
-	reuseConnQueryTimeout = time.Second * 6
+	reuseConnQueryTimeout = time.Second * 4
 )
 
 // ReuseConnTransport is for old tcp protocol. (no pipelining)

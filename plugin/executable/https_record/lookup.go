@@ -114,9 +114,10 @@ func serviceQuery(parent *query_context.Context, name string, typ uint16, inheri
 
 func (p *Record) resolveECH(ctx context.Context, parent *query_context.Context) (echData, error) {
 	branch := serviceQuery(parent, p.echDomain, dns.TypeHTTPS, false)
-	keyQuery := branch.Q().Copy()
-	keyQuery.Id = 0
-	wire, err := keyQuery.Pack()
+	origID := branch.Q().Id
+	branch.Q().Id = 0
+	wire, err := branch.Q().Pack()
+	branch.Q().Id = origID
 	if err != nil {
 		return echData{}, err
 	}

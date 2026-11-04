@@ -35,12 +35,15 @@ var (
 
 const (
 	defaultIdleTimeout = time.Second * 10
-	defaultDialTimeout = time.Second * 5
+	defaultDialTimeout = time.Second * 3
 
 	// If a pipeline connection sent a query but did not see any reply (include replies that
 	// for other queries) from the server after waitingReplyTimeout. It assumes that
 	// something goes wrong with the connection or the server. The connection will be closed.
-	waitingReplyTimeout = time.Second * 10
+	waitingReplyTimeout = time.Second * 5
+
+	// Interval between UDP query resends while waiting for a reply.
+	udpResendInterval = time.Millisecond * 400
 
 	defaultTdcMaxConcurrentQuery = 32
 	defaultMaxLazyConnQueue      = 16

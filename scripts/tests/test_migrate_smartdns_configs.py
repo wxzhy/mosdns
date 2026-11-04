@@ -20,9 +20,9 @@ from scripts.migrate_smartdns_configs import merge_example_services, render_conf
 ROOT = Path(__file__).resolve().parents[2]
 POLICY_HASHES = {
     # Entire policy graphs at 559ee09 before the runtime-service merge;
-    # updated when the GitHub IP sets were inlined, dropping the txt dependency.
-    "config.yaml": "36adc38bbd7018e7dad690750aec69c1431d514037363e2aee8f2f9258114d5a",
-    "config-cernet.yaml": "b36d0aafcbb88630cdcac61580a04ac74aad8ccd206d31e38c46b4862b66ed1d",
+    # updated when the GitHub IP sets were inlined and selector/HTTPS timeouts were tightened.
+    "config.yaml": "f4ddf9214c5b85b3dcf04973ac9bfa2dcd1906433a9d746b258a63bb6e358b04",
+    "config-cernet.yaml": "bd0766618de950a20be96b298059cf4a296f1298bd30d7e2b209122d0b5bfd9d",
 }
 
 

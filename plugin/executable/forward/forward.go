@@ -48,8 +48,9 @@ func init() {
 }
 
 const (
-	maxConcurrentQueries = 3
-	queryTimeout         = time.Second * 5
+	defaultQuickSetupConcurrent = 3
+	maxConcurrentQueries        = 8
+	queryTimeout                = time.Second * 3
 )
 
 type Args struct {
@@ -401,7 +402,7 @@ func (f *Forward) setUpstream(qCtx *query_context.Context, u *upstreamWrapper) {
 
 func quickSetup(bq sequence.BQ, s string) (any, error) {
 	args := new(Args)
-	args.Concurrent = maxConcurrentQueries
+	args.Concurrent = defaultQuickSetupConcurrent
 	for _, u := range strings.Fields(s) {
 		args.Upstreams = append(args.Upstreams, UpstreamConfig{Addr: u})
 	}

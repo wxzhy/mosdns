@@ -118,14 +118,17 @@ func newECHDoTTestServer(t testing.TB, handler dns.Handler, echConfig, privateKe
 		t.Fatal(err)
 	}
 	doTAddr := tlsListener.Addr().String()
+	ready := make(chan struct{})
 	doTServer := dns.Server{
-		Net:           "tcp-tls",
-		Listener:      tlsListener,
-		TLSConfig:     tlsConfig,
-		Handler:       handler,
-		MaxTCPQueries: -1,
+		Net:               "tcp-tls",
+		Listener:          tlsListener,
+		TLSConfig:         tlsConfig,
+		Handler:           handler,
+		MaxTCPQueries:     -1,
+		NotifyStartedFunc: func() { close(ready) },
 	}
 	go doTServer.ActivateAndServe()
+	<-ready
 	return doTAddr, func() {
 		doTServer.Shutdown()
 	}
@@ -273,14 +276,17 @@ func newDoTTestServerWithCert(t testing.TB, handler dns.Handler, cert tls.Certif
 		t.Fatal(err)
 	}
 	doTAddr := tlsListener.Addr().String()
+	ready := make(chan struct{})
 	doTServer := dns.Server{
-		Net:           "tcp-tls",
-		Listener:      tlsListener,
-		TLSConfig:     tlsConfig,
-		Handler:       handler,
-		MaxTCPQueries: -1,
+		Net:               "tcp-tls",
+		Listener:          tlsListener,
+		TLSConfig:         tlsConfig,
+		Handler:           handler,
+		MaxTCPQueries:     -1,
+		NotifyStartedFunc: func() { close(ready) },
 	}
 	go doTServer.ActivateAndServe()
+	<-ready
 	return doTAddr, func() {
 		doTServer.Shutdown()
 	}

@@ -37,7 +37,8 @@ import (
 const (
 	minimumUpdateInterval = time.Minute * 5
 	retryInterval         = time.Second * 2
-	queryTimeout          = time.Second * 5
+	queryTimeout          = time.Second * 3
+	udpRetryInterval      = time.Millisecond * 400
 )
 
 var (
@@ -180,7 +181,7 @@ func (sp *Bootstrap) resolve(ctx context.Context, qt uint16) (netip.Addr, uint32
 			return
 		}
 
-		retryTicker := time.NewTicker(time.Second)
+		retryTicker := time.NewTicker(udpRetryInterval)
 		defer retryTicker.Stop()
 		for {
 			select {

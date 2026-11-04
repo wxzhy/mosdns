@@ -43,11 +43,14 @@ func newUDPTestServer(t testing.TB, handler dns.Handler) (addr string, shutdownF
 		t.Fatal(err)
 	}
 	udpAddr := udpConn.LocalAddr().String()
+	ready := make(chan struct{})
 	udpServer := dns.Server{
-		PacketConn: udpConn,
-		Handler:    handler,
+		PacketConn:        udpConn,
+		Handler:           handler,
+		NotifyStartedFunc: func() { close(ready) },
 	}
 	go udpServer.ActivateAndServe()
+	<-ready
 	return udpAddr, func() {
 		udpServer.Shutdown()
 	}
@@ -59,12 +62,15 @@ func newTCPTestServer(t testing.TB, handler dns.Handler) (addr string, shutdownF
 		t.Fatal(err)
 	}
 	tcpAddr := l.Addr().String()
+	ready := make(chan struct{})
 	tcpServer := dns.Server{
-		Listener:      l,
-		Handler:       handler,
-		MaxTCPQueries: -1,
+		Listener:          l,
+		Handler:           handler,
+		MaxTCPQueries:     -1,
+		NotifyStartedFunc: func() { close(ready) },
 	}
 	go tcpServer.ActivateAndServe()
+	<-ready
 	return tcpAddr, func() {
 		tcpServer.Shutdown()
 	}
@@ -83,14 +89,17 @@ func newDoTTestServer(t testing.TB, handler dns.Handler) (addr string, shutdownF
 		t.Fatal(err)
 	}
 	doTAddr := tlsListener.Addr().String()
+	ready := make(chan struct{})
 	doTServer := dns.Server{
-		Net:           "tcp-tls",
-		Listener:      tlsListener,
-		TLSConfig:     tlsConfig,
-		Handler:       handler,
-		MaxTCPQueries: -1,
+		Net:               "tcp-tls",
+		Listener:          tlsListener,
+		TLSConfig:         tlsConfig,
+		Handler:           handler,
+		MaxTCPQueries:     -1,
+		NotifyStartedFunc: func() { close(ready) },
 	}
 	go doTServer.ActivateAndServe()
+	<-ready
 	return doTAddr, func() {
 		doTServer.Shutdown()
 	}

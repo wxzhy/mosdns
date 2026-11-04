@@ -220,7 +220,7 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 	}()
 	metadata := make(map[netip.Addr]ipMetadata)
 	doneSources := 0
-	var firstPositive, firstSuccess time.Time
+	var firstPositive, firstNegative, firstSuccess time.Time
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	defer func() {
@@ -244,7 +244,11 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 		}
 	}
 	updateCutoff := func(allowExpand bool) {
-		next := selectionCutoff(deadline, s.args.Mode, firstPositive, firstSuccess, s.args.SelectionTimeout, s.args.SettleWindow)
+		effectivePositive := firstPositive
+		if effectivePositive.IsZero() {
+			effectivePositive = firstNegative
+		}
+		next := selectionCutoff(deadline, s.args.Mode, effectivePositive, firstSuccess, s.args.SelectionTimeout, s.args.SettleWindow)
 		if allowExpand {
 			cutoff = next
 		} else {
@@ -302,12 +306,20 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 					accepted = true
 					if len(c.Addresses) > 0 {
 						observeEarliest(&firstPositive, event.at)
+					} else if c.Negative {
+						observeEarliest(&firstNegative, event.at)
 					}
 					admitted = s.refreshProbes(work, states, probes, startedIPs, probed, launch)
 					recomputeFirstSuccess()
 					if len(c.Addresses) > 0 {
 						if launch {
 							resetTimer(true)
+						} else {
+							updateCutoff(false)
+						}
+					} else if c.Negative && firstPositive.IsZero() {
+						if launch {
+							resetTimer(false)
 						} else {
 							updateCutoff(false)
 						}

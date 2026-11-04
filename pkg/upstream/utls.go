@@ -26,6 +26,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"slices"
 	"strings"
@@ -152,9 +153,17 @@ func copyStdTLSConfigToUTLS(c *tls.Config) *utls.Config {
 // fingerprint and handshakes. If ech is not nil, the resolved ECHConfigList
 // is applied.
 func utlsClientHandshake(ctx context.Context, conn net.Conn, c *tls.Config, fp *utls.ClientHelloID, ech *echConfigResolver) (*utls.UConn, error) {
+	return utlsClientHandshakeWithECH(ctx, conn, c, fp, ech, nil)
+}
+
+func utlsClientHandshakeWithECH(ctx context.Context, conn net.Conn, c *tls.Config, fp *utls.ClientHelloID, ech *echConfigResolver, resolveECH func(context.Context) []byte) (*utls.UConn, error) {
 	uconfig := copyStdTLSConfigToUTLS(c)
 	if ech != nil {
-		uconfig.EncryptedClientHelloConfigList = ech.getConfigList(ctx)
+		if resolveECH != nil {
+			uconfig.EncryptedClientHelloConfigList = resolveECH(ctx)
+		} else {
+			uconfig.EncryptedClientHelloConfigList = ech.getConfigList(ctx)
+		}
 	}
 	uconn := utls.UClient(conn, uconfig, *fp)
 	if err := uconn.BuildHandshakeState(); err != nil {
@@ -409,7 +418,69 @@ func (m *echConfigMutex) Unlock() { <-m.gate }
 
 // minECHConfigTTL is the minimum cache duration for a queried
 // ECHConfigList, to avoid refreshing short TTL records too frequently.
-const minECHConfigTTL = time.Minute * 5
+const (
+	minECHConfigTTL = time.Minute * 5
+	echQueryTimeout = 1500 * time.Millisecond
+)
+
+type sharedECHEntry struct {
+	resolver *echConfigResolver
+	refs     int
+}
+
+var (
+	sharedECHMu        sync.Mutex
+	sharedECHResolvers = make(map[string]*sharedECHEntry)
+)
+
+func acquireECHConfigResolver(s string, logger *zap.Logger) (*echConfigResolver, io.Closer, error) {
+	if !strings.Contains(s, "://") {
+		r, err := newECHConfigResolver(s, logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		return r, r, nil
+	}
+	sharedECHMu.Lock()
+	if entry := sharedECHResolvers[s]; entry != nil && !entry.resolver.closed {
+		entry.refs++
+		r := entry.resolver
+		sharedECHMu.Unlock()
+		return r, newSharedECHCloser(s, entry), nil
+	}
+	r, err := newECHConfigResolver(s, logger)
+	if err != nil {
+		sharedECHMu.Unlock()
+		return nil, nil, err
+	}
+	entry := &sharedECHEntry{resolver: r, refs: 1}
+	sharedECHResolvers[s] = entry
+	sharedECHMu.Unlock()
+	return r, newSharedECHCloser(s, entry), nil
+}
+
+func newSharedECHCloser(key string, entry *sharedECHEntry) io.Closer {
+	var once sync.Once
+	var closeErr error
+	return closerFunc(func() error {
+		once.Do(func() {
+			var toClose *echConfigResolver
+			sharedECHMu.Lock()
+			entry.refs--
+			if entry.refs <= 0 {
+				if sharedECHResolvers[key] == entry {
+					delete(sharedECHResolvers, key)
+				}
+				toClose = entry.resolver
+			}
+			sharedECHMu.Unlock()
+			if toClose != nil {
+				closeErr = toClose.Close()
+			}
+		})
+		return closeErr
+	})
+}
 
 func newECHConfigResolver(s string, logger *zap.Logger) (*echConfigResolver, error) {
 	if logger == nil {
@@ -437,24 +508,30 @@ func newECHConfigResolver(s string, logger *zap.Logger) (*echConfigResolver, err
 	return &echConfigResolver{domain: domain, dnsServer: dnsServer, logger: logger, closedCtx: closedCtx, cancel: cancel}, nil
 }
 
-// getConfigList returns the ECHConfigList. It never returns nil.
-func (r *echConfigResolver) getConfigList(ctx context.Context) []byte {
+// startGetConfigList begins resolving the ECHConfigList (or returns a cached/static
+// result immediately) so callers can overlap ECH DNS resolution with TCP dialing.
+// The returned function must be called once; pass a nil context to release the flight.
+func (r *echConfigResolver) startGetConfigList(ctx context.Context) func(context.Context) []byte {
+	if r == nil {
+		return nil
+	}
 	if r.closedCtx.Err() != nil || ctx.Err() != nil {
-		return invalidECHConfigList
+		return func(context.Context) []byte { return invalidECHConfigList }
 	}
 	if r.static != nil {
-		return r.static
+		static := r.static
+		return func(context.Context) []byte { return static }
 	}
 
 	r.stateMu.Lock()
 	if r.closed || ctx.Err() != nil || r.closedCtx.Err() != nil {
 		r.stateMu.Unlock()
-		return invalidECHConfigList
+		return func(context.Context) []byte { return invalidECHConfigList }
 	}
 	if time.Now().Before(r.nextRefresh) && r.config != nil {
 		cfg := r.config
 		r.stateMu.Unlock()
-		return cfg
+		return func(context.Context) []byte { return cfg }
 	}
 	f := r.flight
 	if f == nil {
@@ -466,19 +543,30 @@ func (r *echConfigResolver) getConfigList(ctx context.Context) []byte {
 	f.waiters++
 	r.stateMu.Unlock()
 
-	select {
-	case <-f.done:
-		if ctx.Err() != nil || r.closedCtx.Err() != nil {
+	return func(waitCtx context.Context) []byte {
+		if waitCtx == nil {
+			r.releaseFlight(f)
 			return invalidECHConfigList
 		}
-		return f.result
-	case <-ctx.Done():
-		r.releaseFlight(f)
-		return invalidECHConfigList
-	case <-r.closedCtx.Done():
-		r.releaseFlight(f)
-		return invalidECHConfigList
+		select {
+		case <-f.done:
+			if waitCtx.Err() != nil || r.closedCtx.Err() != nil {
+				return invalidECHConfigList
+			}
+			return f.result
+		case <-waitCtx.Done():
+			r.releaseFlight(f)
+			return invalidECHConfigList
+		case <-r.closedCtx.Done():
+			r.releaseFlight(f)
+			return invalidECHConfigList
+		}
 	}
+}
+
+// getConfigList returns the ECHConfigList. It never returns nil.
+func (r *echConfigResolver) getConfigList(ctx context.Context) []byte {
+	return r.startGetConfigList(ctx)(ctx)
 }
 
 func (r *echConfigResolver) releaseFlight(f *echFlight) {
@@ -558,7 +646,7 @@ func (r *echConfigResolver) Close() error {
 // It returns the ech param of the record and the record's TTL.
 // It must be called with r.mu locked.
 func (r *echConfigResolver) query(ctx context.Context) ([]byte, uint32, error) {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithTimeout(ctx, echQueryTimeout)
 	defer cancel()
 	stop := context.AfterFunc(r.closedCtx, cancel)
 	defer stop()

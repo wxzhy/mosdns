@@ -772,7 +772,7 @@ plugins:
   args:
   - exec: $upstream_114dns_2
 
-# 各组 selector 保留原候选顺序、mode 和超时；不能用先选一份响应的 forward 池代替。
+# 各组 selector 保留原候选顺序，统一使用 bounded 限时选优并收紧超时，避免慢/不可达上游拖慢整次查询；不能用先选一份响应的 forward 池代替。
 # probe/labels/倍率配置以锚点共享；修改锚点影响其引用，单组调整时先展开对应别名。
 # private 只豁免探测，不代表丢弃该地址；其余地址在过滤和替换完成后才进入测速。
 - tag: select_cn
@@ -788,13 +788,13 @@ plugins:
     - source_cn__114dns__1
     - source_cn__114dns__2
     mode: bounded
-    total_timeout: 2s
-    selection_timeout: 300ms
+    total_timeout: 1500ms
+    selection_timeout: 250ms
     settle_window: 25ms
     probe: &id001
       tcp_ports: []
       icmp: true
-      timeout: 300ms
+      timeout: 200ms
     max_num: 1
     threshold_ms: 100
     labels: &id002
@@ -1017,8 +1017,8 @@ plugins:
     - source_global__nextdns__5
     - source_global__nextdns__6
     - source_global__nextdns__7
-    mode: wait_all
-    total_timeout: 5s
+    mode: bounded
+    total_timeout: 2500ms
     selection_timeout: 300ms
     settle_window: 25ms
     probe: *id001
@@ -1344,8 +1344,8 @@ plugins:
     - source_default__nextdns__5
     - source_default__nextdns__6
     - source_default__nextdns__7
-    mode: wait_all
-    total_timeout: 5s
+    mode: bounded
+    total_timeout: 2500ms
     selection_timeout: 300ms
     settle_window: 25ms
     probe: *id001
@@ -1531,7 +1531,7 @@ plugins:
     ip_source: resolve_cached
     match_ip:
     - $ip_cloudflare
-    timeout: 500ms
+    timeout: 400ms
 - tag: inject_https_cn
   type: sequence
   args:
@@ -1560,7 +1560,7 @@ plugins:
     match_ip:
     - $ip_cloudflare
     - $ip_asn_33191
-    timeout: 500ms
+    timeout: 400ms
 - tag: inject_https
   type: sequence
   args:
@@ -1589,7 +1589,7 @@ plugins:
     match_ip:
     - $ip_cloudflare
     - $ip_fastly
-    timeout: 500ms
+    timeout: 400ms
 - tag: inject_https_twitter
   type: sequence
   args:

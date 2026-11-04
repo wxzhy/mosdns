@@ -163,3 +163,29 @@ func TestDoTSingleEventObserverWrap(t *testing.T) {
 	}
 }
 
+func TestSharedECHConfigResolverRefCounting(t *testing.T) {
+	spec := "shared.example+udp://127.0.0.1:53535"
+	r1, c1, err := acquireECHConfigResolver(spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, c2, err := acquireECHConfigResolver(spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1 != r2 {
+		t.Fatal("identical ECH spec did not share resolver")
+	}
+	if err := c1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if r1.closed {
+		t.Fatal("shared resolver closed while second reference is still active")
+	}
+	if err := c2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !r1.closed {
+		t.Fatal("shared resolver was not closed after last reference released")
+	}
+}

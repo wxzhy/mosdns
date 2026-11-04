@@ -32,3 +32,30 @@ func Test_lazyDnsConn_honors_configured_dial_timeout(t *testing.T) {
 		t.Fatal("dial was not started")
 	}
 }
+
+func Test_lazyDnsConn_dialFailureDoesNotBlockEarlyOrLateCallers(t *testing.T) {
+	dialRelease := make(chan struct{})
+	lc := newLazyDnsConn(func(ctx context.Context) (DnsConn, error) {
+		<-dialRelease
+		return nil, ErrClosedTransport
+	}, time.Second, 4, zap.NewNop())
+	defer lc.Close()
+
+	rxc1, closed := lc.ReserveNewQuery()
+	require.False(t, closed)
+	require.NotNil(t, rxc1)
+
+	rxc2, closed := lc.ReserveNewQuery()
+	require.False(t, closed)
+	require.NotNil(t, rxc2)
+	rxc2.WithdrawReserved()
+
+	close(dialRelease)
+
+	_, err := rxc1.ExchangeReserved(context.Background(), []byte{0, 1})
+	require.ErrorIs(t, err, ErrClosedTransport)
+
+	rxc3, closed := lc.ReserveNewQuery()
+	require.True(t, closed)
+	require.Nil(t, rxc3)
+}

@@ -280,7 +280,7 @@ class Migration:
         probe = {
             "tcp_ports": ping.get("port") or [],
             "icmp": ping.get("ping", True),
-            "timeout": f"{round(ping.get('timeout', 0.3) * 1000)}ms",
+            "timeout": f"{min(round(ping.get('timeout', 0.2) * 1000), 200)}ms",
         }
         asn_multipliers = speed.get("asn_multipliers", {})
         probe_match = {
@@ -309,11 +309,9 @@ class Migration:
                 "speedcheck",
                 {
                     "sources": sources,
-                    "mode": "wait_all"
-                    if resolver.get("wait_all", False)
-                    else "bounded",
-                    "total_timeout": f"{resolver['timeout']}s",
-                    "selection_timeout": "300ms",
+                    "mode": "bounded",
+                    "total_timeout": "1500ms" if group == "cn" else "2500ms",
+                    "selection_timeout": "250ms" if group == "cn" else "300ms",
                     "settle_window": "25ms",
                     "probe": probe,
                     "max_num": speed.get("max_num", 1),
@@ -426,7 +424,7 @@ class Migration:
                 "ech_domain": action.get("ech_domain", "crypto.cloudflare.com"),
                 "ip_source": "resolve_cached",
                 "match_ip": self.ip_expressions(action["match_ip"], "include"),
-                "timeout": "500ms",
+                "timeout": "400ms",
             }
             tag = name.replace("-", "_")
             self.add(f"process_{tag}", "https_record", args)
@@ -557,7 +555,7 @@ def render_config(cfg: dict) -> str:
             "任一步之后无响应立即 return 结束该候选，不对原地址先测速。"
         ),
         "select_": (
-            "各组 selector 保留原候选顺序、mode 和超时；不能用先选一份响应的 forward 池代替。\n"
+            "各组 selector 保留原候选顺序，统一使用 bounded 限时选优并收紧超时，避免慢/不可达上游拖慢整次查询；不能用先选一份响应的 forward 池代替。\n"
             "probe/labels/倍率配置以锚点共享；修改锚点影响其引用，单组调整时先展开对应别名。\n"
             "private 只豁免探测，不代表丢弃该地址；其余地址在过滤和替换完成后才进入测速。"
         ),
