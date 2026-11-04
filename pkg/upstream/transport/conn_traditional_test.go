@@ -272,7 +272,7 @@ func TestTraditionalRepeatOnlyUDP(t *testing.T) {
 		q := make([]byte, 12)
 		conn := &recordingConn{closed: make(chan struct{})}
 		dc := NewDnsConn(TraditionalDnsConnOpts{WithLengthHeader: tcp, Repeat: 2}, conn)
-		if err := dc.writeQuery(q, 42); err != nil {
+		if err := dc.writeQuery(context.Background(), q, 42); err != nil {
 			t.Fatal(err)
 		}
 		dc.Close()

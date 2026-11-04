@@ -110,10 +110,20 @@ func ServeDoQ(l *quic.Listener, h Handler, opts DoQServerOpts) error {
 						Protocol:   "DoQ",
 					}
 
-					resp := h.Handle(connCtx, req, queryMeta, pool.PackTCPBuffer)
+					// The stream context tracks our send side, including a peer's
+					// cancellation of its response reader. A normal request FIN
+					// only closes the receive side and must leave the query alive.
+					queryCtx, cancelQuery := context.WithCancelCause(connCtx)
+					defer cancelQuery(nil)
+					stopStreamCancel := context.AfterFunc(stream.Context(), func() {
+						cancelQuery(context.Cause(stream.Context()))
+					})
+					defer stopStreamCancel()
+					resp := h.Handle(queryCtx, req, queryMeta, pool.PackTCPBuffer)
 					if resp == nil {
 						return
 					}
+					defer pool.ReleaseBuf(resp)
 					if _, err := stream.Write(*resp); err != nil {
 						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
 					}

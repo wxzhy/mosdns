@@ -18,19 +18,20 @@ Linux 的对应命令：
 `ips/<tag>.txt`、`Country.mmdb`、`ASN.mmdb` 和 SHA-256 清单
 `manifest.json`，另保留 `domains/<tag>.txt` 供核对。两份配置都以 mosdns
 启动时的工作目录解析 `data/smartdns` 路径。部署可复制整个目录；运行只需要
-三个数据库和两个 IP 文本，不依赖 `domains` 文本或 Python。生成的数据无需加入 Git。
+三个数据库，GitHub 两个自定义集合的 CIDR 已内联进配置，不依赖 IP 文本，
+也不依赖 `domains` 文本或 Python。生成的数据无需加入 Git。
 
 | SmartDNS 数据 | mosdns 数据与用途 |
 |---|---|
 | `tags/output/geosite.trie` | 默认转换成保留后缀语义的 `geosite.dat`，直接使用 `geosite:cn` 等集合名称；同份规则另导出为文本供核对 |
-| `tags/geoip/github.txt`、`github-raw.txt` | 规范化 CIDR，供 `ip_set.files` 加载 |
+| `tags/geoip/github.txt`、`github-raw.txt` | 规范化 CIDR 内联进两份配置的 `ip_github`、`ip_github-raw`；导出文本仅供核对 |
 | `tags/output/geoip.metadb` | 原样复制为 `Country.mmdb`；顶层 `geodata.geoip` 指定后使用 `geoip:标签`，保留国家和 CDN 多标签 |
 | `tags/output/asn.mmdb` | 原样复制为 `ASN.mmdb`；顶层 `geodata.asn` 指定后使用 `asn:号码` |
 | `tags/output/geoip.radix` | 不直接加载。它是 Python pickle，两个自定义集合用原始文本迁移 |
 
 数据库路径在 YAML 顶层集中声明，路由和动作直接引用名称，不再为每个域名集合
-建立 `domain_set` 插件。两个 GitHub 集合是自定义精确 IP 段，继续使用文件；用较宽的
-MMDB 标签或 ASN 替代会扩大匹配范围。
+建立 `domain_set` 插件。两个 GitHub 集合是自定义精确 IP 段，已内联为配置中的
+CIDR 字面量，不读取任何 IP 文本；用较宽的 MMDB 标签或 ASN 替代会扩大匹配范围。
 
 ```yaml
 geodata:

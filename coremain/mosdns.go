@@ -33,6 +33,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"io"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"sync"
@@ -44,7 +45,8 @@ type Mosdns struct {
 	geodataPaths geodata.Paths
 
 	// Plugins
-	plugins map[string]any
+	pluginsMu sync.RWMutex
+	plugins   map[string]any
 
 	httpMux    *chi.Mux
 	metricsReg *prometheus.Registry
@@ -112,65 +114,113 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	// This must be called after m.httpMux and m.metricsReg been set.
 	m.initHttpMux()
 
-	// Start http api server
-	if httpAddr := cfg.API.HTTP; len(httpAddr) > 0 {
+	// A plugin can signal failure from a serving goroutine before its
+	// constructor returns. Wait for initialization to stop publishing plugins
+	// before taking the shutdown snapshot and releasing the log sink.
+	initDone := make(chan struct{})
+	finishInit := sync.OnceFunc(func() { close(initDone) })
+	defer finishInit()
+	m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
+		defer done()
+		defer closeLog()
+		<-closeSignal
+		<-initDone
+		m.logger.Info("starting shutdown sequences")
+		for tag, p := range m.pluginsSnapshot() {
+			if closer, _ := p.(io.Closer); closer != nil {
+				m.logger.Info("closing plugin", zap.String("tag", tag))
+				_ = closer.Close()
+			}
+		}
+		m.logger.Info("all plugins were closed")
+	})
+	failInit := func(err error) (*Mosdns, error) {
+		m.sc.SendCloseSignal(err)
+		finishInit()
+		// Preserve the first service error if it caused initialization to stop.
+		if closeErr := m.sc.WaitClosed(); closeErr != nil {
+			return nil, closeErr
+		}
+		return nil, err
+	}
+
+	// Reserve the API socket synchronously so bind failures are initialization
+	// errors. Do not serve requests until all plugin routes are installed.
+	var apiListener net.Listener
+	if httpAddr := cfg.API.HTTP; httpAddr != "" {
+		apiListener, err = net.Listen("tcp", httpAddr)
+		if err != nil {
+			return failInit(fmt.Errorf("failed to listen api http server: %w", err))
+		}
+		defer func() {
+			if !initialized {
+				_ = apiListener.Close()
+			}
+		}()
+	}
+
+	// Preset plugins
+	if err := m.loadPresetPlugins(); err != nil {
+		return failInit(err)
+	}
+	// Plugins from config.
+	if err := m.loadPluginsFromCfg(cfg, 0); err != nil {
+		return failInit(err)
+	}
+	if err := m.initializationError(); err != nil {
+		return failInit(err)
+	}
+	m.logger.Info("all plugins are loaded")
+
+	if apiListener != nil {
+		m.logger.Info("starting api http server", zap.Stringer("addr", apiListener.Addr()))
 		httpServer := &http.Server{
-			Addr:              httpAddr,
 			Handler:           ProtectAPI(m.httpMux, cfg.API.Token),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 		m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
 			defer done()
+			defer apiListener.Close()
+			defer httpServer.Close()
 			errChan := make(chan error, 1)
 			go func() {
-				m.logger.Info("starting api http server", zap.String("addr", httpAddr))
-				errChan <- httpServer.ListenAndServe()
+				errChan <- httpServer.Serve(apiListener)
 			}()
 			select {
 			case err := <-errChan:
 				m.sc.SendCloseSignal(err)
 			case <-closeSignal:
 				_ = httpServer.Close()
+				_ = apiListener.Close()
+				<-errChan
 			}
 		})
 	}
-
-	// Load plugins.
-
-	// Close all plugins on signal.
-	// From here, call m.sc.SendCloseSignal() if any plugin failed to load.
-	m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
-		go func() {
-			defer done()
-			defer closeLog()
-			<-closeSignal
-			m.logger.Info("starting shutdown sequences")
-			for tag, p := range m.plugins {
-				if closer, _ := p.(io.Closer); closer != nil {
-					m.logger.Info("closing plugin", zap.String("tag", tag))
-					_ = closer.Close()
-				}
-			}
-			m.logger.Info("all plugins were closed")
-		}()
-	})
-
-	// Preset plugins
-	if err := m.loadPresetPlugins(); err != nil {
-		m.sc.SendCloseSignal(err)
-		_ = m.sc.WaitClosed()
-		return nil, err
+	if err := m.initializationError(); err != nil {
+		return failInit(err)
 	}
-	// Plugins from config.
-	if err := m.loadPluginsFromCfg(cfg, 0); err != nil {
-		m.sc.SendCloseSignal(err)
-		_ = m.sc.WaitClosed()
-		return nil, err
-	}
-	m.logger.Info("all plugins are loaded")
-
 	initialized = true
+	finishInit()
 	return m, nil
+}
+
+func (m *Mosdns) initializationError() error {
+	select {
+	case <-m.sc.ReceiveCloseSignal():
+		return errors.New("mosdns closed during initialization")
+	default:
+		return nil
+	}
+}
+
+func (m *Mosdns) pluginsSnapshot() map[string]any {
+	m.pluginsMu.RLock()
+	defer m.pluginsMu.RUnlock()
+	plugins := make(map[string]any, len(m.plugins))
+	for tag, p := range m.plugins {
+		plugins[tag] = p
+	}
+	return plugins
 }
 
 // NewTestMosdnsWithPlugins returns a mosdns instance for testing.
@@ -213,6 +263,8 @@ func (m *Mosdns) Logger() *zap.Logger {
 
 // GetPlugin returns a plugin.
 func (m *Mosdns) GetPlugin(tag string) any {
+	m.pluginsMu.RLock()
+	defer m.pluginsMu.RUnlock()
 	return m.plugins[tag]
 }
 
@@ -222,7 +274,7 @@ type Flusher interface {
 
 // FlushAllCaches supports the historical stats_api cache control endpoint.
 func (m *Mosdns) FlushAllCaches() {
-	for _, p := range m.plugins {
+	for _, p := range m.pluginsSnapshot() {
 		if f, ok := p.(Flusher); ok {
 			f.Flush()
 		}
@@ -283,17 +335,25 @@ func (m *Mosdns) initHttpMux() {
 
 func (m *Mosdns) loadPresetPlugins() error {
 	for tag, f := range LoadNewPersetPluginFuncs() {
+		if err := m.initializationError(); err != nil {
+			return err
+		}
 		p, err := f(NewBP(tag, m))
 		if err != nil {
 			return fmt.Errorf("failed to init preset plugin %s, %w", tag, err)
 		}
+		m.pluginsMu.Lock()
 		m.plugins[tag] = p
+		m.pluginsMu.Unlock()
 	}
-	return nil
+	return m.initializationError()
 }
 
 // loadPluginsFromCfg loads plugins from this config. It follows include first.
 func (m *Mosdns) loadPluginsFromCfg(cfg *Config, includeDepth int) error {
+	if err := m.initializationError(); err != nil {
+		return err
+	}
 	if includeDepth > 0 && cfg.Geodata != (geodata.Paths{}) {
 		return errors.New("geodata defaults must be declared in the root config, not an included config")
 	}

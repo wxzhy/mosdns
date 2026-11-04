@@ -24,7 +24,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,6 +58,7 @@ type TraditionalDnsConn struct {
 	reservedQuery int
 	nextQid       uint16
 	queue         map[uint32]chan *[]byte // uint32 has fast path
+	writeGate     chan struct{}           // one owner of the shared write deadline
 
 	// waitingResp indicates connection is waiting a reply from the peer.
 	// It can identify c is dead or buggy in some circumstances. e.g. Network is dropped
@@ -102,6 +102,7 @@ func NewDnsConn(opt TraditionalDnsConnOpts, conn NetConn) *TraditionalDnsConn {
 		dropSpoofedResp: opt.DropSpoofedResp,
 		closeNotify:     make(chan struct{}),
 		queue:           make(map[uint32]chan *[]byte),
+		writeGate:       make(chan struct{}, 1),
 	}
 	if dc.repeat < 0 {
 		dc.repeat = 0
@@ -130,13 +131,8 @@ func (dc *TraditionalDnsConn) exchange(ctx context.Context, q []byte) (*[]byte, 
 	}
 	defer dc.deleteQueueC(assignedQid)
 
-	// Reminder: Set write deadline here is not very useful to avoid dead connections.
-	// Typically, a write operation will time out only if its socket buffer is full.
-	// Ser read deadline is enough.
-	err := dc.writeQuery(q, assignedQid)
+	err := dc.writeQuery(ctx, q, assignedQid)
 	if err != nil {
-		// Write error usually is fatal. Abort and close this connection.
-		dc.CloseWithErr(fmt.Errorf("write err, %w", err))
 		return nil, err
 	}
 
@@ -161,9 +157,8 @@ wait:
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
 	case <-resend:
-		err := dc.writeQuery(q, assignedQid)
+		err := dc.writeQuery(ctx, q, assignedQid)
 		if err != nil {
-			dc.CloseWithErr(fmt.Errorf("write err, %w", err))
 			return nil, err
 		}
 		goto wait
@@ -176,7 +171,24 @@ wait:
 	}
 }
 
-func (dc *TraditionalDnsConn) writeQuery(q []byte, assignedQid uint16) error {
+func (dc *TraditionalDnsConn) writeQuery(ctx context.Context, q []byte, assignedQid uint16) error {
+	select {
+	case dc.writeGate <- struct{}{}:
+		defer func() { <-dc.writeGate }()
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-dc.closeNotify:
+		return dc.closeErr
+	}
+	// Both the gate and cancellation may be ready. A queued cancellation
+	// must not alter the active connection's deadline or close the socket.
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	if dc.closed.Load() {
+		return ErrTDCClosed
+	}
+
 	var payload *[]byte
 	if dc.isTcp {
 		var err error
@@ -189,24 +201,14 @@ func (dc *TraditionalDnsConn) writeQuery(q []byte, assignedQid uint16) error {
 		payload = copyMsg(q)
 		binary.BigEndian.PutUint16(*payload, assignedQid)
 	}
+	defer pool.ReleaseBuf(payload)
 
-	// Send additional copies to improve the reliability against packet loss.
-	// Only for udp.
-	for i := 0; i < dc.repeat; i++ {
-		if n, err := dc.c.Write(*payload); err != nil || n != len(*payload) {
-			pool.ReleaseBuf(payload)
-			if err == nil {
-				err = io.ErrShortWrite
-			}
-			return err
-		}
+	err := writeWithContext(ctx, dc.c, *payload, dc.repeat+1, time.Now().Add(waitingReplyTimeout))
+	if err != nil {
+		// Active cancellation may leave a partial TCP/TLS frame. Keeping
+		// that socket would corrupt other queries sharing the connection.
+		dc.CloseWithErr(fmt.Errorf("write err, %w", err))
 	}
-
-	n, err := dc.c.Write(*payload)
-	if err == nil && n != len(*payload) {
-		err = io.ErrShortWrite
-	}
-	pool.ReleaseBuf(payload)
 	return err
 }
 
@@ -237,16 +239,7 @@ func (dc *TraditionalDnsConn) readLoop() {
 		}
 
 		rid := binary.BigEndian.Uint16(*r)
-		resChan := dc.getQueueC(rid)
-		if resChan != nil {
-			select {
-			case resChan <- r: // resChan has buffer
-			default:
-				pool.ReleaseBuf(r)
-			}
-		} else {
-			pool.ReleaseBuf(r)
-		}
+		dc.deliverResponse(rid, r)
 	}
 }
 
@@ -284,10 +277,17 @@ func (dc *TraditionalDnsConn) CloseWithErr(err error) {
 	})
 }
 
-func (dc *TraditionalDnsConn) getQueueC(qid uint16) chan<- *[]byte {
-	dc.queueMu.RLock()
-	defer dc.queueMu.RUnlock()
-	return dc.queue[uint32(qid)]
+func (dc *TraditionalDnsConn) deliverResponse(qid uint16, payload *[]byte) {
+	dc.queueMu.Lock()
+	defer dc.queueMu.Unlock()
+	if ch := dc.queue[uint32(qid)]; ch != nil {
+		select {
+		case ch <- payload:
+			return
+		default:
+		}
+	}
+	pool.ReleaseBuf(payload)
 }
 
 func (dc *TraditionalDnsConn) queueLen() int {
@@ -323,8 +323,16 @@ func (dc *TraditionalDnsConn) addQueueC() (qid uint16, c chan *[]byte) {
 
 func (dc *TraditionalDnsConn) deleteQueueC(qid uint16) {
 	dc.queueMu.Lock()
+	defer dc.queueMu.Unlock()
+	ch := dc.queue[uint32(qid)]
 	delete(dc.queue, uint32(qid))
-	dc.queueMu.Unlock()
+	// Delivery and removal share the same lock, so no reader can enqueue a
+	// pooled response into an orphaned channel after this drain.
+	select {
+	case payload := <-ch:
+		pool.ReleaseBuf(payload)
+	default:
+	}
 }
 
 func (dc *TraditionalDnsConn) ReserveNewQuery() (_ ReservedExchanger, closed bool) {

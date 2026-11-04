@@ -47,11 +47,15 @@ func NewMap[K Hashable, V any]() *Map[K, V] {
 }
 
 // NewMapCache returns a cache with a maximum size.
-// Note that, because this it has multiple (MapShardSize) shards,
-// the actual maximum size is MapShardSize*(size / MapShardSize).
+// Positive sizes below MapShardSize are rounded up to MapShardSize so every
+// shard remains bounded. Larger sizes are rounded down to a multiple of
+// MapShardSize.
 // If size <=0, it's equal to NewMap().
 func NewMapCache[K Hashable, V any](size int) *Map[K, V] {
-	sizePreShard := size / MapShardSize
+	if size <= 0 {
+		return NewMap[K, V]()
+	}
+	sizePreShard := max(1, size/MapShardSize)
 	m := new(Map[K, V])
 	for i := range m.shards {
 		m.shards[i] = newShard[K, V](sizePreShard)
@@ -125,6 +129,10 @@ func (m *shard[K, V]) get(key K) (V, bool) {
 func (m *shard[K, V]) set(key K, v V) {
 	m.l.Lock()
 	defer m.l.Unlock()
+	if _, exists := m.m[key]; exists {
+		m.m[key] = v
+		return
+	}
 	if m.max > 0 && len(m.m)+1 > m.max {
 		for k := range m.m {
 			delete(m.m, k)

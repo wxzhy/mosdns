@@ -16,6 +16,11 @@ from urllib.parse import urlsplit
 
 import yaml
 
+try:
+    from migrate_smartdns_data import ip_rules  # 直接执行脚本时生效
+except ModuleNotFoundError:  # 以 scripts.migrate_smartdns_configs 导入时生效
+    from scripts.migrate_smartdns_data import ip_rules
+
 
 def endpoint(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
@@ -64,11 +69,12 @@ def merge_example_services(cfg: dict, *, profile: str = "default") -> dict:
 
 
 class Migration:
-    def __init__(self, cfg: dict, *, profile: str = "default"):
+    def __init__(self, cfg: dict, *, profile: str = "default", source: Path):
         if profile not in ("default", "cernet"):
             raise ValueError(f"unknown deployment profile {profile!r}")
         self.cfg = cfg
         self.profile = profile
+        self.source = source
         self.plugins: list[dict] = []
         self.nameservers = {x["name"]: x for x in cfg["nameservers"]}
         self.resolvers = {x["name"]: x for x in cfg["resolvers"]}
@@ -127,8 +133,11 @@ class Migration:
                 {"ips": [f"geoip:{label}"]},
             )
         for label in ("github", "github-raw"):
+            # 内联源树里的自定义 GitHub 网段：配置不再依赖导出的 IP 文本文件。
             self.add(
-                f"ip_{label}", "ip_set", {"files": [f"./data/smartdns/ips/{label}.txt"]}
+                f"ip_{label}",
+                "ip_set",
+                {"ips": ip_rules(self.source / f"tags/geoip/{label}.txt")},
             )
         for asn in (19679, 33191):
             self.add(
@@ -480,7 +489,8 @@ def render_config(cfg: dict) -> str:
             "正常关闭及定时转储保留统计，普通/CERNET 使用各自文件，避免切换配置时混用。"
         ),
         "ip_cloudflare": (
-            "IP 集合保留原标签：GeoIP/ASN 使用上面的默认库；GitHub 两个自定义集合仍读原导出文本。"
+            "IP 集合保留原标签：GeoIP/ASN 使用上面的默认库；GitHub 两个自定义集合\n"
+            "已把原导出文本的 CIDR 内联进来，不再依赖外部 IP 文本文件。"
         ),
         "static_block": (
             "静态路由：A/AAAA 返回配置地址；其他类型保持 NOERROR/NODATA。\n"
@@ -617,7 +627,7 @@ def main() -> None:
             )))
             continue
         raw = (source / name).read_bytes()
-        cfg = Migration(yaml.safe_load(raw), profile=profile).run()
+        cfg = Migration(yaml.safe_load(raw), profile=profile, source=source).run()
         header = (
             f"# 由 smartdns-test/{name} 迁移而来；源文件 SHA256 {hashlib.sha256(raw).hexdigest()}\n"
             "# 由 scripts/migrate_smartdns_configs.py 生成；说明见 docs/smartdns-migration.md。\n"

@@ -111,8 +111,7 @@ func getMsgKey(q *dns.Msg) string {
 		b = b | doBit
 	}
 	buf[0] = b
-	buf[1] = byte(question.Qtype << 8)
-	buf[2] = byte(question.Qtype)
+	binary.BigEndian.PutUint16(buf[1:3], question.Qtype)
 	buf[3] = byte(question.Qclass >> 8)
 	buf[4] = byte(question.Qclass)
 	buf[5] = byte(len(question.Name) >> 8)
@@ -121,20 +120,33 @@ func getMsgKey(q *dns.Msg) string {
 	return utils.BytesToStringUnsafe(buf)
 }
 
-// migratedDumpKey upgrades the pre-QCLASS layout used by existing
-// mosdns_cache_v2 dumps. The old key contained flags, type, one-byte name
-// length and name; reconstruct the class from the stored DNS question.
-// Unrecognized keys are left unchanged for backward-compatible imports.
+// migratedDumpKey upgrades pre-QCLASS keys and repairs the historical loss
+// of QTYPE's high byte. All remaining fields must match the stored question.
+// Keep scope prefixes intact; unrecognized keys are left for validation.
 func migratedDumpKey(raw []byte, response *dns.Msg) key {
+	original := raw
 	if response == nil || len(response.Question) != 1 {
 		return key(raw)
 	}
+	var prefix []byte
+	if len(raw) >= 3 && raw[0] == 0xfe {
+		scopeLen := int(binary.BigEndian.Uint16(raw[1:3]))
+		if scopeLen == 0 || len(raw) <= 3+scopeLen {
+			return key(raw)
+		}
+		prefix, raw = raw[:3+scopeLen], raw[3+scopeLen:]
+	}
 	question := response.Question[0]
-	if len(raw) != 4+len(question.Name) || raw[0]&^byte(7) != 0 ||
-		uint16(raw[1])<<8|uint16(raw[2]) != question.Qtype ||
-		int(raw[3]) != len(question.Name)&0xff ||
-		string(raw[4:]) != question.Name {
-		return key(raw)
+	legacy := len(raw) == 4+len(question.Name) && raw[0]&^byte(7) == 0 &&
+		(binary.BigEndian.Uint16(raw[1:3]) == question.Qtype ||
+			(raw[1] == 0 && raw[2] == byte(question.Qtype))) &&
+		int(raw[3]) == len(question.Name)&0xff && string(raw[4:]) == question.Name
+	truncated := len(raw) == 7+len(question.Name) && raw[0]&^byte(7) == 0 &&
+		question.Qtype > 255 && raw[1] == 0 && raw[2] == byte(question.Qtype) &&
+		binary.BigEndian.Uint16(raw[3:5]) == question.Qclass &&
+		int(binary.BigEndian.Uint16(raw[5:7])) == len(question.Name) && string(raw[7:]) == question.Name
+	if !legacy && !truncated {
+		return key(original)
 	}
 	q := new(dns.Msg).SetQuestion(question.Name, question.Qtype)
 	q.Question[0].Qclass = question.Qclass
@@ -143,7 +155,7 @@ func migratedDumpKey(raw []byte, response *dns.Msg) key {
 	if raw[0]&4 != 0 {
 		q.SetEdns0(1232, true)
 	}
-	return key(getMsgKey(q))
+	return key(string(prefix) + getMsgKey(q))
 }
 
 type item struct {

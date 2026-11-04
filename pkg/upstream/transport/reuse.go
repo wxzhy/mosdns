@@ -44,6 +44,7 @@ type ReuseConnTransport struct {
 	logger      *zap.Logger // non-nil
 	ctx         context.Context
 	ctxCancel   context.CancelCauseFunc
+	closeOnce   sync.Once
 
 	m         sync.Mutex // protect following fields
 	closed    bool
@@ -90,6 +91,9 @@ func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*[]
 
 	retry := 0
 	for {
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
+		}
 		var isNewConn bool
 		c, err := t.getIdleConn()
 		if err != nil {
@@ -111,7 +115,7 @@ func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*[]
 		resp, err := c.exchange(ctx, queryPayload)
 		pool.ReleaseBuf(queryPayload)
 		if err != nil {
-			if !isNewConn && retry < maxRetry {
+			if !isNewConn && retry < maxRetry && ctx.Err() == nil {
 				retry++
 				continue // retry if c is a reused connection.
 			}
@@ -200,18 +204,20 @@ func (t *ReuseConnTransport) getIdleConn() (*reusableConn, error) {
 // Close closes ReuseConnTransport and all its connections.
 // It always returns a nil error.
 func (t *ReuseConnTransport) Close() error {
-	t.m.Lock()
-	defer t.m.Unlock()
-	if t.closed {
-		return nil
-	}
-	t.closed = true
-	for c := range t.conns {
-		delete(t.conns, c)
-		delete(t.idleConns, c)
-		c.closeWithErrByTransport(ErrClosedTransport)
-	}
-	t.ctxCancel(ErrClosedTransport)
+	t.closeOnce.Do(func() {
+		t.m.Lock()
+		t.closed = true
+		conns := t.conns
+		t.conns = make(map[*reusableConn]struct{})
+		t.idleConns = make(map[*reusableConn]struct{})
+		t.m.Unlock()
+		t.ctxCancel(ErrClosedTransport)
+		// Connection error cleanup takes t.m inside its Once callback. Never
+		// hold t.m while waiting for the same connection's Once to finish.
+		for c := range conns {
+			c.closeWithErrByTransport(ErrClosedTransport)
+		}
+	})
 	return nil
 }
 
@@ -235,6 +241,9 @@ type reusableConn struct {
 
 // return nil if transport was closed
 func (t *ReuseConnTransport) newReusableConn(c NetConn) *reusableConn {
+	// A dial can finish after its caller was canceled and return this socket
+	// straight to the pool. Bound that first idle read before publishing it.
+	c.SetReadDeadline(time.Now().Add(t.idleTimeout))
 	rc := &reusableConn{
 		c:           c,
 		t:           t,
@@ -275,16 +284,13 @@ func (c *reusableConn) readLoop() {
 			return
 		}
 
-		// This connection is idled again.
 		c.c.SetReadDeadline(time.Now().Add(c.t.idleTimeout))
-		// Note: calling setIdle before sending resp back to make sure this connection is idle
-		// before Exchange call returning. Otherwise, Test_ReuseConnTransport may fail.
-		c.t.setIdle(c)
 
 		waiter.mu.Lock()
 		if waiter.abandoned {
 			waiter.mu.Unlock()
 			pool.ReleaseBuf(resp)
+			c.t.setIdle(c)
 		} else {
 			select {
 			case waiter.ch <- resp:
@@ -325,6 +331,10 @@ func (c *reusableConn) closeWithErrByTransport(err error) {
 }
 
 func (c *reusableConn) exchange(ctx context.Context, q *[]byte) (*[]byte, error) {
+	if ctx.Err() != nil {
+		c.t.setIdle(c)
+		return nil, context.Cause(ctx)
+	}
 	waiter := &reuseWaiter{ch: make(chan *[]byte, 1)}
 	c.m.Lock()
 	if c.waitingResp != nil {
@@ -334,30 +344,42 @@ func (c *reusableConn) exchange(ctx context.Context, q *[]byte) (*[]byte, error)
 	c.waitingResp = waiter
 	c.m.Unlock()
 
-	waitRespTimeout := reuseConnQueryTimeout
-	if c.t.testWaitRespTimeout > 0 {
-		waitRespTimeout = c.t.testWaitRespTimeout
-	}
-	c.c.SetDeadline(time.Now().Add(waitRespTimeout))
-	_, err := c.c.Write(*q)
-	if err != nil {
-		c.closeWithErr(err)
-		return nil, err
-	}
-
 	abandon := func() {
+		hasResponse := false
 		waiter.mu.Lock()
 		waiter.abandoned = true
 		select {
 		case resp := <-waiter.ch:
 			pool.ReleaseBuf(resp)
+			hasResponse = true
 		default:
 		}
 		waiter.mu.Unlock()
+		if hasResponse {
+			c.t.setIdle(c)
+		}
+	}
+	waitRespTimeout := reuseConnQueryTimeout
+	if c.t.testWaitRespTimeout > 0 {
+		waitRespTimeout = c.t.testWaitRespTimeout
+	}
+	deadline := time.Now().Add(waitRespTimeout)
+	c.c.SetReadDeadline(deadline)
+	err := writeWithContext(ctx, c.c, *q, 1, deadline)
+	if err != nil {
+		c.closeWithErr(err)
+		// A fast response may already be queued while Write is finishing.
+		// Close first so abandoning it cannot return this failed socket to
+		// the idle pool, then release either a queued or late response.
+		abandon()
+		return nil, err
 	}
 
 	select {
 	case resp := <-waiter.ch:
+		// The writer has stopped its cancellation callback and reset its
+		// deadline before this connection is made available to another query.
+		c.t.setIdle(c)
 		return resp, nil
 	case <-c.closeNotify:
 		abandon()

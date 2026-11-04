@@ -24,7 +24,8 @@ plugins:
     dump_file: /etc/mosdns/stats.dump
     dump_interval: 600
 
-# IP 集合保留原标签：GeoIP/ASN 使用上面的默认库；GitHub 两个自定义集合仍读原导出文本。
+# IP 集合保留原标签：GeoIP/ASN 使用上面的默认库；GitHub 两个自定义集合
+# 已把原导出文本的 CIDR 内联进来，不再依赖外部 IP 文本文件。
 - tag: ip_cloudflare
   type: ip_set
   args:
@@ -58,13 +59,21 @@ plugins:
 - tag: ip_github
   type: ip_set
   args:
-    files:
-    - ./data/smartdns/ips/github.txt
+    ips:
+    - 185.199.108.0/22
+    - 2606:50c0:8000::/46
 - tag: ip_github-raw
   type: ip_set
   args:
-    files:
-    - ./data/smartdns/ips/github-raw.txt
+    ips:
+    - 185.199.108.133/32
+    - 185.199.109.133/32
+    - 185.199.110.133/32
+    - 185.199.111.133/32
+    - 2606:50c0:8000::154/128
+    - 2606:50c0:8001::154/128
+    - 2606:50c0:8002::154/128
+    - 2606:50c0:8003::154/128
 - tag: ip_asn_19679
   type: ip_set
   args:

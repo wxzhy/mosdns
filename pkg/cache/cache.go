@@ -55,7 +55,9 @@ type Opts struct {
 }
 
 func (opts *Opts) init() {
-	utils.SetDefaultNum(&opts.Size, 1024)
+	if opts.Size < 1024 {
+		opts.Size = 1024
+	}
 	utils.SetDefaultNum(&opts.CleanerInterval, defaultCleanerInterval)
 }
 
@@ -90,7 +92,11 @@ func (c *Cache[K, V]) Close() error {
 func (c *Cache[K, V]) Get(key K) (v V, expirationTime time.Time, ok bool) {
 	if e, hasEntry := c.m.Get(key); hasEntry {
 		if e.expirationTime.Before(time.Now()) {
-			c.m.Del(key)
+			// Another writer may have replaced e after Get released its lock.
+			// Delete only the expired entry that this call actually observed.
+			c.m.TestAndSet(key, func(current *elem[V], ok bool) (*elem[V], bool, bool) {
+				return nil, false, ok && current == e
+			})
 			return
 		}
 		return e.v, e.expirationTime, true

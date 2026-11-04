@@ -88,11 +88,16 @@ func GetPluginType(typ string) (PluginTypeInfo, bool) {
 
 // newPlugin initializes a Plugin from c and adds it to mosdns.
 func (m *Mosdns) newPlugin(c PluginConfig) error {
+	if err := m.initializationError(); err != nil {
+		return err
+	}
+	m.pluginsMu.RLock()
 	if len(c.Tag) == 0 {
 		c.Tag = fmt.Sprintf("anonymouse_%s_%d", c.Type, len(m.plugins))
 	}
-
-	if _, dup := m.plugins[c.Tag]; dup {
+	_, dup := m.plugins[c.Tag]
+	m.pluginsMu.RUnlock()
+	if dup {
 		return fmt.Errorf("duplicated plugin tag %s", c.Tag)
 	}
 
@@ -115,8 +120,10 @@ func (m *Mosdns) newPlugin(c PluginConfig) error {
 	if err != nil {
 		return fmt.Errorf("failed to init plugin: %w", err)
 	}
+	m.pluginsMu.Lock()
 	m.plugins[c.Tag] = p
-	return nil
+	m.pluginsMu.Unlock()
+	return m.initializationError()
 }
 
 // GetAllPluginTypes returns all plugin types which are configurable.
