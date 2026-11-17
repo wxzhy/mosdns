@@ -37,7 +37,7 @@ func TestSelectionPublishesReliableProbeStatus(t *testing.T) {
 		}, query_context.ProbeUnmeasured, 2},
 		{"disabled", Args{Probe: speedtest.Config{TCPPorts: []uint16{}}}, nil, query_context.ProbeUnmeasured, 0},
 		{"unmatched", Args{ProbeMatch: &IPFilter{LabelsInclude: []string{}}}, nil, query_context.ProbeUnmeasured, 0},
-		{"pending", Args{SelectionTimeout: 5 * time.Millisecond}, func(ctx context.Context, _ netip.Addr, _ speedtest.Config) speedtest.Result {
+		{"pending", Args{TotalTimeout: 40 * time.Millisecond}, func(ctx context.Context, _ netip.Addr, _ speedtest.Config) speedtest.Result {
 			<-ctx.Done()
 			return speedtest.Result{Outcome: speedtest.Unmeasured}
 		}, query_context.ProbeUnmeasured, 2},

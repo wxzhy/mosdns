@@ -772,7 +772,7 @@ plugins:
   args:
   - exec: $upstream_114dns_2
 
-# 各组 selector 保留原候选顺序，统一使用 bounded 限时选优并收紧超时，避免慢/不可达上游拖慢整次查询；不能用先选一份响应的 forward 池代替。
+# 各组 selector 保留原候选顺序，bounded 从首个成功 RTT 开始限时收集；无 RTT 时等全部工作完成或总预算耗尽，再走原兜底。
 # probe/labels/倍率配置以锚点共享；修改锚点影响其引用，单组调整时先展开对应别名。
 # private 只豁免探测，不代表丢弃该地址；其余地址在过滤和替换完成后才进入测速。
 - tag: select_cn

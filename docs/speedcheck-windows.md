@@ -41,7 +41,7 @@ nslookup -port=15353 example.com 127.0.0.1
     threshold_ms: 100
 ```
 
-`source_a`、`source_b` 是此前定义的 sequence，每份来源通常只配置一个 forward 上游。序列完成过滤就提交完整候选；地址探测与其他 DNS 查询重叠执行。默认在首个成功 RTT 后再收集 25ms，同时受首个合格正答后 300ms、总预算和所有工作完成的限制。`wait_all` 等待全部来源及相关探测，但仍受总预算限制。
+`source_a`、`source_b` 是此前定义的 sequence，每份来源通常只配置一个 forward 上游。序列完成过滤就提交完整候选；地址探测与其他 DNS 查询重叠执行。`selection_timeout` 和 `settle_window` 都从首个成功 RTT 起算，默认取较短的 25ms 收集窗口。仅收到 DNS 响应或失败/未测量结果不会启动窗口；无成功 RTT 时继续等全部工作完成或总预算耗尽，再沿用倍率和 `ip_fallback` 兜底策略。`wait_all` 等待全部来源及相关探测，但仍受总预算限制。
 
 启用 ping 时改为：
 

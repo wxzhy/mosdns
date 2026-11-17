@@ -709,21 +709,18 @@ func TestForwardThenSleepDoesNotRestartTTL(t *testing.T) {
 func TestCutoffUsesEarliestEventAndFreezesOutOfOrderState(t *testing.T) {
 	base := time.Unix(100, 0)
 	deadline := base.Add(time.Second)
-	var positive, success time.Time
-	observeEarliest(&positive, base.Add(80*time.Millisecond))
-	observeEarliest(&positive, base.Add(20*time.Millisecond))
+	var success time.Time
 	observeEarliest(&success, base.Add(70*time.Millisecond))
-	old := selectionCutoff(deadline, ModeBounded, positive, success, 300*time.Millisecond, 25*time.Millisecond)
+	old := selectionCutoff(deadline, ModeBounded, success, 300*time.Millisecond, 25*time.Millisecond)
 	states := []*candidateState{{readyAt: base.Add(80 * time.Millisecond)}, {readyAt: base.Add(60 * time.Millisecond)}}
 	probes := map[netip.Addr]*probeState{netip.MustParseAddr("192.0.2.1"): {done: true, completedAt: base.Add(70 * time.Millisecond), result: speedtest.Result{Outcome: speedtest.Success}}, netip.MustParseAddr("192.0.2.2"): {done: true, completedAt: base.Add(60 * time.Millisecond), result: speedtest.Result{Outcome: speedtest.Success}}}
 	observeEarliest(&success, base.Add(35*time.Millisecond))
-	cutoff := selectionCutoff(deadline, ModeBounded, positive, success, 300*time.Millisecond, 25*time.Millisecond)
+	cutoff := selectionCutoff(deadline, ModeBounded, success, 300*time.Millisecond, 25*time.Millisecond)
 	if !cutoff.Before(old) || !cutoff.Equal(base.Add(60*time.Millisecond)) {
 		t.Fatal(cutoff)
 	}
-	observeEarliest(&positive, base.Add(90*time.Millisecond))
 	observeEarliest(&success, base.Add(100*time.Millisecond))
-	if got := selectionCutoff(deadline, ModeBounded, positive, success, 300*time.Millisecond, 25*time.Millisecond); !got.Equal(cutoff) {
+	if got := selectionCutoff(deadline, ModeBounded, success, 300*time.Millisecond, 25*time.Millisecond); !got.Equal(cutoff) {
 		t.Fatal("later event extended window")
 	}
 	freezeAtCutoff(states, probes, cutoff)
@@ -867,8 +864,8 @@ func TestDisplacedEarlyProbeDoesNotShortenBoundedCutoffForAdmittedCandidates(t *
 	})
 }
 
-func TestBoundedNegativeResponseDoesNotWaitForTotalTimeout(t *testing.T) {
-	t.Run("negative_only_finishes_at_selection_timeout", func(t *testing.T) {
+func TestBoundedNegativeResponseWaitsForRTTOrTotalTimeout(t *testing.T) {
+	t.Run("negative_only_waits_for_total_timeout", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			neg := delayedSource("neg", 10*time.Millisecond)
 			dead := delayedSource("dead", 5*time.Second, "192.0.2.9")
@@ -883,8 +880,8 @@ func TestBoundedNegativeResponseDoesNotWaitForTotalTimeout(t *testing.T) {
 			if err := s.Exec(context.Background(), q); err != nil {
 				t.Fatal(err)
 			}
-			if elapsed := time.Since(start); elapsed != 260*time.Millisecond {
-				t.Fatalf("bounded negative waited %s, want 260ms", elapsed)
+			if elapsed := time.Since(start); elapsed != 2450*time.Millisecond {
+				t.Fatalf("bounded negative waited %s, want 2450ms", elapsed)
 			}
 			if q.R() == nil || q.R().Rcode != dns.RcodeSuccess || len(q.R().Answer) != 0 {
 				t.Fatalf("unexpected negative response: %v", q.R())
@@ -892,7 +889,7 @@ func TestBoundedNegativeResponseDoesNotWaitForTotalTimeout(t *testing.T) {
 			synctest.Wait()
 		})
 	})
-	t.Run("positive_within_negative_window_expands_cutoff", func(t *testing.T) {
+	t.Run("positive_with_successful_rtt_starts_window", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			neg := delayedSource("neg", 10*time.Millisecond)
 			pos := delayedSource("pos", 100*time.Millisecond, "192.0.2.1")

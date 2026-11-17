@@ -31,7 +31,7 @@ plugins:
     type: speedcheck
     args:
       sources: [source_a, source_b]   # 并行查询，按探测得分选优
-      mode: bounded                   # 首个合格正答后限时收尾
+      mode: bounded                   # 首个成功 RTT 后限时收尾
       total_timeout: 5s
       selection_timeout: 300ms
       settle_window: 25ms

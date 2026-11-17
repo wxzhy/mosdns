@@ -151,9 +151,10 @@ HTTPS 处理保留原来的 hint/H3 清理、ECH 注入和辅助 A 查询。名�
 
 ## 有意保留与不能逐项等价的行为
 
-- 各测速组统一映射为 `bounded` 限时选优：`cn` 首响应收集窗口 250ms、总预算 1500ms；
-  `global`/`default` 首响应收集窗口 300ms、总预算 2500ms，首次测速成功后收集 25ms，
-  避免慢或不可达上游把整次查询拖满总超时；仍受父截止时间限制。
+- 各测速组统一映射为 `bounded` 限时选优：`cn` 的 `selection_timeout` 为 250ms、总预算 1500ms；
+  `global`/`default` 分别为 300ms 和 2500ms。`selection_timeout` 与 25ms 的 `settle_window`
+  均从首次测速成功起算，取较短窗口；无成功 RTT 时继续等全部来源和探测完成或总预算耗尽，
+  再使用原倍率/`ip_fallback` 兜底，仍受父截止时间限制。
 - 每个测速来源只查询一个上游。原 aiodns 地址列表和 HTTP hosts 地址池展开并行，
   不再随机挑一个拨号地址，也不逐项模拟 aiodns 的 tries/轮询退避。Google-cn、
   OpenNIC、ECH 查询不需要地址测速，使用独立完整响应 forward 池。

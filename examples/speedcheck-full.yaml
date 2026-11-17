@@ -93,7 +93,7 @@ plugins:
       sources: [source_a, source_b]   # 声明顺序用于得分持平时的裁决
       mode: bounded                   # 备选：wait_all，等待全部来源与探测
       total_timeout: 5s               # 总预算，还受父请求截止时间约束
-      selection_timeout: 300ms        # bounded：首个合格正答后的等待上限
+      selection_timeout: 300ms        # bounded：首个成功 RTT 后的等待上限
       settle_window: 25ms             # bounded：首个探测成功后的收集窗口
       probe:
         tcp_ports: [80, 443]          # [] 显式关闭 TCP；省略才是默认 [80,443]

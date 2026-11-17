@@ -34,7 +34,7 @@ func TestIPFallbackUsesSelectorProbeStatus(t *testing.T) {
 						args.Probe.TCPPorts = []uint16{}
 					}
 					if scenario == "pending" {
-						args.Mode, args.SelectionTimeout = ModeBounded, 5*time.Millisecond
+						args.Mode, args.TotalTimeout = ModeBounded, 40*time.Millisecond
 					}
 					var calls atomic.Int64
 					probe := func(ctx context.Context, ip netip.Addr, _ speedtest.Config) speedtest.Result {

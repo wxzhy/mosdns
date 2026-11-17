@@ -220,7 +220,7 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 	}()
 	metadata := make(map[netip.Addr]ipMetadata)
 	doneSources := 0
-	var firstPositive, firstNegative, firstSuccess time.Time
+	var firstSuccess time.Time
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	defer func() {
@@ -244,11 +244,7 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 		}
 	}
 	updateCutoff := func(allowExpand bool) {
-		effectivePositive := firstPositive
-		if effectivePositive.IsZero() {
-			effectivePositive = firstNegative
-		}
-		next := selectionCutoff(deadline, s.args.Mode, effectivePositive, firstSuccess, s.args.SelectionTimeout, s.args.SettleWindow)
+		next := selectionCutoff(deadline, s.args.Mode, firstSuccess, s.args.SelectionTimeout, s.args.SettleWindow)
 		if allowExpand {
 			cutoff = next
 		} else {
@@ -304,25 +300,12 @@ func (s *Selector) Exec(parent context.Context, qCtx *query_context.Context) (er
 					cs.probeAllowed = s.matches(s.args.ProbeMatch, cs)
 					states[event.index] = cs
 					accepted = true
-					if len(c.Addresses) > 0 {
-						observeEarliest(&firstPositive, event.at)
-					} else if c.Negative {
-						observeEarliest(&firstNegative, event.at)
-					}
 					admitted = s.refreshProbes(work, states, probes, startedIPs, probed, launch)
 					recomputeFirstSuccess()
-					if len(c.Addresses) > 0 {
-						if launch {
-							resetTimer(true)
-						} else {
-							updateCutoff(false)
-						}
-					} else if c.Negative && firstPositive.IsZero() {
-						if launch {
-							resetTimer(false)
-						} else {
-							updateCutoff(false)
-						}
+					if launch {
+						resetTimer(true)
+					} else {
+						updateCutoff(false)
 					}
 				}
 			}
@@ -420,17 +403,14 @@ func minTime(a, b time.Time) time.Time {
 	return a
 }
 
-func selectionCutoff(deadline time.Time, mode string, positive, success time.Time, selection, settle time.Duration) time.Time {
-	if mode != ModeBounded {
+func selectionCutoff(deadline time.Time, mode string, success time.Time, selection, settle time.Duration) time.Time {
+	if mode != ModeBounded || success.IsZero() {
 		return deadline
 	}
-	if !positive.IsZero() {
-		deadline = minTime(deadline, positive.Add(selection))
-	}
-	if !success.IsZero() {
-		deadline = minTime(deadline, success.Add(settle))
-	}
-	return deadline
+	// DNS arrival alone says nothing about address reachability. Only a
+	// successful RTT starts either bounded window; otherwise keep collecting
+	// until every source/probe completes or the overall budget is exhausted.
+	return minTime(deadline, success.Add(min(selection, settle)))
 }
 
 func observeEarliest(current *time.Time, at time.Time) bool {
