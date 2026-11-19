@@ -1,5 +1,22 @@
 # SmartDNS 数据迁移
 
+仓库中的两份部署示例读取 `data/smartdns/geosite-deployment.dat`、
+`Country.mmdb` 和 `ASN.mmdb`。部署 GeoSite 使用
+[MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat)，需要包含
+`category-telemetry`、`category-ads-and-telemetry`，以及 `google@cn`、
+`apple@cn`、`category-games@cn` 的规则。数据库文件相对于启动工作目录解析。
+
+在仓库根目录执行下方导出命令后，下载部署用 GeoSite（PowerShell）：
+
+```powershell
+curl.exe --fail --location --output data/smartdns/geosite-deployment.dat https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat
+```
+
+Linux 可使用同一命令，将 `curl.exe` 改为 `curl`。下载的库保留上游域名匹配类型和属性，
+规则内容随数据版本变化。本地验证方法见[集成测试说明](../../tests/integration/README.md)。
+
+## 导出旧 SmartDNS 规则及 MMDB
+
 在 mosdns 项目根目录执行，复用 smartdns-test 已有 Python 环境：
 
 ```powershell
@@ -16,10 +33,10 @@ Linux 的对应命令：
 
 输出包含两份配置共用的 `geosite.dat`（19 个命名集合）、两个
 `ips/<tag>.txt`、`Country.mmdb`、`ASN.mmdb` 和 SHA-256 清单
-`manifest.json`，另保留 `domains/<tag>.txt` 供核对。两份配置都以 mosdns
-启动时的工作目录解析 `data/smartdns` 路径。部署可复制整个目录；运行只需要
-三个数据库，GitHub 两个自定义集合的 CIDR 已内联进配置，不依赖 IP 文本，
-也不依赖 `domains` 文本或 Python。生成的数据无需加入 Git。
+`manifest.json`，另保留 `domains/<tag>.txt` 供核对。旧规则导出的
+`geosite.dat` 供迁移语义核对或重新生成旧配置时使用。两份当前示例直接使用
+上方的部署 GeoSite 和两份 MMDB。GitHub 两个自定义集合的 CIDR 已内联进配置。
+生成的数据无需加入 Git。
 
 | SmartDNS 数据 | mosdns 数据与用途 |
 |---|---|
@@ -35,10 +52,10 @@ CIDR 字面量，不读取任何 IP 文本；用较宽的 MMDB 标签或 ASN 替
 
 ```yaml
 geodata:
-  geosite: ./data/smartdns/geosite.dat
+  geosite: ./data/smartdns/geosite-deployment.dat
   geoip: ./data/smartdns/Country.mmdb
   asn: ./data/smartdns/ASN.mmdb
-# 匹配示例：qname geosite:cn geosite:apple-cn
+# 匹配示例：qname geosite:cn geosite:apple@cn
 # IP 表达式示例：geoip:cloudflare、asn:33191
 ```
 

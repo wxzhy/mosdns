@@ -27,7 +27,7 @@ import (
 // TXT is deliberately absent because the source configuration forwards it.
 func TestSmartdnsMigrationLocalWire(t *testing.T) {
 	if os.Getenv("MOSDNS_SMARTDNS_LOCAL_DATA") != "1" {
-		t.Skip("set MOSDNS_SMARTDNS_LOCAL_DATA=1 after exporting data/smartdns")
+		t.Skip("set MOSDNS_SMARTDNS_LOCAL_DATA=1 after preparing the deployment databases")
 	}
 	for _, path := range smartdnsMigrationConfigs {
 		t.Run(path, func(t *testing.T) {
@@ -86,13 +86,10 @@ func TestSmartdnsMigrationLocalWire(t *testing.T) {
 				}
 			})
 
-			ads := smartdnsWireDomain(t, cfg, m, []string{"category-ads-all", "category-ads", "ads"}, nil)
-			proxy := smartdnsWireDomain(t, cfg, m, []string{"proxy"}, []string{"category-ads-all", "category-ads", "ads"})
+			blocked := []string{"category-ads-all", "category-ads", "category-telemetry", "category-ads-and-telemetry"}
+			ads := smartdnsWireDomain(t, cfg, m, blocked, nil)
+			proxy := smartdnsWireDomain(t, cfg, m, []string{"openai", "anthropic", "xai", "google-gemini"}, blocked)
 			t.Logf("real-rule domains: ads=%s proxy=%s", ads, proxy)
-			proxy4, proxy6 := "9.0.0.0", "2620::"
-			if strings.Contains(path, "cernet") {
-				proxy4, proxy6 = "192.168.8.64", "2001:db8::64"
-			}
 			cases := []struct {
 				name, domain, ip string
 				qtype            uint16
@@ -100,8 +97,8 @@ func TestSmartdnsMigrationLocalWire(t *testing.T) {
 				{"ads_A", ads, "127.0.0.1", dns.TypeA},
 				{"ads_AAAA", ads, "::1", dns.TypeAAAA},
 				{"ads_TXT", ads, "", dns.TypeTXT},
-				{"proxy_A", proxy, proxy4, dns.TypeA},
-				{"proxy_AAAA", proxy, proxy6, dns.TypeAAAA},
+				{"proxy_A", proxy, "9.0.0.0", dns.TypeA},
+				{"proxy_AAAA", proxy, "2620::", dns.TypeAAAA},
 			}
 			for _, network := range []string{"udp", "tcp"} {
 				if addresses[network] == "" {

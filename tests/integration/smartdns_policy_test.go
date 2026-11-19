@@ -133,6 +133,9 @@ func smartdnsPolicyInstanceWithDumps(t *testing.T, cfg coremain.Config, answer f
 				q.SetResponse(r)
 				return nil
 			})
+			// Keep controlled upstreams valid as dynamic IP sources.
+			f.plugins[tag+"__fixture"] = instance
+			instance, err = sequence.NewSequence(bp, sequence.Args{{Exec: "$" + tag + "__fixture"}})
 		case *speedcheck.Args:
 			var sources []speedcheck.Source
 			for _, tag := range a.Sources {
@@ -264,18 +267,14 @@ func TestSmartdnsPolicyFilterWholeResponseAndExemptions(t *testing.T) {
 	for _, path := range smartdnsMigrationConfigs {
 		t.Run(path, func(t *testing.T) {
 			cfg := smartdnsMigrationConfig(t, path)
-			exempt := "meta"
-			if strings.Contains(path, "cernet") {
-				exempt = "facebook"
-			}
 			for _, tc := range []struct {
 				name, terminal string
 				keep           bool
 			}{
 				{"unlisted", "", false},
-				{exempt, "", true},
+				{"meta", "", true},
 				{"dropbox", "", true},
-				{"alias", exempt + ".migration.invalid.", true},
+				{"alias", "meta.migration.invalid.", true},
 			} {
 				t.Run(tc.name+tc.terminal, func(t *testing.T) {
 					f := smartdnsPolicyInstance(t, cfg, func(_ string, query *dns.Msg) *dns.Msg {
@@ -323,6 +322,10 @@ func TestSmartdnsPolicyCNAMEReplacementExclusionAndDO(t *testing.T) {
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					f := smartdnsPolicyInstance(t, cfg, func(_ string, query *dns.Msg) *dns.Msg {
+						switch query.Question[0].Name {
+						case "cf-bgp.my.cn.eu.org.", "cf-ct.my.cn.eu.org.":
+							return smartdnsPolicyAddressReply(query, "", "172.64.145.0")
+						}
 						r := smartdnsPolicyAddressReply(query, tc.terminal, "104.16.0.42", "104.16.0.43")
 						r.AuthenticatedData = true
 						return r
@@ -406,11 +409,16 @@ func TestSmartdnsPolicyGoogleFallback(t *testing.T) {
 			}{
 				{"failed", "2001:4860:4860::42", speedtest.Failed, true},
 				{"success", "2001:4860:4860::42", speedtest.Success, false},
-				{"unmeasured", "2001:4860:4860::42", speedtest.Unmeasured, false},
-				{"private", "fc00::42", speedtest.Failed, false},
+				{"unmeasured", "2001:4860:4860::42", speedtest.Unmeasured, true},
+				{"private", "fc00::42", speedtest.Failed, true},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
+					const dynamicTarget = "2001:db8:ffff::42"
 					f := smartdnsPolicyInstance(t, cfg, func(_ string, query *dns.Msg) *dns.Msg {
+						switch query.Question[0].Name {
+						case "goog-cernet.my.cn.eu.org.", "goog-ct.my.cn.eu.org.":
+							return smartdnsPolicyAddressReply(query, "", dynamicTarget)
+						}
 						return smartdnsPolicyAddressReply(query, "", tc.ip)
 					}, func(context.Context, netip.Addr, speedtest.Config) speedtest.Result {
 						return speedtest.Result{Outcome: tc.outcome, RTT: time.Millisecond}
@@ -419,15 +427,12 @@ func TestSmartdnsPolicyGoogleFallback(t *testing.T) {
 					smartdnsPolicyRequireSuccess(t, q, err)
 					got := smartdnsMigrationAnswerIPs(q)
 					if tc.fallback {
-						prefix := "2607:f8b0:4007:"
-						if strings.Contains(path, "cernet") {
-							prefix = "2404:6800:4005:"
+						if !slices.Equal(got, []string{dynamicTarget}) {
+							t.Fatalf("dynamic fallback returned %v, want %s", got, dynamicTarget)
 						}
-						if len(got) != 6 || !strings.HasPrefix(got[0], prefix) {
-							t.Fatalf("real measurement failure did not trigger configured fallback: %v", got)
-						}
-						if q.R().Answer[0].Header().Ttl != 86400 {
-							t.Fatalf("fallback TTL=%d, want 86400", q.R().Answer[0].Header().Ttl)
+						ttl := q.R().Answer[0].Header().Ttl
+						if ttl == 0 || ttl > 60 {
+							t.Fatalf("dynamic fallback TTL=%d, want 1–60", ttl)
 						}
 					} else if !slices.Equal(got, []string{tc.ip}) {
 						t.Fatalf("unexpected fallback: %v", got)
@@ -556,6 +561,7 @@ func TestSmartdnsPolicyHTTPSAuxiliaryAFollowsFullRoute(t *testing.T) {
 	for _, path := range smartdnsMigrationConfigs {
 		t.Run(path, func(t *testing.T) {
 			cfg := smartdnsMigrationConfig(t, path)
+			const name = "unlisted.migration.invalid."
 			var sourceCount int
 			for _, p := range cfg.Plugins {
 				if p.Tag == "select_default" {
@@ -566,12 +572,16 @@ func TestSmartdnsPolicyHTTPSAuxiliaryAFollowsFullRoute(t *testing.T) {
 				if tag == "ech_lookup" {
 					return smartdnsPolicyECHReply(query)
 				}
+				switch query.Question[0].Name {
+				case "cf-bgp.my.cn.eu.org.", "cf-ct.my.cn.eu.org.":
+					return smartdnsPolicyAddressReply(query, "", "172.64.145.0")
+				}
 				if query.Question[0].Qtype == dns.TypeA {
 					return smartdnsPolicyAddressReply(query, "", "104.16.0.42")
 				}
 				return smartdnsPolicyHTTPSReply(query)
 			}, nil)
-			q, err := f.exec(t, "main", "unlisted.migration.invalid.", dns.TypeHTTPS, false)
+			q, err := f.exec(t, "main", name, dns.TypeHTTPS, false)
 			smartdnsPolicyRequireSuccess(t, q, err)
 			smartdnsPolicyAssertHTTPS(t, q, true)
 			calls, probes := f.observations()
@@ -580,7 +590,7 @@ func TestSmartdnsPolicyHTTPSAuxiliaryAFollowsFullRoute(t *testing.T) {
 				switch {
 				case call.tag == "ech_lookup":
 					ech++
-				case call.qtype == dns.TypeA:
+				case call.name == name && call.qtype == dns.TypeA:
 					address++
 				case call.qtype == dns.TypeHTTPS:
 					binding++
@@ -599,14 +609,14 @@ func TestSmartdnsPolicyHTTPSAuxiliaryAFollowsFullRoute(t *testing.T) {
 			}
 			// The A result is cached through resolve_cached, and the finalized
 			// HTTPS result is cached through main. Neither needs a second query.
-			cached, err := f.exec(t, "main", "unlisted.migration.invalid.", dns.TypeHTTPS, false)
+			cached, err := f.exec(t, "main", name, dns.TypeHTTPS, false)
 			smartdnsPolicyRequireSuccess(t, cached, err)
 			smartdnsPolicyAssertHTTPS(t, cached, true)
 			afterCalls, afterProbes := f.observations()
 			if len(afterCalls) != len(calls) || len(afterProbes) != len(probes) {
 				t.Fatal("cached HTTPS result repeated DNS, ECH or measurement work")
 			}
-			a, err := f.exec(t, "main", "unlisted.migration.invalid.", dns.TypeA, false)
+			a, err := f.exec(t, "main", name, dns.TypeA, false)
 			smartdnsPolicyRequireSuccess(t, a, err)
 			afterCalls, afterProbes = f.observations()
 			if len(afterCalls) != len(calls) || len(afterProbes) != len(probes) {

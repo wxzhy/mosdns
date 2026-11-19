@@ -9,7 +9,7 @@
 两份 YAML 独立使用，均监听 UDP/TCP `[::]:5335`，不能同时在同一端口启动。
 保留原部署的上游 URL、个人解析配置标识、代理地址和 `insecure_skip_verify`
 选择；这些不是通用公共上游示例，分享或用于其他网络前应检查并调整。
-CERNET 的代理 IPv6 `2001:db8::64` 仍是原配置的占位地址。
+两份当前示例的静态代理地址为 `9.0.0.0` 和 `2620::`。
 
 ## 准备与启动
 
@@ -20,11 +20,8 @@ CERNET 的代理 IPv6 `2001:db8::64` 仍是原配置的占位地址。
 & ..\smartdns-test\.venv\Scripts\python.exe scripts/migrate_smartdns_data.py `
   --source ..\smartdns-test --output data/smartdns
 
-# 将示例基础功能合并到已有迁移 YAML，保持其解析策略和来源记录：
-& ..\smartdns-test\.venv\Scripts\python.exe scripts/migrate_smartdns_configs.py --merge-existing
-
-# 需要重新读取 SmartDNS 源文件并完整生成时运行：
-& ..\smartdns-test\.venv\Scripts\python.exe scripts/migrate_smartdns_configs.py
+# 当前部署示例使用带遥测分类和 cn 属性的规则库。
+curl.exe --fail --location --output data/smartdns/geosite-deployment.dat https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat
 
 go build -o mosdns.exe .
 .\mosdns.exe start -c examples/smartdns/config.yaml
@@ -49,13 +46,14 @@ SmartDNS 源文件；保留原源文件哈希、所有 GeoData 引用、路由�
 
 | 功能 | 普通配置 | CERNET 配置 |
 |---|---|---|
-| 日志 | `info`，`/var/log/mosdns.log` | 同左 |
-| API | `0.0.0.0:9091` | 同左 |
-| 统计 | 2000 条日志，`/etc/mosdns/stats.dump`，转储间隔 600 秒 | `/etc/mosdns/stats-cernet.dump`，其余相同 |
-| 响应缓存 | 20000 条，`lazy_cache_ttl: 86400`，`/etc/mosdns/cache.dump`，转储间隔 600 秒 | `/etc/mosdns/cache-cernet.dump`，其余相同 |
+| 日志 | `info`，`/tmp/mosdns.log` | 同左 |
+| API | `127.0.0.1:9091` | 同左 |
+| 统计 | 2000 条日志，`/opt/mosdns/stats.dump`，转储间隔 600 秒 | 同左 |
+| 响应缓存 | 20000 条，`lazy_cache_ttl: 86400`，`/opt/mosdns/cache.dump`，转储间隔 600 秒 | 同左 |
 
-不同转储路径避免切换普通/CERNET 配置时加载另一套策略产生的答案。过期缓存命中返回
-TTL 5 秒并后台重新解析；后台刷新仍经过原分流、选址和 HTTPS 后处理。cache 的周期转储
+两份示例共用转储路径。切换配置时会加载此前的统计和响应缓存；需要独立状态时，为各份
+配置填写各自的转储路径。过期缓存命中返回 TTL 5 秒并后台重新解析，后台刷新继续经过
+相应的分流、选址和 HTTPS 后处理。cache 的周期转储
 还受累计更新次数门槛约束，正常关闭会保存最终状态。统计 API 路径为
 `/plugins/stats_collector/api/v1/stats`，历史短路径 `/plugins/stats_collector/stats` 也保留。
 
@@ -67,21 +65,19 @@ TTL 5 秒并后台重新解析；后台刷新仍经过原分流、选址和 HTTP
 
 ```yaml
 geodata:
-  geosite: ./data/smartdns/geosite.dat
+  geosite: ./data/smartdns/geosite-deployment.dat
   geoip: ./data/smartdns/Country.mmdb
   asn: ./data/smartdns/ASN.mmdb
-# 域名直接写 qname geosite:cn geosite:apple-cn，无需中间 domain_set 插件。
+# 域名直接写 qname geosite:cn geosite:apple@cn，无需中间 domain_set 插件。
 # IP 集合、过滤、替换、测速标签使用 geoip:cloudflare、asn:33191。
 ```
 
-19 组域名都从本次导出的 `geosite.dat` 按名称加载；六组 MMDB 标签与两组 ASN
-也使用名称。仅 GitHub、GitHub raw 两组自定义 IP 段保留文件引用，避免用更宽的
-标签扩大匹配范围。域名数据库由旧程序实际加载的 runtime 规则打包，保持原后缀
-匹配结果；直接复制旧项目的原始 `tags/geosite.dat` 会改变 full/domain/regexp
-语义。导出的域名文本仅供核对，运行不再依赖它们。
+当前示例从部署 GeoSite 按名称和属性加载域名规则，GitHub 和 GitHub raw 的自定义
+网段直接写在配置中。由旧程序 runtime 规则打包的 `geosite.dat` 及配套域名文本
+用于核对旧迁移结果。上方的启动步骤使用仓库中已维护的两份 YAML。
 
-关键处理链的注释随配置生成器一起维护，重新生成 YAML 也会保留。两份配置分别
-省去 19 个域名集合中间插件，路由、过滤、替换与动作顺序保持不变。
+配置生成器用于重建旧 SmartDNS 源文件的迁移结果。当前示例的上游、标签和动态目标
+配置随 YAML 单独维护。
 
 测速保留旧配置的 **仅 ICMP**：`probe.tcp_ports: []`、`icmp: true`、超时 200ms。
 Windows 需使用允许 raw ICMP 的权限运行；Linux 优先使用非特权接口，必要时

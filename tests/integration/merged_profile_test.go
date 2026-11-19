@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,28 +27,24 @@ import (
 func mergedProfileConfig(t *testing.T, path string) coremain.Config {
 	t.Helper()
 	cfg := smartdnsMigrationConfig(t, path)
-	if cfg.Log.Level != "info" || cfg.Log.File != "/var/log/mosdns.log" || cfg.API.HTTP != "127.0.0.1:9091" || len(cfg.Include) != 0 {
-		t.Fatalf("shared logging/API basics were not merged: log=%+v api=%+v include=%v", cfg.Log, cfg.API, cfg.Include)
+	if cfg.Log.Level != "info" || cfg.Log.File != "/tmp/mosdns.log" || cfg.API.HTTP != "127.0.0.1:9091" || len(cfg.Include) != 0 {
+		t.Fatalf("unexpected shared logging/API settings: log=%+v api=%+v include=%v", cfg.Log, cfg.API, cfg.Include)
 	}
 	if len(cfg.Plugins) == 0 || cfg.Plugins[0].Tag != "stats_collector" || cfg.Plugins[0].Type != "stats_api" {
 		t.Fatal("the statistics collector must precede every caller")
-	}
-	suffix := ""
-	if strings.Contains(path, "cernet") {
-		suffix = "-cernet"
 	}
 	var seenStats, seenCache, seenMain, seenAux bool
 	for _, p := range cfg.Plugins {
 		switch p.Tag {
 		case "stats_collector":
 			a := smartdnsMigrationArgs(t, p).(*stats_api.Args)
-			if seenStats || a.Capacity != 2000 || a.DumpInterval != 600 || a.DumpFile != "/etc/mosdns/stats"+suffix+".dump" {
-				t.Fatalf("statistics defaults or profile isolation changed: %+v", a)
+			if seenStats || a.Capacity != 2000 || a.DumpInterval != 600 || a.DumpFile != "/opt/mosdns/stats.dump" {
+				t.Fatalf("unexpected shared statistics settings: %+v", a)
 			}
 			seenStats = true
 		case "response_cache":
 			a := smartdnsMigrationArgs(t, p).(*cache.Args)
-			if seenCache || a.Size != 20000 || a.LazyCacheTTL != 86400 || a.DumpInterval != 600 || a.DumpFile != "/etc/mosdns/cache"+suffix+".dump" {
+			if seenCache || a.Size != 20000 || a.LazyCacheTTL != 86400 || a.DumpInterval != 600 || a.DumpFile != "/opt/mosdns/cache.dump" {
 				t.Fatalf("existing response cache was not reused with the shared defaults: %+v", a)
 			}
 			seenCache = true

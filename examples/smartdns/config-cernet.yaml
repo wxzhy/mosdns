@@ -5,1013 +5,1390 @@
 # ICMP-only probes preserve the old configuration and require ICMP capability.
 log:
   level: info
-  file: /var/log/mosdns.log
+  file: /tmp/mosdns.log
 
-# 域名直接使用 geosite:标签，默认库为导出的 runtime 兼容 bundle。
-# 不要用原始 GeoSite dat 替换它而声称匹配语义不变；typed 模式是另行选择的语义调整。
+# 部署规则库需要遥测分类，并保留 google、apple 和 category-games 条目的 cn 属性。
 geodata:
-  geosite: ./data/smartdns/geosite.dat
+  geosite: ./data/smartdns/geosite-deployment.dat
   geoip: ./data/smartdns/Country.mmdb
   asn: ./data/smartdns/ASN.mmdb
 plugins:
+  # 示例基础功能：仅在主入口最前方统计，包含缓存命中；不统计 HTTPS 辅助查询。
+  # 正常关闭及定时转储保留统计；普通/CERNET 示例使用相同的转储路径。
+  - tag: stats_collector
+    type: stats_api
+    args:
+      capacity: 2000
+      dump_file: /opt/mosdns/stats.dump
+      dump_interval: 600
 
-# 示例基础功能：仅在主入口最前方统计，包含缓存命中；不统计 HTTPS 辅助查询。
-# 正常关闭及定时转储保留统计，普通/CERNET 使用各自文件，避免切换配置时混用。
-- tag: stats_collector
-  type: stats_api
-  args:
-    capacity: 2000
-    dump_file: /etc/mosdns/stats-cernet.dump
-    dump_interval: 600
+  # Google fallback 的额外豁免域名，包含域名本身及子域名；后续 qname/CNAME 共用。
+  - tag: domain_google_fallback_exempt
+    type: domain_set
+    args:
+      exps:
+        - domain:supl.google.com
+        - domain:bdn.dev
+        - domain:c.chat.google.com
+        - domain:c.mail.google.com
+        - domain:c.pack.google.com
+        - domain:c.play.google.com
+        - domain:c.youtubeeducation.com
+        - domain:gcpcdn.gvt1.com
+        - domain:gvt1.com
+        - domain:offline-maps.gvt1.com
+        - domain:snap.gvt1.com
+        - domain:xn--ngstr-lra8j.com
+        - domain:googlevideo.com
 
-# IP 集合保留原标签：GeoIP/ASN 使用上面的默认库；GitHub 两个自定义集合
-# 已把原导出文本的 CIDR 内联进来，不再依赖外部 IP 文本文件。
-- tag: ip_cloudflare
-  type: ip_set
-  args:
-    ips:
-    - geoip:cloudflare
-- tag: ip_cloudfront
-  type: ip_set
-  args:
-    ips:
-    - geoip:cloudfront
-- tag: ip_fastly
-  type: ip_set
-  args:
-    ips:
-    - geoip:fastly
-- tag: ip_private
-  type: ip_set
-  args:
-    ips:
-    - geoip:private
-- tag: ip_facebook
-  type: ip_set
-  args:
-    ips:
-    - geoip:facebook
-- tag: ip_twitter
-  type: ip_set
-  args:
-    ips:
-    - geoip:twitter
-- tag: ip_github
-  type: ip_set
-  args:
-    ips:
-    - 185.199.108.0/22
-    - 2606:50c0:8000::/46
-- tag: ip_github-raw
-  type: ip_set
-  args:
-    ips:
-    - 185.199.108.133/32
-    - 185.199.109.133/32
-    - 185.199.110.133/32
-    - 185.199.111.133/32
-    - 2606:50c0:8000::154/128
-    - 2606:50c0:8001::154/128
-    - 2606:50c0:8002::154/128
-    - 2606:50c0:8003::154/128
-- tag: ip_asn_19679
-  type: ip_set
-  args:
-    ips:
-    - asn:19679
-- tag: ip_asn_33191
-  type: ip_set
-  args:
-    ips:
-    - asn:33191
+  # IP 集合保留原标签：GeoIP/ASN 使用上面的默认库；GitHub 两个自定义集合
+  # 已把原导出文本的 CIDR 内联进来，不再依赖外部 IP 文本文件。
+  - tag: ip_cloudflare
+    type: ip_set
+    args:
+      ips:
+        - geoip:cloudflare
+  - tag: ip_cloudfront
+    type: ip_set
+    args:
+      ips:
+        - geoip:cloudfront
+  - tag: ip_fastly
+    type: ip_set
+    args:
+      ips:
+        - geoip:fastly
+  - tag: ip_private
+    type: ip_set
+    args:
+      ips:
+        - geoip:private
+  - tag: ip_facebook
+    type: ip_set
+    args:
+      ips:
+        - geoip:facebook
+  - tag: ip_twitter
+    type: ip_set
+    args:
+      ips:
+        - geoip:twitter
+  - tag: ip_github
+    type: ip_set
+    args:
+      ips:
+        - 185.199.108.0/22
+        - 2606:50c0:8000::/46
+  - tag: ip_github-raw
+    type: ip_set
+    args:
+      ips:
+        - 185.199.108.133/32
+        - 185.199.109.133/32
+        - 185.199.110.133/32
+        - 185.199.111.133/32
+        - 2606:50c0:8000::154/128
+        - 2606:50c0:8001::154/128
+        - 2606:50c0:8002::154/128
+        - 2606:50c0:8003::154/128
+  - tag: ip_asn_19679
+    type: ip_set
+    args:
+      ips:
+        - asn:19679
+  - tag: ip_asn_33191
+    type: ip_set
+    args:
+      ips:
+        - asn:33191
 
-# 上游连接：addr 中的 URL 主机名用于 TLS SNI，dial_addr 只改变拨号目标；
-# http_host 只改变 HTTP Host，http_method 保留原 GET/POST，三者不能互相替代。
-# 同一服务的多个地址按 dial_addr 展开为独立候选，避免在测速前提前丢掉其他可用响应。
-- tag: upstream_test-tcp_1
-  type: forward
-  args:
-    upstreams:
-    - addr: tcp://8.8.8.8:53
-      use_tricks: true
-- tag: upstream_google-1_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://[2001:4860:4860::8888]:53
-      repeat: 0
-      use_tricks: true
-- tag: upstream_google-2_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://[2001:4860:4860::8844]:53
-      repeat: 0
-      use_tricks: true
-- tag: upstream_google-3_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://216.239.34.34:53
-      repeat: 0
-      use_tricks: true
-- tag: upstream_google-4_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://216.239.36.36:53
-      repeat: 0
-      use_tricks: true
-- tag: upstream_curl-doh_1
-  type: forward
-  args:
-    upstreams:
-    - addr: https://jxl61mtx82.cloudflare-gateway.com/dns-query
-      http_host: jxl61mtx82.cloudflare-gateway.com
-      http_method: POST
-      insecure_skip_verify: false
-      ech_config_list: crypto.cloudflare.com+udp://114.114.114.114:53
-      fingerprint: chrome
-- tag: upstream_v-dns_1
-  type: forward
-  args:
-    upstreams:
-    - addr: https://v.recipes/dns-ecs
-      http_host: v.recipes
-      http_method: POST
-      insecure_skip_verify: false
-      ech_config_list: crypto.cloudflare.com+udp://114.114.114.114:53
-      fingerprint: chrome
-- tag: upstream_nextdns_1
-  type: forward
-  args:
-    upstreams:
-    - addr: https://dns.nextdns.io/394f12
-      http_host: dns.nextdns.io
-      http_method: POST
-      insecure_skip_verify: false
-      ech_config_list: crypto.cloudflare.com+udp://114.114.114.114:53
-      fingerprint: chrome
-      dial_addr: '[2606:4700:10::]:443'
-- tag: upstream_nextdns_2
-  type: forward
-  args:
-    upstreams:
-    - addr: https://dns.nextdns.io/394f12
-      http_host: dns.nextdns.io
-      http_method: POST
-      insecure_skip_verify: false
-      ech_config_list: crypto.cloudflare.com+udp://114.114.114.114:53
-      fingerprint: chrome
-      dial_addr: '[2606:4700:20::]:443'
-- tag: upstream_iij_1
-  type: forward
-  args:
-    upstreams:
-    - addr: https://www.baidu.com/dns-query
-      http_host: public.dns.iij.jp
-      http_method: POST
-      insecure_skip_verify: true
-      fingerprint: chrome
-      dial_addr: '[2001:300::5]:443'
-- tag: upstream_iij_2
-  type: forward
-  args:
-    upstreams:
-    - addr: https://www.baidu.com/dns-query
-      http_host: public.dns.iij.jp
-      http_method: POST
-      insecure_skip_verify: true
-      fingerprint: chrome
-      dial_addr: '[2001:300::6]:443'
-- tag: upstream_hinet_1
-  type: forward
-  args:
-    upstreams:
-    - addr: https://www.sina.com/dns-query
-      http_host: dns.hinet.net
-      http_method: POST
-      insecure_skip_verify: true
-      fingerprint: chrome
-      dial_addr: '[2001:b000:168::1]:443'
-- tag: upstream_hinet_2
-  type: forward
-  args:
-    upstreams:
-    - addr: https://www.sina.com/dns-query
-      http_host: dns.hinet.net
-      http_method: POST
-      insecure_skip_verify: true
-      fingerprint: chrome
-      dial_addr: '[2001:b000:168::2]:443'
-- tag: upstream_114dns_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://114.114.114.114:53
-- tag: upstream_114dns_2
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://114.114.115.115:53
-- tag: upstream_dnspod_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://119.29.29.29:53
-- tag: upstream_dnspod_2
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://119.28.28.28:53
-- tag: upstream_trafficroute_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://180.184.1.1:53
-- tag: upstream_trafficroute_2
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://180.184.2.2:53
-- tag: upstream_telecom_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://218.2.2.2:53
-- tag: upstream_telecom_2
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://218.4.4.4:53
-- tag: upstream_unicom_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://221.6.4.66:53
-- tag: upstream_unicom_2
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://58.240.57.33:53
-- tag: upstream_cmcc_1
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://221.131.143.69:53
-- tag: upstream_cmcc_2
-  type: forward
-  args:
-    upstreams:
-    - addr: udp://221.131.143.70:53
-- tag: upstream_opennic_1
-  type: forward
-  args:
-    upstreams:
-    - addr: tcp://[2a01:4f9:2b:1305::2]:53
-- tag: upstream_opennic_2
-  type: forward
-  args:
-    upstreams:
-    - addr: tcp://[2a01:4f9:c011:83d::1]:53
+  # 上游连接：addr 中的 URL 主机名用于 TLS SNI，dial_addr 只改变拨号目标；
+  # http_host 只改变 HTTP Host，http_method 保留原 GET/POST，三者不能互相替代。
+  # 同一服务的多个地址按 dial_addr 展开为独立候选，避免在测速前提前丢掉其他可用响应。
+  - tag: upstream_test-tcp_1
+    type: forward
+    args:
+      upstreams:
+        - addr: tcp://8.8.8.8:53
+          use_tricks: true
+  - tag: upstream_google-1_1
+    type: forward
+    args:
+      upstreams:
+        - addr: tcp://[2001:4860:4860::8888]:53
+          use_tricks: true
+  - tag: upstream_google-2_1
+    type: forward
+    args:
+      upstreams:
+        - addr: tcp://[2001:4860:4860::8844]:53
+          use_tricks: true
+  - tag: upstream_google-3_1
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://216.239.34.34:53
+          repeat: 0
+          use_tricks: true
+  - tag: upstream_google-4_1
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://216.239.36.36:53
+          repeat: 0
+          use_tricks: true
+  - tag: upstream_curl-doh_1
+    type: forward
+    args:
+      upstreams:
+        - addr: &cloudflare_gateway_url https://jxl61mtx82.cloudflare-gateway.com/dns-query
+          http_host: &cloudflare_gateway_host jxl61mtx82.cloudflare-gateway.com
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: &ech_config_source crypto.cloudflare.com+udp://114.114.114.114:53
+          fingerprint: chrome
+          dial_addr: 172.64.145.0:443
+  - tag: upstream_curl-doh_2
+    type: forward
+    args:
+      upstreams:
+        - addr: *cloudflare_gateway_url
+          http_host: *cloudflare_gateway_host
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: 104.18.38.0:443
+  - tag: upstream_curl-doh_3
+    type: forward
+    args:
+      upstreams:
+        - addr: *cloudflare_gateway_url
+          http_host: *cloudflare_gateway_host
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: "[2606:4700:10::]:443"
+  - tag: upstream_curl-doh_4
+    type: forward
+    args:
+      upstreams:
+        - addr: *cloudflare_gateway_url
+          http_host: *cloudflare_gateway_host
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: "[2606:4700:20::]:443"
+  - tag: upstream_v-dns_1
+    type: forward
+    args:
+      upstreams:
+        - addr: https://v.recipes/dns-ecs
+          http_host: v.recipes
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: 172.64.145.0:443
+  - tag: upstream_v-dns_2
+    type: forward
+    args:
+      upstreams:
+        - addr: https://v.recipes/dns-ecs
+          http_host: v.recipes
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: 104.18.38.0:443
+  - tag: upstream_v-dns_3
+    type: forward
+    args:
+      upstreams:
+        - addr: https://v.recipes/dns-ecs
+          http_host: v.recipes
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: "[2606:4700:10::]:443"
+  - tag: upstream_v-dns_4
+    type: forward
+    args:
+      upstreams:
+        - addr: https://v.recipes/dns-ecs
+          http_host: v.recipes
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: "[2606:4700:20::]:443"
+  - tag: upstream_nextdns_1
+    type: forward
+    args:
+      upstreams:
+        - addr: https://dns.nextdns.io/394f12
+          http_host: dns.nextdns.io
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: 172.64.145.0:443
+  - tag: upstream_nextdns_2
+    type: forward
+    args:
+      upstreams:
+        - addr: https://dns.nextdns.io/394f12
+          http_host: dns.nextdns.io
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: 104.18.38.0:443
+  - tag: upstream_nextdns_3
+    type: forward
+    args:
+      upstreams:
+        - addr: https://dns.nextdns.io/394f12
+          http_host: dns.nextdns.io
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: "[2606:4700:10::]:443"
+  - tag: upstream_nextdns_4
+    type: forward
+    args:
+      upstreams:
+        - addr: https://dns.nextdns.io/394f12
+          http_host: dns.nextdns.io
+          http_method: POST
+          insecure_skip_verify: false
+          ech_config_list: *ech_config_source
+          fingerprint: chrome
+          dial_addr: "[2606:4700:20::]:443"
+  - tag: upstream_iij_1
+    type: forward
+    args:
+      upstreams:
+        - addr: https://www.baidu.com/dns-query
+          http_host: public.dns.iij.jp
+          http_method: POST
+          insecure_skip_verify: true
+          fingerprint: chrome
+          dial_addr: "[2001:300::5]:443"
+  - tag: upstream_iij_2
+    type: forward
+    args:
+      upstreams:
+        - addr: https://www.baidu.com/dns-query
+          http_host: public.dns.iij.jp
+          http_method: POST
+          insecure_skip_verify: true
+          fingerprint: chrome
+          dial_addr: "[2001:300::6]:443"
+  - tag: upstream_hinet_1
+    type: forward
+    args:
+      upstreams:
+        - addr: https://www.sina.com/dns-query
+          http_host: dns.hinet.net
+          http_method: POST
+          insecure_skip_verify: true
+          fingerprint: chrome
+          dial_addr: "[2001:b000:168::1]:443"
+  - tag: upstream_hinet_2
+    type: forward
+    args:
+      upstreams:
+        - addr: https://www.sina.com/dns-query
+          http_host: dns.hinet.net
+          http_method: POST
+          insecure_skip_verify: true
+          fingerprint: chrome
+          dial_addr: "[2001:b000:168::2]:443"
+  - tag: upstream_114dns_1
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://114.114.114.114:53
+  - tag: upstream_114dns_2
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://114.114.115.115:53
+  - tag: upstream_dnspod_1
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://119.29.29.29:53
+  - tag: upstream_dnspod_2
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://119.28.28.28:53
+  - tag: upstream_trafficroute_1
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://180.184.1.1:53
+  - tag: upstream_trafficroute_2
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://180.184.2.2:53
+  - tag: upstream_telecom_1
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://218.2.2.2:53
+  - tag: upstream_telecom_2
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://218.4.4.4:53
+  - tag: upstream_unicom_1
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://221.6.4.66:53
+  - tag: upstream_unicom_2
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://58.240.57.33:53
+  - tag: upstream_cmcc_1
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://221.131.143.69:53
+  - tag: upstream_cmcc_2
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://221.131.143.70:53
+  - tag: upstream_opennic_1
+    type: forward
+    args:
+      upstreams:
+        - addr: tcp://[2a01:4f9:2b:1305::2]:53
+  - tag: upstream_opennic_2
+    type: forward
+    args:
+      upstreams:
+        - addr: tcp://[2a01:4f9:c011:83d::1]:53
 
-# 静态路由：A/AAAA 返回配置地址；其他类型保持 NOERROR/NODATA。
-# black_hole 后的 has_resp/accept 与 reject 0 不能省略，否则会继续落到其他路由。
-- tag: static_block
-  type: sequence
-  args:
-  - exec: black_hole 127.0.0.1 ::1
-  - matches:
-    - has_resp
-    exec: ttl 86400
-  - matches:
-    - has_resp
-    exec: accept
-  - exec: reject 0
-- tag: static_proxy
-  type: sequence
-  args:
-  - exec: black_hole 192.168.8.64 2001:db8::64
-  - matches:
-    - has_resp
-    exec: ttl 86400
-  - matches:
-    - has_resp
-    exec: accept
-  - exec: reject 0
+  # 静态路由：A/AAAA 返回配置地址；其他类型保持 NOERROR/NODATA。
+  # black_hole 后的 has_resp/accept 与 reject 0 不能省略，否则会继续落到其他路由。
+  - tag: static_block
+    type: sequence
+    args:
+      - exec: black_hole 127.0.0.1 ::1
+      - matches:
+          - has_resp
+        exec: ttl 86400
+      - matches:
+          - has_resp
+        exec: accept
+      - exec: reject 0
+  - tag: static_proxy
+    type: sequence
+    args:
+      - exec: "black_hole 9.0.0.0 2620::"
+      - matches:
+          - has_resp
+        exec: ttl 86400
+      - matches:
+          - has_resp
+        exec: accept
+      - exec: reject 0
 
-# CDN 替换保留 replace_map 原顺序，GitHub raw 的例外须先于 Fastly 的宽泛集合。
-# Fastly 的 IPv4 /22、IPv6 /64 替换保留主机位，不能改成逐地址的 /32、/128。
-- tag: replace_cdn
-  type: ip_replace
-  args:
-    replace_map:
-    - match_ip:
-      - $ip_cloudflare
-      exclude_ip: []
-      ipv4_prefixlen: 32
-      ipv6_prefixlen: 128
-      ipv4:
-      - 172.64.145.0
-      - 172.64.146.0
-      - 104.18.38.0
-      - 104.18.39.0
-      ipv6:
-      - '2606:4700:10::'
-      - '2606:4700:20::'
-    - match_ip:
-      - $ip_cloudfront
-      exclude_ip: []
-      ipv4_prefixlen: 32
-      ipv6_prefixlen: 128
-      ipv4:
-      - 3.168.241.0
-      - 13.225.167.0
-      - 3.175.219.0
-      - 13.33.212.0
-      - 3.166.246.0
-      ipv6:
-      - '2600:9000:2939::'
-      - '2600:9000:2079::'
-    - match_ip:
-      - $ip_github-raw
-      exclude_ip: []
-      ipv4_prefixlen: 32
-      ipv6_prefixlen: 128
-      ipv4:
-      - 146.75.50.132
-      - 146.75.49.55
-      - 146.75.48.133
-      - 146.75.50.217
-      - 146.75.49.91
-      ipv6:
-      - 2a04:4e42:200::133
-      - 2a04:4e42:400::311
-      - 2a04:4e42:600::347
-    - match_ip:
-      - $ip_fastly
-      exclude_ip:
-      - $ip_github
-      ipv4_prefixlen: 22
-      ipv6_prefixlen: 64
-      ipv4:
-      - 146.75.48.0
-      ipv6:
-      - '2a04:4e42:200::'
-      - '2a04:4e42:400::'
-      - '2a04:4e42:600::'
+  # CDN 替换保留 replace_map 原顺序，GitHub raw 的例外须先于 Fastly 的宽泛集合。
+  # Fastly 的 IPv4 /22、IPv6 /64 替换保留主机位，不能改成逐地址的 /32、/128。
+  - tag: replace_cdn
+    type: ip_replace
+    args:
+      ip_source: upstream_dnspod_1
+      replace_map:
+        - match_ip:
+            - $ip_cloudflare
+            - $ip_asn_33191
+          exclude_ip: []
+          ipv4_prefixlen: 32
+          ipv6_prefixlen: 128
+          ipv4: ["domain:cf-bgp.my.cn.eu.org"]
+          ipv6:
+            - "2606:4700:10::"
+            - "2606:4700:20::"
+        - match_ip:
+            - $ip_cloudfront
+          exclude_ip: []
+          ipv4_prefixlen: 32
+          ipv6_prefixlen: 128
+          ipv4: ["domain:cft-bgp.my.cn.eu.org"]
+          ipv6:
+            - "2600:9000:2939::"
+            - "2600:9000:2079::"
+        - match_ip:
+            - $ip_github-raw
+          exclude_ip: []
+          ipv4_prefixlen: 32
+          ipv6_prefixlen: 128
+          ipv4:
+            - 146.75.50.132
+            - 146.75.49.55
+            - 146.75.48.133
+            - 146.75.50.217
+            - 146.75.49.91
+          ipv6:
+            - 2a04:4e42:200::133
+            - 2a04:4e42:400::311
+            - 2a04:4e42:600::347
+        - match_ip:
+            - $ip_fastly
+          exclude_ip:
+            - $ip_github
+          ipv4_prefixlen: 22
+          ipv6_prefixlen: 64
+          ipv4:
+            - 146.75.48.0
+          ipv6:
+            - "2a04:4e42:200::"
+            - "2a04:4e42:400::"
+            - "2a04:4e42:600::"
 
-# 替换门控：豁免名单同时检查 qname 和 CNAME，仅 A/AAAA（1/28）参与地址替换；
-# 各名单内容与先后顺序均取自原配置。
-- tag: apply_replace
-  type: sequence
-  args:
-  - matches:
-    - qname geosite:mozilla geosite:cn geosite:cloudflare-cn geosite:google-cn geosite:category-ntp geosite:category-stun
-    exec: return
-  - matches:
-    - cname geosite:mozilla geosite:cn geosite:cloudflare-cn geosite:google-cn geosite:category-ntp geosite:category-stun
-    exec: return
-  - matches:
-    - '!qtype 1 28'
-    exec: return
-  - exec: $replace_cdn
-- tag: filter_item_1
-  type: sequence
-  args:
-  - matches:
-    - qname geosite:facebook geosite:dropbox
-    exec: return
-  - matches:
-    - cname geosite:facebook geosite:dropbox
-    exec: return
-  - matches:
-    - resp_ip $ip_facebook $ip_twitter $ip_asn_19679
-    exec: drop_resp
+  # 替换门控：豁免名单同时检查 qname 和 CNAME，仅 A/AAAA（1/28）参与地址替换；
+  # google-cn 范围统一包含 google@cn、google-cn 和 redirector.googlevideo.com。
+  # Cloudflare 的额外域名豁免见下方。
+  - tag: apply_replace
+    type: sequence
+    args:
+      # 国内域名条件只在此定义；分流和 HTTPS 门控复用同一组 qname/CNAME 条件。
+      - matches:
+          - &cn_qname qname geosite:cn geosite:google@cn geosite:apple@cn geosite:category-games@cn full:redirector.googlevideo.com
+        exec: return
+      - matches:
+          - &cn_cname cname geosite:cn geosite:google@cn geosite:apple@cn geosite:category-games@cn full:redirector.googlevideo.com
+        exec: return
+      - matches:
+          - qname geosite:mozilla geosite:cloudflare-cn geosite:category-ntp geosite:category-stun
+        exec: return
+      - matches:
+          - cname geosite:mozilla geosite:cloudflare-cn geosite:category-ntp geosite:category-stun
+        exec: return
+      - matches:
+          - "!qtype 1 28"
+        exec: return
+      # Cloudflare 豁免同时检查查询名与 CNAME，包含子域名；其他 CDN 仍按原规则替换。
+      - matches:
+          - &cloudflare_replace_exempt_qname qname domain:pacloudflare.com domain:argotunnel.com domain:stun.cloudflare.com domain:turn.cloudflare.com
+          - resp_ip $ip_cloudflare $ip_asn_33191
+        exec: return
+      - matches:
+          - &cloudflare_replace_exempt_cname cname domain:pacloudflare.com domain:argotunnel.com domain:stun.cloudflare.com domain:turn.cloudflare.com
+          - resp_ip $ip_cloudflare $ip_asn_33191
+        exec: return
+      - exec: $replace_cdn
+  - tag: replace_twitter
+    type: ip_replace
+    args:
+      ip_source: upstream_dnspod_1
+      replace_map:
+        - match_ip:
+            - $ip_fastly
+            - $ip_cloudflare
+          exclude_ip: []
+          ipv4_prefixlen: 32
+          ipv6_prefixlen: 128
+          ipv4: ["domain:cf-bgp.my.cn.eu.org"]
+          ipv6:
+            - "2606:4700:10::"
+            - "2606:4700:20::"
+  - tag: apply_twitter
+    type: sequence
+    args:
+      - matches:
+          - "!qname geosite:twitter"
+          - "!cname geosite:twitter"
+        exec: return
+      - matches:
+          - "!qtype 1 28"
+        exec: return
+      # Twitter 的目标也是 Cloudflare，避免 CNAME 命中豁免后在此再次替换。
+      - matches:
+          - *cloudflare_replace_exempt_qname
+        exec: return
+      - matches:
+          - *cloudflare_replace_exempt_cname
+        exec: return
+      - exec: $replace_twitter
+  - tag: replace_facebook
+    type: ip_replace
+    args:
+      replace_map:
+        - match_ip:
+            - $ip_facebook
+          exclude_ip: []
+          ipv4_prefixlen: 32
+          ipv6_prefixlen: 128
+          ipv4:
+            - 172.64.145.0
+            - 104.18.38.0
+          ipv6:
+            - "2606:4700:10::"
+            - "2606:4700:20::"
+  - tag: apply_facebook
+    type: sequence
+    args:
+      - matches:
+          - "!qname geosite:meta"
+          - "!cname geosite:meta"
+        exec: return
+      - matches:
+          - "!qtype 1 28"
+        exec: return
+      - exec: $replace_facebook
+  - tag: filter_item_1
+    type: sequence
+    args:
+      - matches:
+          - qname geosite:meta geosite:dropbox
+        exec: return
+      - matches:
+          - cname geosite:meta geosite:dropbox
+        exec: return
+      - matches:
+          - resp_ip $ip_facebook $ip_twitter $ip_asn_19679
+        exec: drop_resp
 
-# 命中过滤条件时丢弃整份响应，不是仅删去一个地址；名称豁免同时检查 qname/CNAME。
-# 每项过滤后保留 !has_resp 返回，阻止被丢弃的候选继续参与替换和测速。
-- tag: filter_response
-  type: sequence
-  args:
-  - exec: $filter_item_1
-  - matches:
-    - '!has_resp'
-    exec: return
+  # 命中过滤条件时丢弃整份响应，不是仅删去一个地址；名称豁免同时检查 qname/CNAME。
+  # 每项过滤后保留 !has_resp 返回，阻止被丢弃的候选继续参与替换和测速。
+  - tag: filter_response
+    type: sequence
+    args:
+      - exec: $filter_item_1
+      - matches:
+          - "!has_resp"
+        exec: return
 
-# 固定地址兜底仅接受 all_probes_failed 或合法 NODATA。
-# unmeasured（未启动、取消或不支持）不等于测速失败；NXDOMAIN 也不等于 NODATA。
-- tag: fallback_google
-  type: ip_fallback
-  args:
-    ipv4: []
-    ipv6:
-    - 2404:6800:4005:800::93
-    - 2404:6800:4005:c02::94
-    - 2404:6800:4005:c00::2008
-    - 2404:6800:4005:c02::2018
-    - 2404:6800:4005:c02::ca
-    - 2404:6800:4005:800::b5
-    ttl: 86400
-    'on':
-    - all_probes_failed
-    - nodata
+  # 固定地址兜底仅接受 all_probes_failed 或合法 NODATA。
+  # unmeasured（未启动、取消或不支持）不等于测速失败；NXDOMAIN 也不等于 NODATA。
+  - tag: fallback_google
+    type: ip_fallback
+    args:
+      ip_source: upstream_dnspod_1
+      ipv4: ["domain:goog-cernet.my.cn.eu.org"]
+      ipv6: ["domain:goog-cernet.my.cn.eu.org"]
+      ttl: 86400
+      "on":
+        - all_probes_failed
+        - no_rtt
+        - nodata
 
-# 名称包含/排除门控保持原顺序，同时检查 qname 和 CNAME；仅在对应路由完成选择后调用。
-- tag: apply_fallback
-  type: sequence
-  args:
-  - matches:
-    - qname geosite:google-cn geosite:googlefcm geosite:category-ntp geosite:category-stun
-    exec: return
-  - matches:
-    - cname geosite:google-cn geosite:googlefcm geosite:category-ntp geosite:category-stun
-    exec: return
-  - matches:
-    - '!qname geosite:google'
-    - '!cname geosite:google'
-    exec: return
-  - exec: $fallback_google
+  # 名称包含/排除门控保持原顺序，同时检查 qname 和 CNAME；仅在对应路由完成选择后调用。
+  - tag: apply_fallback
+    type: sequence
+    args:
+      - matches:
+          - qname geosite:google@cn geosite:google-cn full:redirector.googlevideo.com geosite:googlefcm geosite:category-ntp geosite:category-stun
+        exec: return
+      - matches:
+          - cname geosite:google@cn geosite:google-cn full:redirector.googlevideo.com geosite:googlefcm geosite:category-ntp geosite:category-stun
+        exec: return
+      # 额外 fallback 豁免同时检查查询名与 CNAME，包含列出域名及其子域名。
+      - matches:
+          - qname $domain_google_fallback_exempt
+        exec: return
+      - matches:
+          - cname $domain_google_fallback_exempt
+        exec: return
+      - matches:
+          - "!qname geosite:google"
+          - "!cname geosite:google"
+        exec: return
+      - exec: $fallback_google
 
-# source_<路由组>__<上游组>__<序号>：候选来源保持各 resolver 的原动作顺序，
-# 即 上游应答 →（按原配置）全响应过滤 → CDN 替换 → 其他替换，随后交给同组 selector。
-# 任一步之后无响应立即 return 结束该候选，不对原地址先测速。
-- tag: source_cn__telecom__1
-  type: sequence
-  args:
-  - exec: $upstream_telecom_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__telecom__2
-  type: sequence
-  args:
-  - exec: $upstream_telecom_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__unicom__1
-  type: sequence
-  args:
-  - exec: $upstream_unicom_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__unicom__2
-  type: sequence
-  args:
-  - exec: $upstream_unicom_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__cmcc__1
-  type: sequence
-  args:
-  - exec: $upstream_cmcc_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__cmcc__2
-  type: sequence
-  args:
-  - exec: $upstream_cmcc_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__dnspod__1
-  type: sequence
-  args:
-  - exec: $upstream_dnspod_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__dnspod__2
-  type: sequence
-  args:
-  - exec: $upstream_dnspod_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__114dns__1
-  type: sequence
-  args:
-  - exec: $upstream_114dns_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_cn__114dns__2
-  type: sequence
-  args:
-  - exec: $upstream_114dns_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
+  # source_<路由组>__<上游组>__<序号>：候选来源保持各 resolver 的原动作顺序，
+  # 即 上游应答 →（按原配置）全响应过滤 → CDN 替换 → 其他替换，随后交给同组 selector。
+  # 任一步之后无响应立即 return 结束该候选，不对原地址先测速。
+  - tag: source_cn__telecom__1
+    type: sequence
+    args:
+      - exec: $upstream_telecom_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__telecom__2
+    type: sequence
+    args:
+      - exec: $upstream_telecom_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__unicom__1
+    type: sequence
+    args:
+      - exec: $upstream_unicom_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__unicom__2
+    type: sequence
+    args:
+      - exec: $upstream_unicom_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__cmcc__1
+    type: sequence
+    args:
+      - exec: $upstream_cmcc_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__cmcc__2
+    type: sequence
+    args:
+      - exec: $upstream_cmcc_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__dnspod__1
+    type: sequence
+    args:
+      - exec: $upstream_dnspod_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__dnspod__2
+    type: sequence
+    args:
+      - exec: $upstream_dnspod_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__114dns__1
+    type: sequence
+    args:
+      - exec: $upstream_114dns_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_cn__114dns__2
+    type: sequence
+    args:
+      - exec: $upstream_114dns_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
 
-# 各组 selector 保留原候选顺序，bounded 从首个成功 RTT 开始限时收集；无 RTT 时等全部工作完成或总预算耗尽，再走原兜底。
-# probe/labels/倍率配置以锚点共享；修改锚点影响其引用，单组调整时先展开对应别名。
-# private 只豁免探测，不代表丢弃该地址；其余地址在过滤和替换完成后才进入测速。
-- tag: select_cn
-  type: speedcheck
-  args:
-    sources:
-    - source_cn__telecom__1
-    - source_cn__telecom__2
-    - source_cn__unicom__1
-    - source_cn__unicom__2
-    - source_cn__cmcc__1
-    - source_cn__cmcc__2
-    - source_cn__dnspod__1
-    - source_cn__dnspod__2
-    - source_cn__114dns__1
-    - source_cn__114dns__2
-    mode: bounded
-    total_timeout: 1500ms
-    selection_timeout: 250ms
-    settle_window: 25ms
-    probe: &id001
-      tcp_ports: []
-      icmp: true
-      timeout: 200ms
-    max_num: 1
-    threshold_ms: 100
-    labels: &id002
-      private:
-      - $ip_private
-    tag_multipliers: &id003 []
-    asn_multipliers: &id004 {}
-    probe_match: &id005
-      labels_exclude:
-      - private
-- tag: source_global__doh-test__1
-  type: sequence
-  args:
-  - exec: $upstream_curl-doh_1
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_global__nextdns__1
-  type: sequence
-  args:
-  - exec: $upstream_nextdns_1
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_global__nextdns__2
-  type: sequence
-  args:
-  - exec: $upstream_nextdns_2
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: select_global
-  type: speedcheck
-  args:
-    sources:
-    - source_global__doh-test__1
-    - source_global__nextdns__1
-    - source_global__nextdns__2
-    mode: bounded
-    total_timeout: 2500ms
-    selection_timeout: 300ms
-    settle_window: 25ms
-    probe: *id001
-    max_num: 1
-    threshold_ms: 100
-    labels: *id002
-    tag_multipliers: *id003
-    asn_multipliers: *id004
-    probe_match: *id005
-- tag: source_default__telecom__1
-  type: sequence
-  args:
-  - exec: $upstream_telecom_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__telecom__2
-  type: sequence
-  args:
-  - exec: $upstream_telecom_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__unicom__1
-  type: sequence
-  args:
-  - exec: $upstream_unicom_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__unicom__2
-  type: sequence
-  args:
-  - exec: $upstream_unicom_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__cmcc__1
-  type: sequence
-  args:
-  - exec: $upstream_cmcc_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__cmcc__2
-  type: sequence
-  args:
-  - exec: $upstream_cmcc_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__dnspod__1
-  type: sequence
-  args:
-  - exec: $upstream_dnspod_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__dnspod__2
-  type: sequence
-  args:
-  - exec: $upstream_dnspod_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__114dns__1
-  type: sequence
-  args:
-  - exec: $upstream_114dns_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__114dns__2
-  type: sequence
-  args:
-  - exec: $upstream_114dns_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__doh-test__1
-  type: sequence
-  args:
-  - exec: $upstream_curl-doh_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__nextdns__1
-  type: sequence
-  args:
-  - exec: $upstream_nextdns_1
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: source_default__nextdns__2
-  type: sequence
-  args:
-  - exec: $upstream_nextdns_2
-  - exec: $filter_response
-  - matches:
-    - '!has_resp'
-    exec: return
-  - exec: $apply_replace
-  - matches:
-    - '!has_resp'
-    exec: return
-- tag: select_default
-  type: speedcheck
-  args:
-    sources:
-    - source_default__telecom__1
-    - source_default__telecom__2
-    - source_default__unicom__1
-    - source_default__unicom__2
-    - source_default__cmcc__1
-    - source_default__cmcc__2
-    - source_default__dnspod__1
-    - source_default__dnspod__2
-    - source_default__114dns__1
-    - source_default__114dns__2
-    - source_default__doh-test__1
-    - source_default__nextdns__1
-    - source_default__nextdns__2
-    mode: bounded
-    total_timeout: 2500ms
-    selection_timeout: 300ms
-    settle_window: 25ms
-    probe: *id001
-    max_num: 1
-    threshold_ms: 100
-    labels: *id002
-    tag_multipliers: *id003
-    asn_multipliers: *id004
-    probe_match: *id005
+  # 各组 selector 保留原候选顺序，bounded 从首个成功 RTT 开始限时收集；无 RTT 时等全部工作完成或总预算耗尽，再走原兜底。
+  # probe/labels/倍率配置以锚点共享；修改锚点影响其引用，单组调整时先展开对应别名。
+  # private 只豁免探测，不代表丢弃该地址；其余地址在过滤和替换完成后才进入测速。
+  - tag: select_cn
+    type: speedcheck
+    args:
+      sources:
+        - source_cn__telecom__1
+        - source_cn__telecom__2
+        - source_cn__unicom__1
+        - source_cn__unicom__2
+        - source_cn__cmcc__1
+        - source_cn__cmcc__2
+        - source_cn__dnspod__1
+        - source_cn__dnspod__2
+        - source_cn__114dns__1
+        - source_cn__114dns__2
+      mode: bounded
+      total_timeout: 1500ms
+      selection_timeout: 250ms
+      settle_window: 25ms
+      probe: &id001
+        tcp_ports: []
+        icmp: true
+        timeout: 200ms
+      max_num: 1
+      threshold_ms: 100
+      labels: &id002
+        private:
+          - $ip_private
+      tag_multipliers: &id003 []
+      asn_multipliers: &id004 {}
+      probe_match: &id005
+        labels_exclude:
+          - private
+  - tag: source_global__doh-test__1
+    type: sequence
+    args:
+      - exec: $upstream_curl-doh_1
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_twitter
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_global__doh-test__2
+    type: sequence
+    args:
+      - exec: $upstream_curl-doh_2
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_twitter
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_global__doh-test__3
+    type: sequence
+    args:
+      - exec: $upstream_curl-doh_3
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_twitter
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_global__doh-test__4
+    type: sequence
+    args:
+      - exec: $upstream_curl-doh_4
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_twitter
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_global__nextdns__1
+    type: sequence
+    args:
+      - exec: $upstream_nextdns_1
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_twitter
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_global__nextdns__2
+    type: sequence
+    args:
+      - exec: $upstream_nextdns_2
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_twitter
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_global__nextdns__3
+    type: sequence
+    args:
+      - exec: $upstream_nextdns_3
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_twitter
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_global__nextdns__4
+    type: sequence
+    args:
+      - exec: $upstream_nextdns_4
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_twitter
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: select_global
+    type: speedcheck
+    args:
+      sources:
+        - source_global__doh-test__1
+        - source_global__doh-test__2
+        - source_global__doh-test__3
+        - source_global__doh-test__4
+        - source_global__nextdns__1
+        - source_global__nextdns__2
+        - source_global__nextdns__3
+        - source_global__nextdns__4
+      mode: bounded
+      total_timeout: 2500ms
+      selection_timeout: 300ms
+      settle_window: 25ms
+      probe: *id001
+      max_num: 1
+      threshold_ms: 100
+      labels: *id002
+      tag_multipliers: *id003
+      asn_multipliers: *id004
+      probe_match: *id005
+  - tag: source_default__telecom__1
+    type: sequence
+    args:
+      - exec: $upstream_telecom_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__telecom__2
+    type: sequence
+    args:
+      - exec: $upstream_telecom_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__unicom__1
+    type: sequence
+    args:
+      - exec: $upstream_unicom_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__unicom__2
+    type: sequence
+    args:
+      - exec: $upstream_unicom_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__cmcc__1
+    type: sequence
+    args:
+      - exec: $upstream_cmcc_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__cmcc__2
+    type: sequence
+    args:
+      - exec: $upstream_cmcc_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__dnspod__1
+    type: sequence
+    args:
+      - exec: $upstream_dnspod_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__dnspod__2
+    type: sequence
+    args:
+      - exec: $upstream_dnspod_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__114dns__1
+    type: sequence
+    args:
+      - exec: $upstream_114dns_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__114dns__2
+    type: sequence
+    args:
+      - exec: $upstream_114dns_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__doh-test__1
+    type: sequence
+    args:
+      - exec: $upstream_curl-doh_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__doh-test__2
+    type: sequence
+    args:
+      - exec: $upstream_curl-doh_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__doh-test__3
+    type: sequence
+    args:
+      - exec: $upstream_curl-doh_3
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__doh-test__4
+    type: sequence
+    args:
+      - exec: $upstream_curl-doh_4
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__nextdns__1
+    type: sequence
+    args:
+      - exec: $upstream_nextdns_1
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__nextdns__2
+    type: sequence
+    args:
+      - exec: $upstream_nextdns_2
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__nextdns__3
+    type: sequence
+    args:
+      - exec: $upstream_nextdns_3
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: source_default__nextdns__4
+    type: sequence
+    args:
+      - exec: $upstream_nextdns_4
+      - exec: $filter_response
+      - matches:
+          - "!has_resp"
+        exec: return
+      - exec: $apply_replace
+      - matches:
+          - "!has_resp"
+        exec: return
+  - tag: select_default
+    type: speedcheck
+    args:
+      sources:
+        - source_default__telecom__1
+        - source_default__telecom__2
+        - source_default__unicom__1
+        - source_default__unicom__2
+        - source_default__cmcc__1
+        - source_default__cmcc__2
+        - source_default__dnspod__1
+        - source_default__dnspod__2
+        - source_default__114dns__1
+        - source_default__114dns__2
+        - source_default__doh-test__1
+        - source_default__doh-test__2
+        - source_default__doh-test__3
+        - source_default__doh-test__4
+        - source_default__nextdns__1
+        - source_default__nextdns__2
+        - source_default__nextdns__3
+        - source_default__nextdns__4
+      mode: bounded
+      total_timeout: 2500ms
+      selection_timeout: 300ms
+      settle_window: 25ms
+      probe: *id001
+      max_num: 1
+      threshold_ms: 100
+      labels: *id002
+      tag_multipliers: *id003
+      asn_multipliers: *id004
+      probe_match: *id005
 
-# 以下路由保留原 ECS 设置、标记和上游选择方式。
-# 标记编号：1=block 2=proxy 3=google-cn 4=cn 5=global 6=opennic 7=default；
-# main 依据这些标记为 SVCB/HTTPS 查询选择对应的后处理动作。
-- tag: google_ecs
-  type: ecs_handler
-  args:
-    forward: false
-    send: false
-    preset: '240b:4001:23c::'
-    mask6: 48
+  # 以下路由保留原 ECS 设置、标记和上游选择方式。
+  # 标记编号：1=block 2=proxy 3=google-cn 4=cn 5=global 6=opennic 7=default；
+  # main 依据这些标记为 SVCB/HTTPS 查询选择对应的后处理动作。
+  - tag: google_ecs
+    type: ecs_handler
+    args:
+      forward: false
+      send: false
+      preset: "240b:4001:23c::"
+      mask6: 48
 
-# 非测速上游池：forward 并发竞速，取第一份完整应答，不做逐候选测速；
-# route_google_cn 先调用 google_ecs 注入 ECS，再查询此池。
-- tag: upstream_google_cn
-  type: forward
-  args:
-    concurrent: 2
-    upstreams:
-    - addr: udp://[2001:4860:4860::8888]:53
-      repeat: 0
-      use_tricks: true
-    - addr: udp://[2001:4860:4860::8844]:53
-      repeat: 0
-      use_tricks: true
-- tag: upstream_opennic
-  type: forward
-  args:
-    concurrent: 2
-    upstreams:
-    - addr: tcp://[2a01:4f9:2b:1305::2]:53
-    - addr: tcp://[2a01:4f9:c011:83d::1]:53
-- tag: route_google_cn
-  type: sequence
-  args:
-  - exec: mark 3
-  - exec: $google_ecs
-  - exec: $upstream_google_cn
-- tag: route_cn
-  type: sequence
-  args:
-  - exec: mark 4
-  - exec: $select_cn
-- tag: route_global
-  type: sequence
-  args:
-  - exec: mark 5
-  - exec: $select_global
-  - exec: $apply_fallback
-- tag: route_opennic
-  type: sequence
-  args:
-  - exec: mark 6
-  - exec: $upstream_opennic
-- tag: route_default
-  type: sequence
-  args:
-  - exec: mark 7
-  - exec: $select_default
-  - exec: $apply_fallback
-- tag: route_block
-  type: sequence
-  args:
-  - exec: mark 1
-  - exec: $static_block
-- tag: route_proxy
-  type: sequence
-  args:
-  - exec: mark 2
-  - exec: $static_proxy
+  # 非测速上游池：forward 并发竞速，取第一份完整应答，不做逐候选测速；
+  # route_google_cn 先调用 google_ecs 注入 ECS，再通过 TCP 查询，避免 IPv6 UDP 超时。
+  - tag: upstream_google_cn
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: tcp://[2001:4860:4860::8888]:53
+          use_tricks: true
+        - addr: tcp://[2001:4860:4860::8844]:53
+          use_tricks: true
+  - tag: upstream_opennic
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: tcp://[2a01:4f9:2b:1305::2]:53
+        - addr: tcp://[2a01:4f9:c011:83d::1]:53
+  - tag: route_google_cn
+    type: sequence
+    args:
+      - exec: mark 3
+      - exec: $google_ecs
+      - exec: $upstream_google_cn
+  - tag: route_cn
+    type: sequence
+    args:
+      - exec: mark 4
+      - exec: $select_cn
+  - tag: route_global
+    type: sequence
+    args:
+      - exec: mark 5
+      - exec: $select_global
+      - exec: $apply_fallback
+  - tag: route_opennic
+    type: sequence
+    args:
+      - exec: mark 6
+      - exec: $upstream_opennic
+  - tag: route_default
+    type: sequence
+    args:
+      - exec: mark 7
+      - exec: $select_default
+      - exec: $apply_fallback
+  - tag: route_block
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: $static_block
+  - tag: route_proxy
+    type: sequence
+    args:
+      - exec: mark 2
+      - exec: $static_proxy
 
-# 保留原分流顺序：广告 → proxy（A/AAAA）→ google-cn → 国内 → 全局 → OpenNIC → 默认。
-# 每段 has_resp 后立即 accept；合法 NXDOMAIN 也是响应，不能按“没有地址”继续落入默认路由。
-- tag: resolve_base
-  type: sequence
-  args:
-  - matches:
-    - qname geosite:category-ads-all geosite:category-ads geosite:ads
-    exec: $route_block
-  - matches:
-    - has_resp
-    exec: accept
-  - matches:
-    - qname geosite:proxy
-    - qtype 1 28
-    exec: $route_proxy
-  - matches:
-    - has_resp
-    exec: accept
-  - matches:
-    - qname geosite:google-cn
-    exec: $route_google_cn
-  - matches:
-    - has_resp
-    exec: accept
-  - matches:
-    - qname geosite:cn geosite:google-cn geosite:apple-cn
-    exec: $route_cn
-  - matches:
-    - has_resp
-    exec: accept
-  - matches:
-    - qname geosite:google geosite:gfw
-    exec: $route_global
-  - matches:
-    - has_resp
-    exec: accept
-  - matches:
-    - qname geosite:tld-opennic
-    exec: $route_opennic
-  - matches:
-    - has_resp
-    exec: accept
-  - exec: $route_default
-  - matches:
-    - has_resp
-    exec: accept
+  # 保留原分流顺序：广告 → proxy（A/AAAA）→ google-cn → 国内 → 全局 → OpenNIC → 默认。
+  # 每段 has_resp 后立即 accept；合法 NXDOMAIN 也是响应，不能按“没有地址”继续落入默认路由。
+  - tag: resolve_base
+    type: sequence
+    args:
+      - matches:
+          - qname geosite:category-ads-all geosite:category-ads geosite:category-telemetry geosite:category-ads-and-telemetry
+        exec: $route_block
+      - matches:
+          - has_resp
+        exec: accept
+      - matches:
+          - qname geosite:openai geosite:anthropic geosite:xai geosite:google-gemini
+          - qtype 1 28
+        exec: $route_proxy
+      - matches:
+          - has_resp
+        exec: accept
+      - matches:
+          - qname geosite:google@cn geosite:google-cn full:redirector.googlevideo.com
+        exec: $route_google_cn
+      - matches:
+          - has_resp
+        exec: accept
+      - matches:
+          - *cn_qname
+        exec: $route_cn
+      - matches:
+          - has_resp
+        exec: accept
+      - matches:
+          - qname geosite:google geosite:gfw
+        exec: $route_global
+      - matches:
+          - has_resp
+        exec: accept
+      - matches:
+          - qname geosite:tld-opennic
+        exec: $route_opennic
+      - matches:
+          - has_resp
+        exec: accept
+      - exec: $route_default
+      - matches:
+          - has_resp
+        exec: accept
 
-# 复用迁移配置原有的共享缓存，合入示例的容量、lazy 保留期及持久化。
-# 普通/CERNET 使用不同转储文件；过期命中以 TTL 5 秒返回并后台刷新。
-# cache 会包裹后续链，在链执行完后保存最终响应，包括 HTTPS 后处理结果。
-- tag: response_cache
-  type: cache
-  args:
-    size: 20000
-    lazy_cache_ttl: 86400
-    dump_file: /etc/mosdns/cache-cernet.dump
-    dump_interval: 600
+  # 复用迁移配置原有的共享缓存，合入示例的容量、lazy 保留期及持久化。
+  # 过期命中以 TTL 5 秒返回并后台刷新；需要独立状态时为两份配置设置不同转储路径。
+  # cache 会包裹后续链，在链执行完后保存最终响应，包括 HTTPS 后处理结果。
+  - tag: response_cache
+    type: cache
+    args:
+      size: 20000
+      lazy_cache_ttl: 86400
+      dump_file: /opt/mosdns/cache.dump
+      dump_interval: 600
 
-# HTTPS 的辅助 A 查询复用缓存和完整分流、过滤、替换、测速链。
-# 此入口不执行 main 的 HTTPS 后处理，避免递归；也不能直接改成裸 forward 绕过策略。
-- tag: resolve_cached
-  type: sequence
-  args:
-  - exec: $response_cache
-  - matches:
-    - has_resp
-    exec: accept
-  - exec: $resolve_base
+  # HTTPS 的辅助 A 查询复用缓存和完整分流、过滤、替换、测速链。
+  # 此入口不执行 main 的 HTTPS 后处理，避免递归；也不能直接改成裸 forward 绕过策略。
+  - tag: resolve_cached
+    type: sequence
+    args:
+      - exec: $response_cache
+      - matches:
+          - has_resp
+        exec: accept
+      - exec: $resolve_base
 
-# ECH 查询使用独立上游池，与辅助 IP 解析的完整策略链分开。
-- tag: ech_lookup
-  type: forward
-  args:
-    concurrent: 2
-    upstreams:
-    - addr: udp://114.114.114.114:53
-    - addr: udp://114.114.115.115:53
+  # ECH 查询使用独立上游池，与辅助 IP 解析的完整策略链分开。
+  - tag: ech_lookup
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: udp://114.114.114.114:53
+        - addr: udp://114.114.115.115:53
 
-# HTTPS 名称门控控制注入和辅助查询；即使跳过它们，后面的 hint/H3 清理仍执行。
-# 因此 inject_* 与 apply_* 两层不能直接合并成同一个带名称条件的动作。
-- tag: https_cleanup
-  type: https_record
-  args:
-    remove_hint: true
-    remove_h3: true
-    add_ech: false
-    enable_subquery: false
+  # HTTPS 名称门控控制注入和辅助查询；即使跳过它们，后面的 hint/H3 清理仍执行。
+  # 因此 inject_* 与 apply_* 两层不能直接合并成同一个带名称条件的动作。
+  - tag: https_cleanup
+    type: https_record
+    args:
+      remove_hint: true
+      remove_h3: true
+      add_ech: false
+      enable_subquery: false
 
-# HTTPS 后处理参数：match_ip 门控注入对象（应答地址命中这些集合才注入 ECH）。
-# add_ech 开启且满足注入条件时，ech_source 通过独立上游池查询 ech_domain。
-# enable_subquery 另行控制辅助 A 查询；ip_source 使用 resolve_cached 完整策略链。
-- tag: process_https
-  type: https_record
-  args:
-    remove_hint: true
-    remove_h3: true
-    add_ech: true
-    enable_subquery: true
-    ech_source: ech_lookup
-    ech_domain: crypto.cloudflare.com
-    ip_source: resolve_cached
-    match_ip:
-    - $ip_cloudflare
-    timeout: 400ms
-- tag: inject_https
-  type: sequence
-  args:
-  - matches:
-    - qname geosite:cn
-    exec: return
-  - matches:
-    - cname geosite:cn
-    exec: return
-  - exec: $process_https
-- tag: apply_https
-  type: sequence
-  args:
-  - exec: $inject_https
-  - exec: $https_cleanup
+  # HTTPS 后处理参数：match_ip 门控注入对象（应答地址命中这些集合才注入 ECH）。
+  # add_ech 开启且满足注入条件时，ech_source 通过独立上游池查询 ech_domain。
+  # enable_subquery 另行控制辅助 A 查询；ip_source 使用 resolve_cached 完整策略链。
+  - tag: process_https_cn
+    type: https_record
+    args:
+      remove_hint: true
+      remove_h3: true
+      add_ech: true
+      enable_subquery: false
+      ech_source: ech_lookup
+      ech_domain: crypto.cloudflare.com
+      ip_source: resolve_cached
+      match_ip:
+        - $ip_cloudflare
+      timeout: 400ms
+  - tag: inject_https_cn
+    type: sequence
+    args:
+      - matches:
+          - *cn_qname
+        exec: return
+      - matches:
+          - *cn_cname
+        exec: return
+      - exec: $process_https_cn
+  - tag: apply_https_cn
+    type: sequence
+    args:
+      - exec: $inject_https_cn
+      - exec: $https_cleanup
+  - tag: process_https
+    type: https_record
+    args:
+      remove_hint: true
+      remove_h3: true
+      add_ech: true
+      enable_subquery: true
+      ech_source: ech_lookup
+      ech_domain: crypto.cloudflare.com
+      ip_source: resolve_cached
+      match_ip:
+        - $ip_cloudflare
+        - $ip_asn_33191
+      timeout: 400ms
+  - tag: inject_https
+    type: sequence
+    args:
+      - matches:
+          - *cn_qname
+        exec: return
+      - matches:
+          - *cn_cname
+        exec: return
+      - exec: $process_https
+  - tag: apply_https
+    type: sequence
+    args:
+      - exec: $inject_https
+      - exec: $https_cleanup
+  - tag: process_https_twitter
+    type: https_record
+    args:
+      remove_hint: true
+      remove_h3: true
+      add_ech: true
+      enable_subquery: true
+      ech_source: ech_lookup
+      ech_domain: crypto.cloudflare.com
+      ip_source: resolve_cached
+      match_ip:
+        - $ip_cloudflare
+        - $ip_fastly
+      timeout: 400ms
+  - tag: inject_https_twitter
+    type: sequence
+    args:
+      - matches:
+          - "!qname geosite:twitter"
+          - "!cname geosite:twitter"
+        exec: return
+      - exec: $process_https_twitter
+  - tag: apply_https_twitter
+    type: sequence
+    args:
+      - exec: $inject_https_twitter
+      - exec: $https_cleanup
 
-# 总入口：先统计，再查共享缓存，未命中按原策略分流；非 NOERROR 响应不执行 HTTPS 后处理。
-# SVCB/HTTPS 按原路由标记执行对应动作，保留各条规则及其顺序；缓存命中不重复处理。
-- tag: main
-  type: sequence
-  args:
-  - exec: $stats_collector
-  - exec: $response_cache
-  - matches:
-    - has_resp
-    exec: accept
-  - exec: $resolve_base
-  - matches:
-    - '!rcode 0'
-    exec: accept
-  - matches:
-    - qtype 64 65
-    - mark 3
-    exec: $apply_https
-  - matches:
-    - qtype 64 65
-    - mark 4
-    exec: $apply_https
-  - matches:
-    - qtype 64 65
-    - mark 5
-    exec: $apply_https
-  - matches:
-    - qtype 64 65
-    - mark 7
-    exec: $apply_https
+  # 总入口：先统计，再查共享缓存，未命中按原策略分流；非 NOERROR 响应不执行 HTTPS 后处理。
+  # SVCB/HTTPS 按原路由标记执行对应动作，保留各条规则及其顺序；缓存命中不重复处理。
+  - tag: main
+    type: sequence
+    args:
+      - exec: $stats_collector
+      - exec: $response_cache
+      - matches:
+          - has_resp
+        exec: accept
+      - exec: $resolve_base
+      - matches:
+          - "!rcode 0"
+        exec: accept
+      - matches:
+          - qtype 64 65
+          - mark 3
+        exec: $apply_https_cn
+      - matches:
+          - qtype 64 65
+          - mark 4
+        exec: $apply_https_cn
+      - matches:
+          - qtype 64 65
+          - mark 5
+        exec: $apply_https_twitter
+      - matches:
+          - qtype 64 65
+          - mark 5
+        exec: $apply_https
+      - matches:
+          - qtype 64 65
+          - mark 7
+        exec: $apply_https
 
-# TCP/UDP 监听器共用 main，监听地址和端口保留原配置。
-- tag: dns_tcp
-  type: tcp_server
-  args:
-    entry: main
-    listen: '[::]:5335'
-    idle_timeout: 5
-- tag: dns_udp
-  type: udp_server
-  args:
-    entry: main
-    listen: '[::]:5335'
+  # TCP/UDP 监听器共用 main，监听地址和端口保留原配置。
+  - tag: dns_tcp
+    type: tcp_server
+    args:
+      entry: main
+      listen: "[::]:5335"
+      idle_timeout: 5
+  - tag: dns_udp
+    type: udp_server
+    args:
+      entry: main
+      listen: "[::]:5335"
 api:
   http: 127.0.0.1:9091
 include: []

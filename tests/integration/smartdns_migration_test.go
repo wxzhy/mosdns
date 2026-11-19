@@ -18,6 +18,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/speedtest"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/domain_set"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/cache"
 	forward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
@@ -59,15 +60,21 @@ func smartdnsMigrationConfig(t *testing.T, path string) coremain.Config {
 	seen := make(map[string]bool)
 	byTag := make(map[string]coremain.PluginConfig)
 	for _, p := range cfg.Plugins {
-		if p.Type == "domain_set" {
-			t.Fatalf("%s: migration rules must reference geosite entries directly", p.Tag)
-		}
 		if p.Tag == "" || seen[p.Tag] {
 			t.Fatalf("empty or duplicate plugin tag %q", p.Tag)
 		}
 		seen[p.Tag] = true
 		byTag[p.Tag] = p
 		args := smartdnsMigrationArgs(t, p)
+		// Custom domain lists may be shared as sets; GeoSite groups remain
+		// direct references instead of redundant data-provider wrappers.
+		if set, ok := args.(*domain_set.Args); ok {
+			for _, expression := range set.Exps {
+				if _, _, _, geo, _ := geodata.ParseDomainExp(expression); geo {
+					t.Fatalf("%s: migration rules must reference geosite entries directly", p.Tag)
+				}
+			}
+		}
 		if f, ok := args.(*forward.Args); ok && len(f.Upstreams) != 1 && p.Tag != "upstream_google_cn" && p.Tag != "upstream_opennic" && p.Tag != "ech_lookup" {
 			t.Fatalf("%s: each forward must retain exactly one upstream, got %d", p.Tag, len(f.Upstreams))
 		}
@@ -178,6 +185,9 @@ func smartdnsMigrationInstance(t *testing.T, cfg coremain.Config, answer func(st
 				q.SetResponse(r)
 				return nil
 			})
+			// Keep controlled upstreams valid as dynamic IP sources.
+			f.plugins[tag+"__fixture"] = instance
+			instance, err = sequence.NewSequence(bp, sequence.Args{{Exec: "$" + tag + "__fixture"}})
 		case *speedcheck.Args:
 			var sources []speedcheck.Source
 			for _, tag := range a.Sources {
@@ -246,7 +256,17 @@ func smartdnsMigrationWrite(t *testing.T, path, content string) {
 
 func smartdnsMigrationSiteLabels(t *testing.T, cfg coremain.Config) []string {
 	t.Helper()
-	labels := make(map[string]struct{})
+	var codes []string
+	for code := range smartdnsMigrationSiteAttributes(t, cfg) {
+		codes = append(codes, code)
+	}
+	slices.Sort(codes)
+	return codes
+}
+
+func smartdnsMigrationSiteAttributes(t *testing.T, cfg coremain.Config) map[string][]string {
+	t.Helper()
+	labels := make(map[string][]string)
 	for _, plugin := range cfg.Plugins {
 		rules, ok := smartdnsMigrationArgs(t, plugin).(*sequence.Args)
 		if !ok {
@@ -255,17 +275,22 @@ func smartdnsMigrationSiteLabels(t *testing.T, cfg coremain.Config) []string {
 		for _, rule := range *rules {
 			for _, match := range rule.Matches {
 				for _, expression := range strings.Fields(match) {
-					if strings.HasPrefix(expression, "$domain_") {
-						t.Fatalf("%s retains a domain provider reference %q", plugin.Tag, expression)
-					}
 					if !strings.HasPrefix(expression, "geosite:") {
 						continue
 					}
 					_, code, attrs, ok, err := geodata.ParseDomainExp(expression)
-					if err != nil || !ok || len(attrs) != 0 {
+					if err != nil || !ok {
 						t.Fatalf("unsupported synthetic GeoSite expression %q: %v", expression, err)
 					}
-					labels[strings.ToLower(code)] = struct{}{}
+					code = strings.ToLower(code)
+					if _, exists := labels[code]; !exists {
+						labels[code] = nil
+					}
+					for _, attr := range attrs {
+						if !slices.Contains(labels[code], attr) {
+							labels[code] = append(labels[code], attr)
+						}
+					}
 				}
 			}
 		}
@@ -273,12 +298,7 @@ func smartdnsMigrationSiteLabels(t *testing.T, cfg coremain.Config) []string {
 	if len(labels) == 0 {
 		t.Fatal("migration sequences contain no direct geosite references")
 	}
-	var codes []string
-	for code := range labels {
-		codes = append(codes, code)
-	}
-	slices.Sort(codes)
-	return codes
+	return labels
 }
 
 // Build a small, instance-local GeoSite database from the entries referenced by
@@ -290,11 +310,22 @@ func smartdnsMigrationSiteFixture(t *testing.T, cfg coremain.Config, dir string)
 		return protowire.AppendBytes(protowire.AppendTag(dst, number, protowire.BytesType), value)
 	}
 	var data []byte
+	attributes := smartdnsMigrationSiteAttributes(t, cfg)
 	for _, code := range smartdnsMigrationSiteLabels(t, cfg) {
 		domain := protowire.AppendVarint(protowire.AppendTag(nil, 1, protowire.VarintType), uint64(geodata.TypeFull))
 		domain = bytesField(domain, 2, []byte(code+".migration.invalid"))
 		entry := bytesField(nil, 1, []byte(strings.ToUpper(code)))
 		entry = bytesField(entry, 2, domain)
+		// Keep the unfiltered name above distinct from the attributed name,
+		// so tests can detect accidentally matching an entire GeoSite group.
+		if attrs := attributes[code]; len(attrs) != 0 {
+			attributed := protowire.AppendVarint(protowire.AppendTag(nil, 1, protowire.VarintType), uint64(geodata.TypeFull))
+			attributed = bytesField(attributed, 2, []byte(code+"-attr.migration.invalid"))
+			for _, attr := range attrs {
+				attributed = bytesField(attributed, 3, bytesField(nil, 1, []byte(attr)))
+			}
+			entry = bytesField(entry, 2, attributed)
+		}
 		data = bytesField(data, 1, entry)
 	}
 	path := filepath.Join(dir, "geosite.dat")
@@ -384,8 +415,8 @@ func TestSmartdnsMigrationRouting(t *testing.T) {
 			}{
 				{"category-ads-all", "route_block", dns.TypeA, "127.0.0.1"},
 				{"category-ads-all", "route_block", dns.TypeAAAA, "::1"},
-				{"proxy", "route_proxy", dns.TypeA, "9.0.0.0"},
-				{"proxy", "route_proxy", dns.TypeAAAA, "2620::"},
+				{"openai", "route_proxy", dns.TypeA, "9.0.0.0"},
+				{"openai", "route_proxy", dns.TypeAAAA, "2620::"},
 				{"google-cn", "route_google_cn", dns.TypeA, ""},
 				{"cn", "route_cn", dns.TypeA, ""},
 				{"cn", "route_cn", dns.TypeAAAA, ""},
@@ -394,13 +425,6 @@ func TestSmartdnsMigrationRouting(t *testing.T) {
 				{"unlisted", "route_default", dns.TypeA, ""},
 			} {
 				t.Run(tc.name+"/"+dns.TypeToString[tc.qtype], func(t *testing.T) {
-					if strings.Contains(path, "cernet") && tc.route == "route_proxy" {
-						if tc.qtype == dns.TypeA {
-							tc.static = "192.168.8.64"
-						} else {
-							tc.static = "2001:db8::64"
-						}
-					}
 					f := smartdnsMigrationInstance(t, cfg, func(_, name string, qtype uint16) []netip.Addr {
 						if qtype == dns.TypeAAAA {
 							return []netip.Addr{netip.MustParseAddr("2001:db8:c::42")}
@@ -442,7 +466,7 @@ func TestSmartdnsMigrationRouting(t *testing.T) {
 // detection only probes loopback. No deployment listener or cache file is used.
 func TestSmartdnsMigrationLocalData(t *testing.T) {
 	if os.Getenv("MOSDNS_SMARTDNS_LOCAL_DATA") != "1" {
-		t.Skip("set MOSDNS_SMARTDNS_LOCAL_DATA=1 after exporting data/smartdns")
+		t.Skip("set MOSDNS_SMARTDNS_LOCAL_DATA=1 after preparing the deployment databases")
 	}
 	for _, path := range smartdnsMigrationConfigs {
 		t.Run(path, func(t *testing.T) {

@@ -26,7 +26,7 @@
 go test -race ./tests/integration -count=1 -timeout=180s
 ```
 
-需要检查已导出的本地数据库时，在 PowerShell 中执行：
+按[规则数据说明](../../examples/smartdns/README-data.md)准备数据库后，在 PowerShell 中运行真实规则验证：
 
 ```powershell
 $env:MOSDNS_SMARTDNS_LOCAL_DATA = "1"

@@ -1,108 +1,136 @@
 package integration_test
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/geodata"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/speedtest"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/speedcheck"
 	"github.com/miekg/dns"
 )
 
-// Retained text exports are an independent audit input for this test only.
-// Runtime policies load the bundle without depending on the domains directory.
-func TestSmartdnsGeositeDataEquivalent(t *testing.T) {
+// Exercise the actual Google rules and complete policy graph with identical
+// measurement outcomes for the apex, a direct subdomain and a CNAME subdomain.
+// Network I/O is controlled; the exported deployment databases stay intact.
+func TestSmartdnsRealDataGoogleFallbackNames(t *testing.T) {
 	if os.Getenv("MOSDNS_SMARTDNS_LOCAL_DATA") != "1" {
-		t.Skip("set MOSDNS_SMARTDNS_LOCAL_DATA=1 to compare the GeoSite bundle with retained text exports")
+		t.Skip("set MOSDNS_SMARTDNS_LOCAL_DATA=1 to test Google fallback against exported data")
 	}
-	bundles := make(map[string]map[string]struct{})
 	for _, path := range smartdnsMigrationConfigs {
-		cfg := smartdnsMigrationConfig(t, path)
-		labels := bundles[cfg.Geodata.GeoSite]
-		if labels == nil {
-			labels = make(map[string]struct{})
-			bundles[cfg.Geodata.GeoSite] = labels
-		}
-		for _, label := range smartdnsMigrationSiteLabels(t, cfg) {
-			labels[label] = struct{}{}
-		}
+		t.Run(path, func(t *testing.T) {
+			cfg := smartdnsMigrationConfig(t, path)
+			targetName := "goog-ct.my.cn.eu.org."
+			if strings.Contains(path, "cernet") {
+				targetName = "goog-cernet.my.cn.eu.org."
+			}
+			for _, tc := range []struct {
+				name     string
+				outcome  speedtest.Outcome
+				qtype    uint16
+				nodata   bool
+				do       bool
+				fallback bool
+			}{
+				{"failed", speedtest.Failed, dns.TypeAAAA, false, false, true},
+				{"success", speedtest.Success, dns.TypeAAAA, false, false, false},
+				{"unmeasured", speedtest.Unmeasured, dns.TypeAAAA, false, false, true},
+				{"nodata", speedtest.Unmeasured, dns.TypeAAAA, true, false, true},
+				{"dnssec", speedtest.Failed, dns.TypeAAAA, false, true, false},
+				{"ipv4", speedtest.Failed, dns.TypeA, false, false, true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					originalIP, targetIP := "2404:6800:4008:c03::8a", "2001:db8:ffff::42"
+					if tc.qtype == dns.TypeA {
+						originalIP, targetIP = "142.250.1.1", "192.0.2.42"
+					}
+					f := smartdnsPolicyInstanceWithData(t, cfg, func(tag string, query *dns.Msg) *dns.Msg {
+						if tag == "upstream_dnspod_1" && query.Question[0].Name == targetName {
+							return smartdnsPolicyAddressReply(query, "", targetIP)
+						}
+						terminal := ""
+						if query.Question[0].Name == "earth.google.com." {
+							terminal = "www3.l.google.com."
+						}
+						if tc.nodata {
+							return smartdnsPolicyAddressReply(query, terminal)
+						}
+						return smartdnsPolicyAddressReply(query, terminal, originalIP)
+					}, func(context.Context, netip.Addr, speedtest.Config) speedtest.Result {
+						return speedtest.Result{Outcome: tc.outcome, RTT: 0}
+					}, true)
+					for _, name := range []string{"google.com.", "www.google.com.", "earth.google.com."} {
+						t.Run(name, func(t *testing.T) {
+							q, err := f.exec(t, "main", name, tc.qtype, tc.do)
+							smartdnsPolicyRequireSuccess(t, q, err)
+							if !q.HasMark(smartdnsMigrationRouteMarks["route_global"]) {
+								t.Fatal("Google name did not enter the global route")
+							}
+							want := []string{originalIP}
+							if tc.fallback {
+								want = []string{targetIP}
+							}
+							got := smartdnsMigrationAnswerIPs(q)
+							if !slices.Equal(got, want) {
+								t.Fatalf("addresses %v, want %v (probe status %v)", got, want, q.SnapshotResponse().ProbeStatus)
+							}
+							owner := name
+							if name == "earth.google.com." {
+								owner = "www3.l.google.com."
+								if len(q.R().Answer) < 2 || q.R().Answer[0].(*dns.CNAME).Target != owner {
+									t.Fatal("fallback lost the original CNAME chain")
+								}
+							}
+							for _, rr := range q.R().Answer {
+								if rr.Header().Rrtype == tc.qtype && rr.Header().Name != owner {
+									t.Fatalf("address owner %q, want %q", rr.Header().Name, owner)
+								}
+							}
+							t.Logf("route=global probe_status=%v addresses=%v", q.SnapshotResponse().ProbeStatus, got)
+						})
+					}
+				})
+			}
+		})
 	}
-	typeNames := map[geodata.DomainType]string{
-		geodata.TypeFull: "full", geodata.TypeDomain: "domain",
-		geodata.TypeRegex: "regexp", geodata.TypeSubstr: "keyword",
+}
+
+func TestSmartdnsDeploymentGeoSiteReferences(t *testing.T) {
+	if os.Getenv("MOSDNS_SMARTDNS_LOCAL_DATA") != "1" {
+		t.Skip("set MOSDNS_SMARTDNS_LOCAL_DATA=1 after preparing the deployment databases")
 	}
-	var paths []string
-	for path := range bundles {
-		paths = append(paths, path)
+	for _, path := range smartdnsMigrationConfigs {
+		t.Run(path, func(t *testing.T) {
+			cfg := smartdnsMigrationConfig(t, path)
+			attributes := smartdnsMigrationSiteAttributes(t, cfg)
+			for _, code := range smartdnsMigrationSiteLabels(t, cfg) {
+				check := func(attrs []string) {
+					t.Helper()
+					count := 0
+					err := geodata.LoadSite(cfg.Geodata.GeoSite, code, attrs, func(geodata.DomainType, string) error {
+						count++
+						return nil
+					})
+					if err != nil {
+						t.Fatalf("load %s with attributes %v: %v", code, attrs, err)
+					}
+					if count == 0 {
+						t.Fatalf("%s has no rules for attributes %v", code, attrs)
+					}
+				}
+				check(nil)
+				for _, attr := range attributes[code] {
+					check([]string{attr})
+				}
+			}
+		})
 	}
-	slices.Sort(paths)
-	totalRules := 0
-	for _, path := range paths {
-		var labels []string
-		for label := range bundles[path] {
-			labels = append(labels, label)
-		}
-		slices.Sort(labels)
-		if len(labels) != 19 {
-			t.Fatalf("bundle has %d referenced labels, want all 19 deployment labels", len(labels))
-		}
-		for _, label := range labels {
-			t.Run(label, func(t *testing.T) {
-				text, err := os.ReadFile(filepath.Join("data", "smartdns", "domains", label+".txt"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				want := make(map[string]struct{})
-				for _, raw := range strings.Split(string(text), "\n") {
-					expression := strings.TrimSpace(raw)
-					if expression == "" || strings.HasPrefix(expression, "#") {
-						continue
-					}
-					kind, value, ok := strings.Cut(expression, ":")
-					if !ok || value == "" || kind != "full" && kind != "domain" && kind != "regexp" && kind != "keyword" {
-						t.Fatalf("unknown or invalid text rule %q", expression)
-					}
-					if _, duplicate := want[expression]; duplicate {
-						t.Fatalf("duplicate text rule %q", expression)
-					}
-					want[expression] = struct{}{}
-				}
-				got := make(map[string]struct{})
-				if err := geodata.LoadSite(path, label, nil, func(kind geodata.DomainType, value string) error {
-					name, ok := typeNames[kind]
-					if !ok {
-						return fmt.Errorf("unknown GeoSite domain type %d", kind)
-					}
-					expression := name + ":" + value
-					if _, duplicate := got[expression]; duplicate {
-						return fmt.Errorf("duplicate GeoSite rule %q", expression)
-					}
-					got[expression] = struct{}{}
-					return nil
-				}); err != nil {
-					t.Fatal(err)
-				}
-				if len(got) != len(want) {
-					t.Fatalf("GeoSite has %d rules, retained text has %d", len(got), len(want))
-				}
-				for expression := range want {
-					if _, ok := got[expression]; !ok {
-						t.Fatalf("GeoSite is missing retained text rule %q", expression)
-					}
-				}
-				totalRules += len(got)
-				t.Logf("%s: %d rules agree", label, len(got))
-			})
-		}
-	}
-	t.Logf("compared %d rules across %d GeoSite bundles", totalRules, len(paths))
 }
 
 // These tests consume the exported, ignored deployment data. No DNS request or
@@ -112,26 +140,24 @@ func TestSmartdnsRealDataPolicies(t *testing.T) {
 	if os.Getenv("MOSDNS_SMARTDNS_LOCAL_DATA") != "1" {
 		t.Skip("set MOSDNS_SMARTDNS_LOCAL_DATA=1 to test exported SmartDNS rules and MMDBs")
 	}
-	for _, path := range []string{"data/smartdns/Country.mmdb", "data/smartdns/ASN.mmdb", "data/smartdns/geosite.dat", "data/smartdns/ips/github-raw.txt"} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("export the SmartDNS deployment data before opting in: %s: %v", path, err)
-		}
-	}
 	for _, path := range smartdnsMigrationConfigs {
 		t.Run(path, func(t *testing.T) {
 			cernet := strings.Contains(path, "cernet")
+			const cf4, cloudfront4 = "172.64.145.0", "3.168.241.0"
+			cfTarget, cloudfrontTarget := "cf-ct.my.cn.eu.org.", "cft-ct.my.cn.eu.org."
 			cf6, cloudfront6 := "2606:4700:52::", "2600:9000:2755::"
 			github6, fastly6 := "2a04:4e42:7c::133", "2a04:4e42:7c:0:1122:3344:5566:7788"
 			if cernet {
+				cfTarget, cloudfrontTarget = "cf-bgp.my.cn.eu.org.", "cft-bgp.my.cn.eu.org."
 				cf6, cloudfront6 = "2606:4700:10::", "2600:9000:2939::"
 				github6, fastly6 = "2a04:4e42:200::133", "2a04:4e42:200:0:1122:3344:5566:7788"
 			}
 			cases := []struct {
 				name, original, want string
 			}{
-				{"cloudflare_v4", "1.1.1.1", "172.64.145.0"},
+				{"cloudflare_v4", "1.1.1.1", cf4},
 				{"cloudflare_v6", "2606:4700:4700::1111", cf6},
-				{"cloudfront_v4", "3.168.241.42", "3.168.241.0"},
+				{"cloudfront_v4", "3.168.241.42", cloudfront4},
 				{"cloudfront_v6", "2600:9000:22a3::1", cloudfront6},
 				// These also match the real Fastly database and broad GitHub set.
 				// The earlier GitHub raw rule must win over the Fastly rule.
@@ -141,23 +167,30 @@ func TestSmartdnsRealDataPolicies(t *testing.T) {
 				{"fastly_v4_prefix22", "146.75.55.42", "146.75.51.42"},
 				{"fastly_v6_prefix64", "2a04:4e42:1234:abcd:1122:3344:5566:7788", fastly6},
 				{"github_nonraw_excluded_from_fastly", "185.199.108.42", "185.199.108.42"},
-				{"asn33191_v4", "208.103.161.1", "172.64.145.0"},
+				{"asn33191_v4", "208.103.161.1", cf4},
 				{"asn33191_v6", "2602:f79a::1", cf6},
-			}
-			if cernet {
-				for i := range cases {
-					if strings.HasPrefix(cases[i].name, "asn33191_") {
-						cases[i].want = cases[i].original
-					}
-				}
 			}
 			originals := make(map[string]string)
 			for _, tc := range cases {
 				originals[tc.name+".policy.example.com."] = tc.original
 			}
 			cfg := smartdnsMigrationConfig(t, path)
-			f := smartdnsPolicyInstanceWithData(t, cfg, func(_ string, query *dns.Msg) *dns.Msg {
+			qtypeIP := func(query *dns.Msg, ipv4, ipv6 string) *dns.Msg {
+				if query.Question[0].Qtype == dns.TypeAAAA {
+					return smartdnsPolicyAddressReply(query, "", ipv6)
+				}
+				return smartdnsPolicyAddressReply(query, "", ipv4)
+			}
+			f := smartdnsPolicyInstanceWithData(t, cfg, func(tag string, query *dns.Msg) *dns.Msg {
 				name := query.Question[0].Name
+				if tag == "upstream_dnspod_1" {
+					switch name {
+					case cfTarget:
+						return qtypeIP(query, cf4, cf6)
+					case cloudfrontTarget:
+						return qtypeIP(query, cloudfront4, cloudfront6)
+					}
+				}
 				if strings.HasPrefix(name, "nxdomain.") {
 					r := new(dns.Msg).SetRcode(query, dns.RcodeNameError)
 					r.Ns = []dns.RR{&dns.SOA{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 60}, Ns: "ns.example.com.", Mbox: "hostmaster.example.com.", Minttl: 60}}
@@ -276,11 +309,7 @@ func TestSmartdnsRealDataPolicies(t *testing.T) {
 						t.Fatal("real ads rule did not return the configured static answer")
 					}
 					if tc.route == "route_proxy" {
-						want := "9.0.0.0"
-						if cernet {
-							want = "192.168.8.64"
-						}
-						if !slices.Equal(smartdnsMigrationAnswerIPs(q), []string{want}) {
+						if !slices.Equal(smartdnsMigrationAnswerIPs(q), []string{"9.0.0.0"}) {
 							t.Fatal("real proxy rule did not return the configured static answer")
 						}
 					}
