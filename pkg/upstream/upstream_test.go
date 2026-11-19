@@ -28,10 +28,12 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/AdguardTeam/dnscrypt"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/ameshkov/dnsstamps"
 	"github.com/miekg/dns"
@@ -219,7 +221,7 @@ func TestQUICUpstreamClosesOwnedSocket(t *testing.T) {
 
 // startDNSCryptTestServer starts a DNSCrypt test server (udp + tcp)
 // and returns its stamp string.
-func startDNSCryptTestServer(t testing.TB, h dnscrypt.Handler) (stampStr string) {
+func startDNSCryptTestServer(t testing.TB, h dnscrypt.Handler) string {
 	t.Helper()
 
 	rc, err := dnscrypt.GenerateResolverConfig("example.com", nil, 0)
@@ -231,7 +233,8 @@ func startDNSCryptTestServer(t testing.TB, h dnscrypt.Handler) (stampStr string)
 		t.Fatal(err)
 	}
 
-	startServer := func(proto dnscrypt.Proto, addr netip.AddrPort) *dnscrypt.Server {
+	ctx := context.Background()
+	startServer := func(proto dnscrypt.Proto, addr netip.AddrPort) (*dnscrypt.Server, error) {
 		t.Helper()
 		s, err := dnscrypt.NewServer(&dnscrypt.ServerConfig{
 			Handler:      h,
@@ -243,31 +246,46 @@ func startDNSCryptTestServer(t testing.TB, h dnscrypt.Handler) (stampStr string)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Start(context.Background()); err != nil {
+		return s, s.Start(ctx)
+	}
+
+	// TCP and UDP have independent port availability. Keep the first listener
+	// open while binding the second and retry if the shared port is unavailable.
+	loopback := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0)
+	var lastBindErr error
+	for range 10 {
+		srvTCP, tcpErr := startServer(dnscrypt.ProtoTCP, loopback)
+		if tcpErr != nil {
+			t.Fatal(tcpErr)
+		}
+		addr := srvTCP.LocalAddr().(*net.TCPAddr).AddrPort()
+		srvUDP, bindErr := startServer(dnscrypt.ProtoUDP, addr)
+		if bindErr != nil {
+			if shutdownErr := srvTCP.Shutdown(ctx); shutdownErr != nil {
+				t.Fatal(errors.Join(bindErr, shutdownErr))
+			}
+			lastBindErr = bindErr
+			continue
+		}
+		t.Cleanup(func() {
+			_ = srvUDP.Shutdown(ctx)
+			_ = srvTCP.Shutdown(ctx)
+		})
+		stamp, err := rc.CreateStamp(addr.String())
+		if err != nil {
 			t.Fatal(err)
 		}
-		return s
+		return stamp.String()
 	}
-
-	srvUDP := startServer(dnscrypt.ProtoUDP, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0))
-	t.Cleanup(func() { _ = srvUDP.Shutdown(context.Background()) })
-
-	addrStr := srvUDP.LocalAddr().String()
-	stamp, err := rc.CreateStamp(addrStr)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	srvTCP := startServer(dnscrypt.ProtoTCP, netip.MustParseAddrPort(addrStr))
-	t.Cleanup(func() { _ = srvTCP.Shutdown(context.Background()) })
-
-	return stamp.String()
+	t.Fatalf("could not bind a shared TCP/UDP port: %v", lastBindErr)
+	return ""
 }
 
-type dnscryptTestHandler struct{}
+type dnscryptTestHandler struct{ truncateUDP bool }
 
-func (dnscryptTestHandler) ServeDNS(_ context.Context, w dnscrypt.ResponseWriter, r *dns.Msg) error {
+func (h dnscryptTestHandler) ServeDNS(_ context.Context, w dnscrypt.ResponseWriter, r *dns.Msg) error {
 	res := (&dns.Msg{}).SetReply(r)
+	res.Truncated = h.truncateUDP && w.RemoteAddr().Network() == "udp"
 	res.Answer = append(res.Answer, &dns.A{
 		Hdr: dns.RR_Header{
 			Name:   r.Question[0].Name,
@@ -278,6 +296,112 @@ func (dnscryptTestHandler) ServeDNS(_ context.Context, w dnscrypt.ResponseWriter
 		A: net.IPv4(1, 2, 3, 4).To4(),
 	})
 	return w.WriteMsg(context.Background(), res)
+}
+
+type testEventObserver func(Event)
+
+func (f testEventObserver) OnEvent(e Event) { f(e) }
+
+func TestDNSCryptWithConnectionObserver(t *testing.T) {
+	stamp := startDNSCryptTestServer(t, dnscryptTestHandler{truncateUDP: true})
+	var opens, closes atomic.Int32
+	u, err := NewUpstream(stamp, Opt{EventObserver: testEventObserver(func(e Event) {
+		switch e {
+		case EventConnOpen:
+			opens.Add(1)
+		case EventConnClose:
+			closes.Add(1)
+		}
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+
+	q := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+	wire, err := q.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	payload, err := u.ExchangeContext(ctx, wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.ReleaseBuf(payload)
+	resp := new(dns.Msg)
+	if err = resp.Unpack(*payload); err != nil || !resp.Response || resp.Truncated || resp.Id != q.Id || len(resp.Answer) != 1 {
+		t.Fatalf("DNSCrypt reply after TCP retry: %v, error: %v", resp, err)
+	}
+	if opened, closed := opens.Load(), closes.Load(); opened != 3 || closed != 3 {
+		t.Fatalf("expected certificate UDP, query UDP and query TCP; opened %d, closed %d", opened, closed)
+	}
+}
+
+func TestUDPSimultaneousExchangesUseDistinctPorts(t *testing.T) {
+	type source struct {
+		name string
+		port int
+	}
+	observed := make(chan source, 8)
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	addr, stop := newUDPTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, q *dns.Msg) {
+		select {
+		case observed <- source{name: q.Question[0].Name, port: w.RemoteAddr().(*net.UDPAddr).Port}:
+		default:
+		}
+		<-release
+		_ = w.WriteMsg(new(dns.Msg).SetReply(q))
+	}))
+	defer stop()
+	defer unblock()
+	u, err := NewUpstream("udp://"+addr, Opt{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	wires := make(chan error, 2)
+	for i := range 2 {
+		q := new(dns.Msg).SetQuestion(fmt.Sprintf("q%d.example.test.", i), dns.TypeA)
+		b, err := q.Pack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			r, err := u.ExchangeContext(ctx, b)
+			if r != nil {
+				pool.ReleaseBuf(r)
+			}
+			wires <- err
+		}()
+	}
+	ports := make(map[string]int)
+	for len(ports) != 2 {
+		select {
+		case src := <-observed:
+			ports[src.name] = src.port
+		case <-ctx.Done():
+			t.Fatal("missing concurrent UDP exchange")
+		}
+	}
+	if ports["q0.example.test."] == ports["q1.example.test."] {
+		t.Fatalf("two pending DNS exchanges share a source port: %v", ports)
+	}
+	unblock()
+	for range 2 {
+		select {
+		case err := <-wires:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("UDP exchange did not finish")
+		}
+	}
 }
 
 func Test_sdnsUpstream(t *testing.T) {

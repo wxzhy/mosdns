@@ -30,6 +30,7 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/miekg/dns"
 )
 
 var (
@@ -54,11 +55,11 @@ type TraditionalDnsConn struct {
 	closed      atomic.Bool // atomic, for fast check
 	closeErr    error       // closeErr is ready (not nil) when closeNotify is closed.
 
-	queueMu       sync.RWMutex
-	reservedQuery int
-	nextQid       uint16
-	queue         map[uint32]chan *[]byte // uint32 has fast path
-	writeGate     chan struct{}           // one owner of the shared write deadline
+	queueMu    sync.RWMutex
+	querySlots int // reserved queries, including exchanges in flight
+	nextQid    uint16
+	queue      map[uint32]chan *[]byte // uint32 has fast path
+	writeGate  chan struct{}           // one owner of the shared write deadline
 
 	// waitingResp indicates connection is waiting a reply from the peer.
 	// It can identify c is dead or buggy in some circumstances. e.g. Network is dropped
@@ -125,6 +126,12 @@ func (dc *TraditionalDnsConn) exchange(ctx context.Context, q []byte) (*[]byte, 
 	default:
 	}
 
+	var query dns.Msg
+	if !dc.isTcp {
+		if err := query.Unpack(q); err != nil || query.Response || len(query.Question) != 1 {
+			return nil, errors.New("invalid UDP DNS query")
+		}
+	}
 	assignedQid, respChan := dc.addQueueC()
 	if respChan == nil {
 		return nil, ErrTDCTooManyQueries
@@ -163,6 +170,14 @@ wait:
 		}
 		goto wait
 	case r := <-respChan:
+		if !dc.isTcp {
+			query.Id = assignedQid
+			var reply dns.Msg
+			if reply.Unpack(*r) != nil || !dnsutils.MatchesResponse(&query, &reply) {
+				pool.ReleaseBuf(r)
+				goto wait
+			}
+		}
 		orgId := binary.BigEndian.Uint16(q)
 		binary.BigEndian.PutUint16(*r, orgId)
 		return r, nil
@@ -293,7 +308,7 @@ func (dc *TraditionalDnsConn) deliverResponse(qid uint16, payload *[]byte) {
 func (dc *TraditionalDnsConn) queueLen() int {
 	dc.queueMu.RLock()
 	defer dc.queueMu.RUnlock()
-	return len(dc.queue) + dc.reservedQuery
+	return len(dc.queue)
 }
 
 // addQueueC assigns a qid and add it to the queue.
@@ -306,8 +321,12 @@ func (dc *TraditionalDnsConn) addQueueC() (qid uint16, c chan *[]byte) {
 	c = make(chan *[]byte, 1)
 	dc.queueMu.Lock()
 	for i := 0; i < 100; i++ {
-		qid = dc.nextQid
-		dc.nextQid++
+		if dc.isTcp {
+			qid = dc.nextQid
+			dc.nextQid++
+		} else {
+			qid = dns.Id()
+		}
 		if _, dup := dc.queue[uint32(qid)]; dup {
 			continue
 		}
@@ -342,10 +361,10 @@ func (dc *TraditionalDnsConn) ReserveNewQuery() (_ ReservedExchanger, closed boo
 
 	dc.queueMu.Lock()
 	defer dc.queueMu.Unlock()
-	if len(dc.queue)+dc.reservedQuery >= dc.maxCq {
+	if dc.querySlots >= dc.maxCq {
 		return nil, false
 	}
-	dc.reservedQuery++
+	dc.querySlots++
 	return (*tdcOneTimeExchanger)(dc), false
 }
 
@@ -360,6 +379,6 @@ func (ote *tdcOneTimeExchanger) ExchangeReserved(ctx context.Context, q []byte) 
 
 func (ote *tdcOneTimeExchanger) WithdrawReserved() {
 	ote.queueMu.Lock()
-	ote.reservedQuery--
+	ote.querySlots--
 	ote.queueMu.Unlock()
 }

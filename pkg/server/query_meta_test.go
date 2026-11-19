@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -144,6 +145,7 @@ func TestTransportQueryMetadata(t *testing.T) {
 		defer stream.CancelRead(0)
 		_ = stream.SetDeadline(time.Now().Add(3 * time.Second))
 		q := new(dns.Msg).SetQuestion("quic.example.", dns.TypeA)
+		q.Id = 0
 		if _, err := dnsutils.WriteMsgToTCP(stream, q); err != nil {
 			t.Fatal(err)
 		}
@@ -164,5 +166,38 @@ func TestDoHBadRequestPreservesHistoricalBody(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest || w.Body.String() != "Bad Request" {
 		t.Fatalf("historical invalid DoH response changed: %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestDoHGetAcceptNegotiation(t *testing.T) {
+	q := new(dns.Msg).SetQuestion("example.test.", dns.TypeA)
+	wire, err := q.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "/dns-query?dns=" + base64.RawURLEncoding.EncodeToString(wire)
+	for _, tc := range []struct {
+		name   string
+		accept []string
+		want   int
+	}{
+		{"absent", nil, http.StatusOK},
+		{"wildcard", []string{"*/*"}, http.StatusOK},
+		{"media range", []string{"text/plain", "application/*;q=0.5"}, http.StatusOK},
+		{"exact exclusion", []string{"*/*, application/dns-message;q=0"}, http.StatusBadRequest},
+		{"unrelated", []string{"text/plain"}, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHttpHandler(metadataHandler{seen: make(chan QueryMeta, 1)}, HttpHandlerOpts{})
+			req := httptest.NewRequest(http.MethodGet, url, nil)
+			for _, value := range tc.accept {
+				req.Header.Add("Accept", value)
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("HTTP status = %d, want %d", w.Code, tc.want)
+			}
+		})
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -102,38 +103,39 @@ func (sp *Bootstrap) GetAddrPortStr(ctx context.Context) (string, error) {
 }
 
 func (sp *Bootstrap) tryUpdate() {
-	if sp.updating.CompareAndSwap(false, true) {
-		if time.Now().After(sp.nextUpdate) {
-			go func() {
-				defer sp.updating.Store(false)
-				ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-				defer cancel()
-				start := time.Now()
-				addr, ttl, err := sp.updateAddr(ctx)
-				if err != nil {
-					sp.logger.Check(zap.WarnLevel, "failed to update bootstrap addr").Write(
-						zap.String("fqdn", sp.fqdn),
-						zap.Error(err),
-					)
-					sp.nextUpdate = time.Now().Add(retryInterval)
-				} else {
-					updateInterval := time.Second * time.Duration(ttl)
-					if updateInterval < minimumUpdateInterval {
-						updateInterval = minimumUpdateInterval
-					}
-					sp.logger.Check(zap.DebugLevel, "bootstrap addr updated").Write(
-						zap.String("fqdn", sp.fqdn),
-						zap.Stringer("addr", addr),
-						zap.Duration("ttl", updateInterval),
-						zap.Duration("elapse", time.Since(start)),
-					)
-					sp.nextUpdate = time.Now().Add(updateInterval)
-				}
-			}()
-		} else {
-			sp.updating.Store(false)
-		}
+	if !sp.updating.CompareAndSwap(false, true) {
+		return
 	}
+	if !time.Now().After(sp.nextUpdate) {
+		sp.updating.Store(false)
+		return
+	}
+	go func() {
+		defer sp.updating.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+		defer cancel()
+		start := time.Now()
+		addr, ttl, err := sp.updateAddr(ctx)
+		if err != nil {
+			sp.logger.Check(zap.WarnLevel, "failed to update bootstrap addr").Write(
+				zap.String("fqdn", sp.fqdn),
+				zap.Error(err),
+			)
+			sp.nextUpdate = time.Now().Add(retryInterval)
+		} else {
+			updateInterval := time.Second * time.Duration(ttl)
+			if updateInterval < minimumUpdateInterval {
+				updateInterval = minimumUpdateInterval
+			}
+			sp.logger.Check(zap.DebugLevel, "bootstrap addr updated").Write(
+				zap.String("fqdn", sp.fqdn),
+				zap.Stringer("addr", addr),
+				zap.Duration("ttl", updateInterval),
+				zap.Duration("elapse", time.Since(start)),
+			)
+			sp.nextUpdate = time.Now().Add(updateInterval)
+		}
+	}()
 }
 
 func (sp *Bootstrap) updateAddr(ctx context.Context) (netip.Addr, uint32, error) {
@@ -160,81 +162,95 @@ func (sp *Bootstrap) resolve(ctx context.Context, qt uint16) (netip.Addr, uint32
 	q.SetQuestion(sp.fqdn, qt)
 	q.SetEdns0(edns0UdpSize, false)
 
-	c, err := net.DialUDP("udp", nil, sp.bootstrap)
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+	resp, err := sp.exchangeUDP(ctx, q, edns0UdpSize)
 	if err != nil {
 		return netip.Addr{}, 0, err
 	}
-	defer c.Close()
-
-	writeErrC := make(chan error, 1)
-	type res struct {
-		resp *dns.Msg
-		err  error
-	}
-	readResC := make(chan res, 1)
-
-	cancelWrite := make(chan struct{})
-	defer close(cancelWrite)
-	go func() {
-		if _, err := dnsutils.WriteMsgToUDP(c, q); err != nil {
-			writeErrC <- err
-			return
-		}
-
-		retryTicker := time.NewTicker(udpRetryInterval)
-		defer retryTicker.Stop()
-		for {
-			select {
-			case <-cancelWrite:
-				return
-			case <-retryTicker.C:
-				if _, err := dnsutils.WriteMsgToUDP(c, q); err != nil {
-					writeErrC <- err
-					return
-				}
-			}
-		}
-	}()
-
-	go func() {
-		m, _, err := dnsutils.ReadMsgFromUDP(c, edns0UdpSize)
-		readResC <- res{resp: m, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return netip.Addr{}, 0, context.Cause(ctx)
-	case err := <-writeErrC:
-		return netip.Addr{}, 0, fmt.Errorf("failed to write query, %w", err)
-	case r := <-readResC:
-		resp := r.resp
-		err := r.err
+	if resp.Truncated {
+		tcp := dns.Client{Net: "tcp", Timeout: queryTimeout}
+		resp, _, err = tcp.ExchangeContext(ctx, q, sp.bootstrap.String())
 		if err != nil {
-			return netip.Addr{}, 0, fmt.Errorf("failed to read resp, %w", err)
+			return netip.Addr{}, 0, fmt.Errorf("bootstrap TCP exchange: %w", err)
 		}
+	}
+	return bootstrapAddress(q, resp)
+}
 
-		for _, v := range resp.Answer {
-			var ip net.IP
-			var ttl uint32
-			switch rr := v.(type) {
-			case *dns.A:
-				ip = rr.A
-				ttl = rr.Hdr.Ttl
-			case *dns.AAAA:
-				ip = rr.AAAA
-				ttl = rr.Hdr.Ttl
-			default:
-				continue
+func (sp *Bootstrap) exchangeUDP(ctx context.Context, q *dns.Msg, size int) (*dns.Msg, error) {
+	c, err := net.DialUDP("udp", nil, sp.bootstrap)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
+	buf := make([]byte, size)
+	for ctx.Err() == nil {
+		deadline := time.Now().Add(udpRetryInterval)
+		if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
+			deadline = end
+		}
+		if err := c.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+		if _, err := dnsutils.WriteMsgToUDP(c, q); err != nil {
+			return nil, err
+		}
+		for ctx.Err() == nil {
+			n, err := c.Read(buf)
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				break
 			}
-			addr, ok := netip.AddrFromSlice(ip)
-			if ok {
-				return addr, ttl, nil
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, context.Cause(ctx)
+				}
+				return nil, err
+			}
+			r := new(dns.Msg)
+			if r.Unpack(buf[:n]) == nil && dnsutils.MatchesResponse(q, r) {
+				return r, nil
 			}
 		}
+	}
+	return nil, context.Cause(ctx)
+}
 
-		// No ip addr in resp.
+func bootstrapAddress(q, r *dns.Msg) (netip.Addr, uint32, error) {
+	if !dnsutils.MatchesResponse(q, r) || r.Truncated || r.Rcode != dns.RcodeSuccess {
+		return netip.Addr{}, 0, errors.New("invalid bootstrap response")
+	}
+	question := q.Question[0]
+	terminal, ttl, ok := dnsutils.AnswerChain(question, r.Answer)
+	if !ok {
 		return netip.Addr{}, 0, errNoAddrInResp
 	}
+	var addr netip.Addr
+	for _, rr := range r.Answer {
+		h := rr.Header()
+		if h.Class != question.Qclass || h.Rrtype != question.Qtype || dns.CanonicalName(h.Name) != terminal {
+			continue
+		}
+		var ip netip.Addr
+		switch rr := rr.(type) {
+		case *dns.A:
+			ip, _ = netip.AddrFromSlice(rr.A.To4())
+		case *dns.AAAA:
+			ip, _ = netip.AddrFromSlice(rr.AAAA.To16())
+		}
+		if ip.IsValid() {
+			if !addr.IsValid() {
+				addr = ip
+			}
+			ttl = min(ttl, h.Ttl)
+		}
+	}
+	if !addr.IsValid() {
+		return netip.Addr{}, 0, errNoAddrInResp
+	}
+	return addr, ttl, nil
 }
 
 func bootstrapVer2Qt(ver int) (uint16, bool) {

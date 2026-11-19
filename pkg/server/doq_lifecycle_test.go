@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -22,6 +23,11 @@ func (h doqLifecycleHandler) Handle(ctx context.Context, q *dns.Msg, meta QueryM
 
 func startDoQLifecycleServer(t *testing.T, h Handler) *quic.Conn {
 	t.Helper()
+	return startDoQLifecycleServerWithIdleTimeout(t, h, 5*time.Second)
+}
+
+func startDoQLifecycleServerWithIdleTimeout(t *testing.T, h Handler, idleTimeout time.Duration) *quic.Conn {
+	t.Helper()
 	cert := httptest.NewTLSServer(http.NotFoundHandler())
 	t.Cleanup(cert.Close)
 	l, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{Certificates: cert.TLS.Certificates, NextProtos: []string{"doq"}}, nil)
@@ -29,7 +35,7 @@ func startDoQLifecycleServer(t *testing.T, h Handler) *quic.Conn {
 		t.Fatal(err)
 	}
 	stopped := make(chan error, 1)
-	go func() { stopped <- ServeDoQ(l, h, DoQServerOpts{IdleTimeout: 5 * time.Second}) }()
+	go func() { stopped <- ServeDoQ(l, h, DoQServerOpts{IdleTimeout: idleTimeout}) }()
 	t.Cleanup(func() { l.Close(); checkServerStopped(t, stopped) })
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -52,6 +58,7 @@ func sendDoQLifecycleQuery(t *testing.T, c *quic.Conn, name string) (*quic.Strea
 	s.SetDeadline(time.Now().Add(3 * time.Second))
 	t.Cleanup(func() { s.CancelRead(0); s.CancelWrite(0) })
 	q := new(dns.Msg).SetQuestion(name, dns.TypeA)
+	q.Id = 0
 	if _, err := dnsutils.WriteMsgToTCP(s, q); err != nil {
 		t.Fatal(err)
 	}
@@ -129,5 +136,101 @@ func TestDoQRequestFINDoesNotCancelResponse(t *testing.T) {
 	r, _, err := dnsutils.ReadMsgFromTCP(s)
 	if err != nil || r.Id != q.Id || !r.Response {
 		t.Fatalf("response after request FIN=%v, err=%v", r, err)
+	}
+}
+
+func TestDoQIdleTimeoutStartsAfterLastActiveStream(t *testing.T) {
+	const idleTimeout = 200 * time.Millisecond
+	started := make(chan context.Context, 1)
+	release := make(chan struct{})
+	h := doqLifecycleHandler(func(ctx context.Context, q *dns.Msg, _ QueryMeta, pack func(*dns.Msg) (*[]byte, error)) *[]byte {
+		if q.Question[0].Name == "slow.example." {
+			started <- ctx
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-release:
+			}
+		}
+		payload, _ := pack(new(dns.Msg).SetReply(q))
+		return payload
+	})
+	c := startDoQLifecycleServerWithIdleTimeout(t, h, idleTimeout)
+	slow, slowQuery := sendDoQLifecycleQuery(t, c, "slow.example.")
+	var slowCtx context.Context
+	select {
+	case slowCtx = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("slow query handler did not start")
+	}
+	fast, fastQuery := sendDoQLifecycleQuery(t, c, "fast.example.")
+	if r, _, err := dnsutils.ReadMsgFromTCP(fast); err != nil || !dnsutils.MatchesResponse(fastQuery, r) {
+		t.Fatalf("fast response=%v, err=%v", r, err)
+	}
+	select {
+	case <-slowCtx.Done():
+		t.Fatalf("idle timeout canceled the active query: %v", context.Cause(slowCtx))
+	case <-time.After(2 * idleTimeout):
+	}
+	close(release)
+	if r, _, err := dnsutils.ReadMsgFromTCP(slow); err != nil || !dnsutils.MatchesResponse(slowQuery, r) {
+		t.Fatalf("slow response=%v, err=%v", r, err)
+	}
+	select {
+	case <-c.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("idle connection remained open after the last query completed")
+	}
+}
+
+func TestDoQRejectsInvalidTransactionFraming(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		id     uint16
+		frames int
+		fin    bool
+	}{
+		{"nonzero ID", 1, 1, true},
+		{"extra message", 0, 2, true},
+		{"missing FIN", 0, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handled := make(chan struct{}, 1)
+			c := startDoQLifecycleServer(t, doqLifecycleHandler(func(context.Context, *dns.Msg, QueryMeta, func(*dns.Msg) (*[]byte, error)) *[]byte {
+				handled <- struct{}{}
+				return nil
+			}))
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			stream, err := c.OpenStreamSync(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = stream.SetDeadline(time.Now().Add(3 * time.Second))
+			q := new(dns.Msg).SetQuestion("framing.example.test.", dns.TypeA)
+			q.Id = tc.id
+			var frames bytes.Buffer
+			for range tc.frames {
+				if _, err := dnsutils.WriteMsgToTCP(&frames, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := stream.Write(frames.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+			if tc.fin {
+				_ = stream.Close()
+			}
+			_, _, err = dnsutils.ReadMsgFromTCP(stream)
+			var appErr *quic.ApplicationError
+			if !errors.As(err, &appErr) || appErr.ErrorCode != dnsutils.DoQProtocolErrorCode {
+				t.Fatalf("expected DOQ_PROTOCOL_ERROR, got %v", err)
+			}
+			select {
+			case <-handled:
+				t.Fatal("invalid DoQ request reached policy handler")
+			default:
+			}
+		})
 	}
 }

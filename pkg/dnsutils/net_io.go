@@ -52,7 +52,7 @@ func ReadRawMsgFromTCP(c io.Reader) (*[]byte, error) {
 
 	// dns length
 	length := binary.BigEndian.Uint16(*h)
-	if length <= DnsHeaderLen {
+	if length < DnsHeaderLen {
 		return nil, ErrPayloadTooSmall
 	}
 

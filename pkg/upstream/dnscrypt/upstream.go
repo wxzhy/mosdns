@@ -23,12 +23,16 @@ package dnscrypt
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/AdguardTeam/dnscrypt"
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/ameshkov/dnsstamps"
 	"github.com/miekg/dns"
@@ -58,11 +62,14 @@ type Upstream struct {
 	dialUDP func(ctx context.Context) (net.Conn, error)
 	dialTCP func(ctx context.Context) (net.Conn, error)
 
-	// mu protects ri.
-	mu       sync.RWMutex
-	fetchSem chan struct{}
-	// ri is the fetched resolver certificate info. May be nil.
-	ri *dnscrypt.ResolverInfo
+	// mu protects the cache and serializes starting work with Close.
+	mu        sync.Mutex
+	fetchSem  chan struct{}
+	ri        *dnscrypt.ResolverInfo
+	refreshAt time.Time
+	life      context.Context
+	cancel    context.CancelCauseFunc
+	active    sync.WaitGroup
 }
 
 // NewUpstream creates a DNSCrypt upstream from a sdns:// stamp string.
@@ -99,18 +106,22 @@ func NewUpstream(stampStr string, opt Opt) (*Upstream, error) {
 	}
 
 	var libLogger *slog.Logger = slog.New(slog.DiscardHandler)
+	life, cancel := context.WithCancelCause(context.Background())
 	return &Upstream{
 		fetchSem: make(chan struct{}, 1),
 		stamp:    stamp,
 		logger:   logger,
+		life:     life,
+		cancel:   cancel,
 		udpClt: dnscrypt.NewClient(&dnscrypt.ClientConfig{
 			Logger:  libLogger,
 			Proto:   dnscrypt.ProtoUDP,
 			UDPSize: dns.MaxMsgSize,
 		}),
 		tcpClt: dnscrypt.NewClient(&dnscrypt.ClientConfig{
-			Logger: libLogger,
-			Proto:  dnscrypt.ProtoTCP,
+			Logger:  libLogger,
+			Proto:   dnscrypt.ProtoTCP,
+			UDPSize: dns.MaxMsgSize,
 		}),
 		dialUDP: dialUDP,
 		dialTCP: dialTCP,
@@ -120,6 +131,19 @@ func NewUpstream(stampStr string, opt Opt) (*Upstream, error) {
 // ExchangeContext exchanges query message m to the upstream, and returns
 // response. It does not keep or modify m.
 func (u *Upstream) ExchangeContext(ctx context.Context, m []byte) (_ *[]byte, err error) {
+	u.mu.Lock()
+	if u.life.Err() != nil {
+		u.mu.Unlock()
+		return nil, context.Cause(u.life)
+	}
+	u.active.Add(1)
+	u.mu.Unlock()
+	defer u.active.Done()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stop := context.AfterFunc(u.life, func() { cancel(context.Cause(u.life)) })
+	defer stop()
+
 	defer func() {
 		if err != nil && ctx.Err() != nil {
 			err = context.Cause(ctx)
@@ -163,7 +187,7 @@ func (u *Upstream) exchange(ctx context.Context, req *dns.Msg, ri *dnscrypt.Reso
 			return nil, fmt.Errorf("failed to dial tcp conn, %w", err)
 		}
 		stop := closeOnCancel(ctx, conn)
-		resp, err = u.tcpClt.ExchangeConnContext(ctx, conn, req, ri)
+		resp, err = u.tcpClt.ExchangeConnContext(ctx, framedTCPConn{Conn: conn}, req, ri)
 		stop()
 		conn.Close()
 		if err != nil {
@@ -177,16 +201,49 @@ func (u *Upstream) exchange(ctx context.Context, req *dns.Msg, ri *dnscrypt.Reso
 	return resp, nil
 }
 
-// fetchResolverInfo returns the resolver info with a valid (not expired)
-// certificate. It fetches the certificate on first use, and re-fetches
-// it when the cached one expired.
+// AdGuard DNSCrypt v0.0.3 only applies framing to a concrete *net.TCPConn.
+// For any configured TCP connection, present complete DNSCrypt packets to the
+// library and apply the TCP length prefix here.
+type framedTCPConn struct{ net.Conn }
+
+func (c framedTCPConn) Write(p []byte) (int, error) {
+	n, err := dnsutils.WriteRawMsgToTCP(c.Conn, p)
+	if err == nil && n != len(p)+2 {
+		err = io.ErrShortWrite
+	}
+	return max(0, n-2), err
+}
+
+func (c framedTCPConn) Read(p []byte) (int, error) {
+	var prefix [2]byte
+	if _, err := io.ReadFull(c.Conn, prefix[:]); err != nil {
+		return 0, err
+	}
+	size := int(binary.BigEndian.Uint16(prefix[:]))
+	if size > len(p) {
+		return 0, io.ErrShortBuffer
+	}
+	return io.ReadFull(c.Conn, p[:size])
+}
+
+// fetchResolverInfo waits for a certificate on cold start or expiry. With a
+// valid cached certificate it can refresh in the background.
 func (u *Upstream) fetchResolverInfo(ctx context.Context) (*dnscrypt.ResolverInfo, error) {
-	u.mu.RLock()
+	u.mu.Lock()
 	ri := u.ri
-	u.mu.RUnlock()
 	if ri != nil && ri.ResolverCert.VerifyDate() {
+		if !time.Now().Before(u.refreshAt) && u.life.Err() == nil {
+			select {
+			case u.fetchSem <- struct{}{}:
+				u.active.Add(1)
+				go u.refreshCertificate()
+			default:
+			}
+		}
+		u.mu.Unlock()
 		return ri, nil
 	}
+	u.mu.Unlock()
 
 	select {
 	case u.fetchSem <- struct{}{}:
@@ -194,10 +251,13 @@ func (u *Upstream) fetchResolverInfo(ctx context.Context) (*dnscrypt.ResolverInf
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
 	}
+	if ctx.Err() != nil {
+		return nil, context.Cause(ctx)
+	}
 	// Re-check. Another goroutine may have fetched it.
-	u.mu.RLock()
+	u.mu.Lock()
 	ri = u.ri
-	u.mu.RUnlock()
+	u.mu.Unlock()
 	if ri != nil && ri.ResolverCert.VerifyDate() {
 		return ri, nil
 	}
@@ -206,18 +266,47 @@ func (u *Upstream) fetchResolverInfo(ctx context.Context) (*dnscrypt.ResolverInf
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch resolver certificate, %w", err)
 	}
-	u.mu.Lock()
-	u.ri = ri
-	u.mu.Unlock()
+	u.storeCertificate(ri)
 	return ri, nil
+}
+
+func (u *Upstream) refreshCertificate() {
+	defer u.active.Done()
+	defer func() { <-u.fetchSem }()
+	ri, err := u.fetchCertificate(u.life)
+	if err != nil {
+		u.mu.Lock()
+		u.refreshAt = time.Now().Add(30 * time.Second)
+		u.mu.Unlock()
+		u.logger.Debug("DNSCrypt certificate refresh failed", zap.Error(err))
+		return
+	}
+	u.storeCertificate(ri)
+}
+
+func (u *Upstream) storeCertificate(ri *dnscrypt.ResolverInfo) {
+	now := time.Now()
+	// NotAfter is inclusive. Refresh hourly, or sooner for short-lived
+	// certificates, with a minimum interval when close to expiry.
+	expiry := time.Unix(int64(ri.ResolverCert.NotAfter)+1, 0)
+	refreshIn := max(time.Second, min(time.Hour, expiry.Sub(now)/2))
+	u.mu.Lock()
+	if u.ri == nil || *u.ri.ResolverCert != *ri.ResolverCert {
+		u.ri = ri
+	}
+	u.refreshAt = now.Add(refreshIn)
+	u.mu.Unlock()
 }
 
 func closeOnCancel(ctx context.Context, conn net.Conn) func() bool {
 	return context.AfterFunc(ctx, func() { conn.Close() })
 }
 
-// Close implements the io.Closer interface. It is a no-op.
-// DNSCrypt has no persistent connection to close.
+// Close cancels in-flight exchanges and certificate refreshes.
 func (u *Upstream) Close() error {
+	u.mu.Lock()
+	u.cancel(net.ErrClosed)
+	u.mu.Unlock()
+	u.active.Wait()
 	return nil
 }

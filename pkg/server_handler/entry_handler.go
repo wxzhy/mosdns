@@ -89,23 +89,21 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 		return nil
 	}
 
-	ddl := time.Now().Add(h.opts.QueryTimeout)
-	ctx, cancel := context.WithDeadline(ctx, ddl)
-	defer cancel()
-
 	qCtx := query_context.NewContext(q)
 	qCtx.ServerMeta = serverMeta
 
-	// exec entry
-	err := h.opts.Entry.Exec(ctx, qCtx)
 	var resp *dns.Msg
-	if err != nil {
-		h.opts.Logger.Warn("entry err", qCtx.InfoField(), zap.Error(err))
-		resp = new(dns.Msg)
-		resp.SetReply(q)
-		resp.Rcode = dns.RcodeServerFailure
+	if opt := qCtx.ClientOpt(); opt != nil && opt.Version() != 0 {
+		resp = new(dns.Msg).SetRcode(q, dns.RcodeBadVers)
 	} else {
-		resp = qCtx.R()
+		ctx, cancel := context.WithTimeout(ctx, h.opts.QueryTimeout)
+		defer cancel()
+		if err := h.opts.Entry.Exec(ctx, qCtx); err != nil {
+			h.opts.Logger.Warn("entry err", qCtx.InfoField(), zap.Error(err))
+			resp = new(dns.Msg).SetRcode(q, dns.RcodeServerFailure)
+		} else {
+			resp = qCtx.R()
+		}
 	}
 
 	if resp == nil {
@@ -151,11 +149,4 @@ func getValidUDPSize(opt *dns.OPT) int {
 		s = dns.MinMsgSize
 	}
 	return int(s)
-}
-
-func newOpt() *dns.OPT {
-	opt := new(dns.OPT)
-	opt.Hdr.Name = "."
-	opt.Hdr.Rrtype = dns.TypeOPT
-	return opt
 }

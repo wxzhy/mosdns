@@ -21,6 +21,7 @@ package upstream
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -40,7 +41,6 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/dnscrypt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/doh"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/transport"
-	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/ameshkov/dnsstamps"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -369,7 +369,6 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 	switch addrURL.Scheme {
 	case "", "udp":
 		const defaultPort = 53
-		const maxConcurrentQueryPreConn = 4096 // Protocol limit is 65535.
 		host, port, err := parseDialAddr(addrUrlHost, opt.DialAddr, defaultPort)
 		if err != nil {
 			return nil, err
@@ -379,15 +378,14 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 		}
 		dialAddr := joinPort(host, port)
 
-		dialUdpPipeline := func(ctx context.Context) (transport.DnsConn, error) {
+		dialUDP := func(ctx context.Context) (*transport.TraditionalDnsConn, error) {
 			c, err := dialer.DialContext(ctx, "udp", dialAddr)
 			if err != nil {
 				return nil, err
 			}
 			to := transport.TraditionalDnsConnOpts{
 				WithLengthHeader:   false,
-				IdleTimeout:        time.Minute * 5,
-				MaxConcurrentQuery: maxConcurrentQueryPreConn,
+				MaxConcurrentQuery: 1,
 				Repeat:             opt.Repeat,
 				DropSpoofedResp:    opt.UseTricks,
 			}
@@ -401,13 +399,12 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 			return wrapConn(c, opt.EventObserver), nil
 		}
 
+		life, cancel := context.WithCancelCause(context.Background())
 		return &udpWithFallback{
-			u: transport.NewPipelineTransport(transport.PipelineOpts{
-				DialContext:                    dialUdpPipeline,
-				MaxConcurrentQueryWhileDialing: maxConcurrentQueryPreConn,
-				Logger:                         opt.Logger,
-			}),
-			t: transport.NewReuseConnTransport(transport.ReuseConnOpts{DialContext: dialTcpNetConn}),
+			dialUDP: dialUDP,
+			t:       transport.NewReuseConnTransport(transport.ReuseConnOpts{DialContext: dialTcpNetConn}),
+			life:    life,
+			cancel:  cancel,
 		}, nil
 	case "tcp":
 		const defaultPort = 53
@@ -700,20 +697,17 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 			return nil, fmt.Errorf("failed to init udp addr bootstrap, %w", err)
 		}
 
-		srk, _, err := utils.InitQUICSrkFromIfaceMac()
-		if err != nil {
-			opt.Logger.Warn("failed to init quic stateless reset key, it will be disabled", zap.Error(err))
-		}
-
 		lc := net.ListenConfig{Control: getSocketControlFunc(socketOpts{so_mark: opt.SoMark, bind_to_device: opt.BindToDevice})}
 		uc, err := lc.ListenPacket(context.Background(), "udp", "")
 		if err != nil {
 			return nil, fmt.Errorf("failed to init udp socket for quic, %w", err)
 		}
 
+		srk := new(quic.StatelessResetKey)
+		rand.Read(srk[:])
 		t := &quic.Transport{
 			Conn:              uc,
-			StatelessResetKey: (*quic.StatelessResetKey)(srk),
+			StatelessResetKey: srk,
 		}
 		owned := &closeGroup{closers: []io.Closer{t, uc}}
 		defer closeIfFuncErr(owned)
@@ -817,12 +811,42 @@ func NewUpstream(addr string, opt Opt) (upstream Upstream, err error) {
 }
 
 type udpWithFallback struct {
-	u *transport.PipelineTransport
-	t *transport.ReuseConnTransport
+	dialUDP func(context.Context) (*transport.TraditionalDnsConn, error)
+	t       *transport.ReuseConnTransport
+	life    context.Context
+	cancel  context.CancelCauseFunc
+
+	mu     sync.Mutex // serializes starting exchanges with Close
+	active sync.WaitGroup
 }
 
 func (u *udpWithFallback) ExchangeContext(ctx context.Context, q []byte) (*[]byte, error) {
-	r, err := u.u.ExchangeContext(ctx, q)
+	u.mu.Lock()
+	if err := context.Cause(u.life); err != nil {
+		u.mu.Unlock()
+		return nil, err
+	}
+	u.active.Add(1)
+	u.mu.Unlock()
+	defer u.active.Done()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stop := context.AfterFunc(u.life, func() { cancel(context.Cause(u.life)) })
+	defer stop()
+
+	// A connected UDP socket per exchange lets the OS select a source port
+	// independently and keep it stable for retransmissions of this query.
+	conn, err := u.dialUDP(ctx)
+	if err != nil {
+		return nil, err
+	}
+	exchanger, _ := conn.ReserveNewQuery()
+	if exchanger == nil {
+		conn.Close()
+		return nil, transport.ErrTDCClosed
+	}
+	r, err := exchanger.ExchangeReserved(ctx, q)
+	conn.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -834,9 +858,12 @@ func (u *udpWithFallback) ExchangeContext(ctx context.Context, q []byte) (*[]byt
 }
 
 func (u *udpWithFallback) Close() error {
-	u.u.Close()
-	u.t.Close()
-	return nil
+	u.mu.Lock()
+	u.cancel(transport.ErrClosedTransport)
+	u.mu.Unlock()
+	err := u.t.Close()
+	u.active.Wait()
+	return err
 }
 
 type closerFunc func() error

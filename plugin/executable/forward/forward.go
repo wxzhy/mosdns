@@ -358,7 +358,8 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		}(qCtx.Id(), qCtx.QQuestion())
 	}
 
-	for i := 0; i < concurrent; i++ {
+	var fallback res
+	for range concurrent {
 		select {
 		case res := <-resChan:
 			r, err := res.r, res.err
@@ -366,8 +367,10 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 				continue
 			}
 
-			// Retry until the last
-			if i < concurrent-1 && r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
+			// Keep the latest DNS error reply in case no upstream returns a
+			// preferred RCODE. A later transport error has no reply to offer.
+			if r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
+				fallback = res
 				continue
 			}
 			f.setUpstream(qCtx, res.u)
@@ -376,6 +379,10 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 			f.setUpstream(qCtx, lastAttempted)
 			return nil, context.Cause(ctx)
 		}
+	}
+	if fallback.r != nil {
+		f.setUpstream(qCtx, fallback.u)
+		return fallback.r, nil
 	}
 	f.setUpstream(qCtx, lastAttempted)
 	return nil, errors.New("all upstream servers failed")

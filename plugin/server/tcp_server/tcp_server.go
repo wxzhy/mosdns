@@ -56,11 +56,14 @@ func (a *Args) init() {
 type TcpServer struct {
 	args *Args
 
-	l net.Listener
+	l    net.Listener
+	done <-chan struct{}
 }
 
 func (s *TcpServer) Close() error {
-	return s.l.Close()
+	err := s.l.Close()
+	<-s.done
+	return err
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -102,7 +105,9 @@ func StartServer(bp *coremain.BP, args *Args) (*TcpServer, error) {
 	}
 	bp.L().Info("tcp server started", zap.Stringer("addr", l.Addr()), zap.Bool("tls", tc != nil))
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer l.Close()
 		serverOpts := server.TCPServerOpts{Logger: bp.L(), IdleTimeout: time.Duration(args.IdleTimeout) * time.Second}
 		err := server.ServeTCP(l, dh, serverOpts)
@@ -111,5 +116,6 @@ func StartServer(bp *coremain.BP, args *Args) (*TcpServer, error) {
 	return &TcpServer{
 		args: args,
 		l:    l,
+		done: done,
 	}, nil
 }

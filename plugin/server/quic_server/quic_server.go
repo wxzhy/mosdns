@@ -20,6 +20,7 @@
 package quic_server
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -55,9 +56,9 @@ func (a *Args) init() {
 type QuicServer struct {
 	args *Args
 
-	l *quic.Listener
+	l         *quic.Listener
 	transport *quic.Transport
-	conn net.PacketConn
+	conn      net.PacketConn
 }
 
 func (s *QuicServer) Close() error {
@@ -74,8 +75,6 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
-	logger := bp.L()
-
 	dh, err := server_utils.NewHandler(bp, args.Entry)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init dns handler, %w", err)
@@ -99,7 +98,9 @@ func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
 	idleTimeout := time.Duration(args.IdleTimeout) * time.Second
 
 	quicConfig := &quic.Config{
-		MaxIdleTimeout:                 idleTimeout,
+		// The DNS idle timer only runs between queries. Keep the QUIC
+		// network-idle timeout long enough for an active query to finish.
+		MaxIdleTimeout:                 max(idleTimeout, 30*time.Second),
 		InitialStreamReceiveWindow:     4 * 1024,
 		MaxStreamReceiveWindow:         4 * 1024,
 		InitialConnectionReceiveWindow: 8 * 1024,
@@ -110,13 +111,11 @@ func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
 		MaxIncomingUniStreams: -1,
 	}
 
-	srk, _, err := utils.InitQUICSrkFromIfaceMac()
-	if err != nil {
-		logger.Warn("failed to init quic stateless reset key, it will be disabled", zap.Error(err))
-	}
+	srk := new(quic.StatelessResetKey)
+	rand.Read(srk[:])
 	qt := &quic.Transport{
 		Conn:              uc,
-		StatelessResetKey: (*quic.StatelessResetKey)(srk),
+		StatelessResetKey: srk,
 	}
 
 	quicListener, err := qt.Listen(tlsConfig, quicConfig)
@@ -134,9 +133,9 @@ func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
 		bp.M().GetSafeClose().SendCloseSignal(err)
 	}()
 	return &QuicServer{
-		args: args,
-		l:    quicListener,
+		args:      args,
+		l:         quicListener,
 		transport: qt,
-		conn: uc,
+		conn:      uc,
 	}, nil
 }

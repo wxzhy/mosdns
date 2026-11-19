@@ -24,8 +24,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
@@ -129,13 +131,70 @@ var errInvalidMediaType = errors.New("missing or invalid media type header")
 
 var bufPool = pool.NewBytesBufPool(512)
 
+func acceptsDNSMessage(values []string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	bestRank, bestQuality := -1, 0.0
+	for _, value := range values {
+		start := 0
+		quoted, escaped := false, false
+		// Only commas outside quoted media parameters separate ranges.
+		for i := 0; i <= len(value); i++ {
+			if i == len(value) || (value[i] == ',' && !quoted) {
+				rank, quality := dnsMediaRange(value[start:i])
+				if rank > bestRank || (rank == bestRank && quality > bestQuality) {
+					bestRank, bestQuality = rank, quality
+				}
+				start = i + 1
+				continue
+			}
+			if escaped {
+				escaped = false
+			} else if quoted && value[i] == '\\' {
+				escaped = true
+			} else if value[i] == '"' {
+				quoted = !quoted
+			}
+		}
+	}
+	return bestQuality > 0
+}
+
+func dnsMediaRange(value string) (int, float64) {
+	media, params, err := mime.ParseMediaType(value)
+	if err != nil {
+		return -1, 0
+	}
+	quality := 1.0
+	if q, ok := params["q"]; ok {
+		quality, err = strconv.ParseFloat(q, 64)
+		if err != nil || !(quality >= 0 && quality <= 1) {
+			return -1, 0
+		}
+		delete(params, "q")
+	}
+	if len(params) != 0 {
+		return -1, 0
+	}
+	switch media {
+	case "application/dns-message":
+		return 2, quality
+	case "application/*":
+		return 1, quality
+	case "*/*":
+		return 0, quality
+	default:
+		return -1, 0
+	}
+}
+
 func ReadMsgFromReq(req *http.Request) (*dns.Msg, error) {
 	var b []byte
 
 	switch req.Method {
 	case http.MethodGet:
-		// Check accept header
-		if req.Header.Get("Accept") != "application/dns-message" {
+		if !acceptsDNSMessage(req.Header.Values("Accept")) {
 			return nil, errInvalidMediaType
 		}
 

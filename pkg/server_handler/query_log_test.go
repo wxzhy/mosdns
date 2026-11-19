@@ -31,6 +31,28 @@ func queryLogEntry(_ context.Context, c *query_context.Context) error {
 	return nil
 }
 
+func TestUnsupportedEDNSVersionReturnsBadVers(t *testing.T) {
+	h := NewEntryHandler(EntryHandlerOpts{Entry: sequence.ExecutableFunc(func(context.Context, *query_context.Context) error {
+		t.Fatal("unsupported EDNS version reached the policy chain")
+		return nil
+	})})
+	q := new(dns.Msg).SetQuestion("example.test.", dns.TypeA)
+	q.SetEdns0(1232, true)
+	q.IsEdns0().SetVersion(1)
+	payload := h.Handle(context.Background(), q, server.QueryMeta{FromUDP: true}, pool.PackBuffer)
+	if payload == nil {
+		t.Fatal("missing BADVERS response")
+	}
+	defer pool.ReleaseBuf(payload)
+	var r dns.Msg
+	if err := r.Unpack(*payload); err != nil {
+		t.Fatal(err)
+	}
+	if r.Rcode != dns.RcodeBadVers || r.Id != q.Id || r.IsEdns0() == nil || r.IsEdns0().Version() != 0 || !r.IsEdns0().Do() {
+		t.Fatalf("invalid EDNS version negotiation response: %v", &r)
+	}
+}
+
 func TestQueryLogsExactlyOnceForSuccessErrorAndEmptyReply(t *testing.T) {
 	for _, level := range []zapcore.Level{zap.InfoLevel, zap.DebugLevel} {
 		for _, behavior := range []string{"success", "error", "empty"} {

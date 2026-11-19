@@ -20,12 +20,14 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
@@ -36,6 +38,7 @@ import (
 const (
 	defaultTCPIdleTimeout = time.Second * 10
 	tcpFirstReadTimeout   = time.Second * 2
+	tcpWriteTimeout       = time.Second * 5
 )
 
 type TCPServerOpts struct {
@@ -57,72 +60,113 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 	if idleTimeout <= 0 {
 		idleTimeout = defaultTCPIdleTimeout
 	}
-	firstReadTimeout := tcpFirstReadTimeout
-	if idleTimeout < firstReadTimeout {
-		firstReadTimeout = idleTimeout
-	}
-
 	listenerCtx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(errListenerCtxCanceled)
+	var connections sync.WaitGroup
+	defer func() {
+		cancel(errListenerCtxCanceled)
+		connections.Wait()
+	}()
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			return fmt.Errorf("unexpected listener err: %w", err)
 		}
 
-		// handle connection
-		tcpConnCtx, cancelConn := context.WithCancelCause(listenerCtx)
+		connections.Add(1)
 		go func() {
-			defer c.Close()
-			defer cancelConn(errConnectionCtxCanceled)
+			defer connections.Done()
+			serveTCPConn(listenerCtx, c, h, logger, idleTimeout)
+		}()
+	}
+}
 
-			firstRead := true
-			for {
-				if firstRead {
-					firstRead = false
-					c.SetReadDeadline(time.Now().Add(firstReadTimeout))
-				} else {
-					c.SetReadDeadline(time.Now().Add(idleTimeout))
+func serveTCPConn(parent context.Context, c net.Conn, h Handler, logger *zap.Logger, idleTimeout time.Duration) {
+	ctx, cancel := context.WithCancelCause(parent)
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	var queries sync.WaitGroup
+	defer func() {
+		stop()
+		cancel(errConnectionCtxCanceled)
+		_ = c.Close()
+		queries.Wait()
+	}()
+
+	remote := c.RemoteAddr()
+	var clientAddr netip.Addr
+	if ta, ok := remote.(*net.TCPAddr); ok {
+		clientAddr = ta.AddrPort().Addr()
+	}
+	reader := bufio.NewReader(c)
+	firstDeadline := time.Now().Add(min(tcpFirstReadTimeout, idleTimeout))
+	_ = c.SetReadDeadline(firstDeadline)
+	var readMu sync.Mutex
+	var writeMu sync.Mutex
+	var pending int
+	var readingFrame bool
+	for ctx.Err() == nil {
+		if _, err := reader.Peek(1); err != nil {
+			return
+		}
+		// A partial frame needs a deadline even while other queries run.
+		readMu.Lock()
+		readingFrame = true
+		frameDeadline := firstDeadline
+		if frameDeadline.IsZero() {
+			frameDeadline = time.Now().Add(idleTimeout)
+		}
+		_ = c.SetReadDeadline(frameDeadline)
+		readMu.Unlock()
+
+		req, _, err := dnsutils.ReadMsgFromTCP(reader)
+		if err != nil || ctx.Err() != nil {
+			return
+		}
+		firstDeadline = time.Time{}
+		readMu.Lock()
+		readingFrame = false
+		pending++
+		_ = c.SetReadDeadline(time.Time{})
+		readMu.Unlock()
+
+		meta := QueryMeta{ClientAddr: clientAddr, Protocol: "TCP"}
+		if tlsConn, ok := c.(*tls.Conn); ok {
+			meta.ServerName = tlsConn.ConnectionState().ServerName
+			meta.Protocol = "DoT"
+		}
+		queries.Add(1)
+		go func() {
+			defer queries.Done()
+			defer func() {
+				readMu.Lock()
+				pending--
+				if pending == 0 && !readingFrame {
+					_ = c.SetReadDeadline(time.Now().Add(idleTimeout))
 				}
-				req, _, err := dnsutils.ReadMsgFromTCP(c)
-				if err != nil {
-					return // read err, close the connection
-				}
+				readMu.Unlock()
+			}()
+			if ctx.Err() != nil {
+				return
+			}
+			r := h.Handle(ctx, req, meta, pool.PackTCPBuffer)
+			if r == nil {
+				_ = c.Close()
+				return
+			}
+			defer pool.ReleaseBuf(r)
 
-				// Try to get server name from tls conn.
-				var serverName string
-				protocol := "TCP"
-				if tlsConn, ok := c.(*tls.Conn); ok {
-					serverName = tlsConn.ConnectionState().ServerName
-					protocol = "DoT"
-				}
-
-				// handle query
-				go func() {
-					var clientAddr netip.Addr
-					ta, ok := c.RemoteAddr().(*net.TCPAddr)
-					if ok {
-						clientAddr = ta.AddrPort().Addr()
-					}
-					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName, Protocol: protocol}, pool.PackTCPBuffer)
-					if r == nil {
-						c.Close() // abort the connection
-						return
-					}
-					defer pool.ReleaseBuf(r)
-
-					n, err := c.Write(*r)
-					if err == nil && n != len(*r) {
-						err = io.ErrShortWrite
-					}
-					if err != nil {
-						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
-						// A partial reply corrupts the length-prefixed stream
-						// for every following message. Close instead of letting
-						// the connection linger until its idle timeout.
-						c.Close()
-					}
-				}()
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			if ctx.Err() != nil {
+				return
+			}
+			_ = c.SetWriteDeadline(time.Now().Add(tcpWriteTimeout))
+			n, err := c.Write(*r)
+			if err == nil && n != len(*r) {
+				err = io.ErrShortWrite
+			}
+			if err != nil {
+				logger.Warn("failed to write response", zap.Stringer("client", remote), zap.Error(err))
+				_ = c.Close()
 			}
 		}()
 	}

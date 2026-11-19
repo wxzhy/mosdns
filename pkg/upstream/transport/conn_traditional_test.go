@@ -185,10 +185,14 @@ func Test_dnsConn_exchange(t *testing.T) {
 			r.NoError(err)
 
 			rec, closed := dc.ReserveNewQuery()
-			r.Equal(tt.connClosed, closed)
-			if rec == nil {
+			if closed {
+				// The read loop can observe the injected error before reservation.
+				r.True(tt.connClosed || tt.rErrProb == 1)
+				r.Nil(rec)
 				return
 			}
+			r.False(tt.connClosed)
+			r.NotNil(rec)
 
 			respPayload, err := rec.ExchangeReserved(ctx, queryPayload)
 			if tt.wantErr {
@@ -199,6 +203,7 @@ func Test_dnsConn_exchange(t *testing.T) {
 
 			if tt.wantMsg {
 				r.NotNil(respPayload)
+				defer pool.ReleaseBuf(respPayload)
 				r.True(bytes.Equal(queryPayload, *respPayload))
 
 				// test idle timeout
@@ -335,10 +340,15 @@ func Test_dnsConn_exchange_retains_reply_during_write(t *testing.T) {
 	require.Eventually(t, func() bool { return dc.queueLen() > 0 },
 		2*time.Second, time.Millisecond, "exchange did not register its query")
 
-	// The server replies while exchange is still writing. The first query id
-	// assigned by a fresh connection is 0.
-	resp := bytes.Clone(qb)
-	binary.BigEndian.PutUint16(resp, 0)
+	// The server replies while exchange is still writing.
+	reply := new(dns.Msg).SetReply(q)
+	dc.queueMu.RLock()
+	for id := range dc.queue {
+		reply.Id = uint16(id)
+	}
+	dc.queueMu.RUnlock()
+	resp, err := reply.Pack()
+	require.NoError(t, err)
 	go func() {
 		_, _ = c2.Write(resp)
 	}()

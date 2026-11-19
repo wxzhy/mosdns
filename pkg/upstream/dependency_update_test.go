@@ -89,6 +89,7 @@ func TestDependencyUpdateQUICAdapters(t *testing.T) {
 type dependencyQUICPeer struct {
 	started, canceled       chan struct{}
 	startOnce, canceledOnce sync.Once
+	responseID              uint16
 }
 
 type dependencyQUICExchanger interface {
@@ -106,11 +107,33 @@ func (p *dependencyQUICPeer) answer(ctx context.Context, q *dns.Msg) (*dns.Msg, 
 		return nil, ctx.Err()
 	}
 	r := new(dns.Msg).SetReply(q)
+	r.Id = p.responseID
 	r.Answer = []dns.RR{&dns.A{
 		Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 30},
 		A:   net.IPv4(192, 0, 2, 20),
 	}}
 	return r, nil
+}
+
+func TestDoQUpstreamRequiresZeroWireID(t *testing.T) {
+	serverTLS, clientTLS := dependencyQUICCertificates(t)
+	const originalID = 17
+	u := startDependencyDoQ(t, &dependencyQUICPeer{responseID: originalID}, serverTLS, clientTLS)
+	q := new(dns.Msg).SetQuestion("framing.dependency.invalid.", dns.TypeA)
+	q.Id = originalID
+	wire, err := q.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := u.ExchangeContext(ctx, wire)
+	if resp != nil {
+		pool.ReleaseBuf(resp)
+	}
+	if !errors.Is(err, dnsutils.ErrDoQProtocol) {
+		t.Fatalf("nonzero DoQ wire ID: expected protocol error, got %v", err)
+	}
 }
 
 func dependencyQUICCertificates(t *testing.T) (*tls.Config, *tls.Config) {
@@ -160,10 +183,16 @@ func startDependencyDoQ(t *testing.T, peer *dependencyQUICPeer, serverTLS, clien
 					go func() {
 						defer workers.Done()
 						defer stream.Close()
-						defer stream.CancelRead(0)
-						q, _, err := dnsutils.ReadMsgFromTCP(stream)
+						payload, err := dnsutils.ReadDoQFrame(stream, false)
 						if err != nil {
 							t.Errorf("read DoQ query: %v", err)
+							return
+						}
+						q := new(dns.Msg)
+						err = q.Unpack(*payload)
+						pool.ReleaseBuf(payload)
+						if err != nil {
+							t.Errorf("unpack DoQ query: %v", err)
 							return
 						}
 						r, err := peer.answer(stream.Context(), q)

@@ -3,6 +3,8 @@ package transport
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
@@ -16,8 +18,6 @@ const (
 
 const (
 	// RFC 9250 4.3. DoQ Error Codes
-	_DOQ_NO_ERROR          = quic.StreamErrorCode(0x0)
-	_DOQ_INTERNAL_ERROR    = quic.StreamErrorCode(0x1)
 	_DOQ_REQUEST_CANCELLED = quic.StreamErrorCode(0x3)
 )
 
@@ -47,22 +47,30 @@ func (c *QuicDnsConn) ReserveNewQuery() (_ ReservedExchanger, closed bool) {
 	if err != nil {
 		return nil, false
 	}
-	return &quicReservedExchanger{stream: s}, false
+	return &quicReservedExchanger{conn: c.c, stream: s}, false
 }
 
 type quicReservedExchanger struct {
+	conn   *quic.Conn
 	stream *quic.Stream
 }
 
 var _ ReservedExchanger = (*quicReservedExchanger)(nil)
 
-func (ote *quicReservedExchanger) ExchangeReserved(ctx context.Context, q []byte) (resp *[]byte, err error) {
+func (ote *quicReservedExchanger) ExchangeReserved(ctx context.Context, q []byte) (*[]byte, error) {
 	stream := ote.stream
+	if ctx.Err() != nil {
+		ote.WithdrawReserved()
+		return nil, context.Cause(ctx)
+	}
+	if len(q) < dnsutils.DnsHeaderLen {
+		ote.WithdrawReserved()
+		return nil, dnsutils.ErrPayloadTooSmall
+	}
 
 	payload, err := copyMsgWithLenHdr(q)
 	if err != nil {
-		stream.CancelWrite(_DOQ_REQUEST_CANCELLED)
-		stream.CancelRead(_DOQ_REQUEST_CANCELLED)
+		ote.WithdrawReserved()
 		return nil, err
 	}
 
@@ -74,57 +82,40 @@ func (ote *quicReservedExchanger) ExchangeReserved(ctx context.Context, q []byte
 	orgQid := binary.BigEndian.Uint16((*payload)[2:])
 	binary.BigEndian.PutUint16((*payload)[2:], 0)
 
+	stop := context.AfterFunc(ctx, ote.WithdrawReserved)
+	defer stop()
 	stream.SetDeadline(time.Now().Add(quicQueryTimeout))
-	_, err = stream.Write(*payload)
+	n, err := stream.Write(*payload)
+	if err == nil && n != len(*payload) {
+		err = io.ErrShortWrite
+	}
 	pool.ReleaseBuf(payload)
+	if err == nil {
+		// Close sends FIN on the request side and leaves the response readable.
+		err = stream.Close()
+	}
 	if err != nil {
-		stream.CancelRead(_DOQ_REQUEST_CANCELLED)
-		stream.CancelWrite(_DOQ_REQUEST_CANCELLED)
+		ote.WithdrawReserved()
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
+		}
 		return nil, err
 	}
 
-	// RFC 9250 4.2
-	//    The client MUST send the DNS query over the selected stream and MUST
-	//    indicate through the STREAM FIN mechanism that no further data will
-	//    be sent on that stream.
-	//
-	// Call Close() here will send the STREAM FIN. It won't close Read.
-	stream.Close()
-
-	type res struct {
-		resp *[]byte
-		err  error
-	}
-	rc := make(chan res)
-	done := make(chan struct{})
-	defer close(done)
-	// If the caller returns on cancellation, the reader may already hold a
-	// pooled response. An unbuffered rc lets the reader release it, mirroring
-	// the DoH exchange, instead of stranding it in a buffered channel.
-	go func() {
-		r, err := dnsutils.ReadRawMsgFromTCP(stream)
-		select {
-		case rc <- res{resp: r, err: err}:
-		case <-done:
-			if r != nil {
-				pool.ReleaseBuf(r)
-			}
+	resp, err := dnsutils.ReadDoQFrame(stream, true)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
 		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		stream.CancelRead(_DOQ_REQUEST_CANCELLED)
-		return nil, context.Cause(ctx)
-	case r := <-rc:
-		resp := r.resp
-		err := r.err
-		if resp != nil {
-			binary.BigEndian.PutUint16((*resp), orgQid)
+		if errors.Is(err, dnsutils.ErrDoQProtocol) {
+			ote.conn.CloseWithError(dnsutils.DoQProtocolErrorCode, err.Error())
+		} else {
+			stream.CancelRead(_DOQ_REQUEST_CANCELLED)
 		}
-		stream.CancelRead(_DOQ_NO_ERROR)
-		return resp, err
+		return nil, err
 	}
+	binary.BigEndian.PutUint16(*resp, orgQid)
+	return resp, nil
 }
 
 func (ote *quicReservedExchanger) WithdrawReserved() {
