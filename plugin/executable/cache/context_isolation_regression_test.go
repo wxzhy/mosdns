@@ -104,6 +104,61 @@ func TestFirstNegativeSOATTLMatchesCachedAnswer(t *testing.T) {
 	}
 }
 
+func TestCNAMEToNODATAUsesTerminalNegativeTTL(t *testing.T) {
+	c := NewCache(&Args{LazyCacheTTL: 120}, Opts{})
+	defer c.Close()
+	q := new(dns.Msg).SetQuestion("alias.example.test.", dns.TypeAAAA)
+	r := new(dns.Msg).SetReply(q)
+	rr := func(s string) dns.RR {
+		record, err := dns.NewRR(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+	r.Answer = []dns.RR{rr("alias.example.test. 60 IN CNAME target.destination.test.")}
+	r.Ns = []dns.RR{
+		rr("example.test. 60 IN SOA ns.example.test. root.example.test. 1 60 60 60 2"),
+		rr("destination.test. 30 IN SOA ns.destination.test. root.destination.test. 1 60 60 60 5"),
+	}
+	normalized := normalizeNegativeSOA(r)
+	if normalized.Ns[0].Header().Ttl != 60 || normalized.Ns[1].Header().Ttl != 5 || r.Ns[1].Header().Ttl != 30 {
+		t.Fatalf("wrong normalized SOA records: %v", normalized.Ns)
+	}
+	keyStr := getMsgKey(q)
+	if !saveRespToCache(keyStr, r, c.backend, c.args.LazyCacheTTL) {
+		t.Fatal("NODATA with a usable SOA was not saved")
+	}
+	stored, expiry, ok := c.backend.Get(key(keyStr))
+	if !ok || stored.resp.Ns[1].Header().Ttl != 5 ||
+		expiry.Sub(stored.storedTime) != 5*time.Second || !expiry.Equal(stored.expirationTime) {
+		t.Fatalf("negative entry has the wrong lifetime: %+v, expiry=%v", stored, expiry)
+	}
+	positive := r.Copy()
+	positive.Answer = append(positive.Answer, rr("target.destination.test. 60 IN AAAA 2001:db8::1"))
+	if normalizeNegativeSOA(positive) != positive {
+		t.Fatal("positive CNAME response was treated as NODATA")
+	}
+
+	// Simulate an older dump that retained the negative result as a positive
+	// answer. It must already be expired when imported.
+	now := time.Now()
+	old := &item{resp: r, storedTime: now.Add(-10 * time.Second), expirationTime: now.Add(20 * time.Second)}
+	c.backend.Store(key(keyStr), old, now.Add(time.Minute))
+	var dump bytes.Buffer
+	if _, err := c.writeDump(&dump); err != nil {
+		t.Fatal(err)
+	}
+	restored := NewCache(&Args{LazyCacheTTL: 120}, Opts{})
+	defer restored.Close()
+	if n, err := restored.readDump(&dump); err != nil || n != 1 {
+		t.Fatalf("restoring negative cache dump: count=%d, error=%v", n, err)
+	}
+	if reply, _, _ := getRespFromCache(keyStr, restored.backend, true, 5); reply != nil {
+		t.Fatalf("expired negative result survived dump import: %v", reply)
+	}
+}
+
 func TestDumpRejectsMismatchedQuestionAtomically(t *testing.T) {
 	c := NewCache(&Args{}, Opts{})
 	defer c.Close()

@@ -10,6 +10,7 @@
 | [speedcheck-windows.yaml](speedcheck-windows.yaml) | Windows 最小 UDP/TCP 示例 | [Windows 说明](../docs/speedcheck-windows.md) |
 | [ip-replace.yaml](ip-replace.yaml) | 不访问公网的地址前缀替换演示 | [IP 替换](../docs/ip-replace.md) |
 | [ip-fallback.yaml](ip-fallback.yaml) | 不访问公网的静态回退演示 | [静态回退](../docs/ip-fallback.md) |
+| [dynamic-ip-targets.yaml](dynamic-ip-targets.yaml) | hosts、专用缓存与域名目标回退/替换的离线演示 | [动态目标与缓存计算](../docs/dynamic-ip-targets.md) |
 | [https-record.yaml](https-record.yaml) | 离线 HTTPS/SVCB 响应处理演示 | [HTTPS 处理](../docs/https-record.md) |
 | [smartdns/config.yaml](smartdns/config.yaml) | 原普通网络部署的迁移配置 | [迁移说明](../docs/smartdns-migration.md) |
 | [smartdns/config-cernet.yaml](smartdns/config-cernet.yaml) | 原 CERNET 部署的迁移配置 | [规则数据准备](smartdns/README-data.md) |

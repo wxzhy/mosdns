@@ -13,6 +13,9 @@ QNAME, QTYPE, QCLASS and DNSSEC flags. Entries loaded from a dump do not
 restore executable continuations and cannot be proactively prefetched until
 refreshed by a new frontend query.
 
+Lazy refresh and prefetch replace only the cache entry that triggered them.
+A newer entry written while a refresh is running keeps its answer and metadata.
+
 **Policy boundary:** The default `scope: shared` keeps a common cache across
 compatible sequences, including ordinary A and HTTPS auxiliary A lookups in
 the SmartDNS examples. To isolate different sequence continuations using the
@@ -52,6 +55,44 @@ Older dumps are accepted, but cannot recover classification they never stored.
 Imported dumps are validated in full before committing any entries, including
 checking cache-key question, type, class and scope encoding against the
 serialized DNS response. Old pre-QCLASS dump keys are migrated when valid.
+
+## Dynamic address targets
+
+`ip_fallback` and `ip_replace` have no persistent address cache. A cache in
+their `ip_source` chain stores the target DNS question, independently for A and
+AAAA, so different original user questions can reuse the same target answer.
+Without such a cache, each eligible rewrite resolves its domain targets again.
+The plugin `timeout` bounds lookup work; cache `size` bounds entry capacity.
+Neither setting specifies the cached answer's lifetime.
+
+For positive answers, the normal cache lifetime is the minimum TTL across
+Answer, Authority and Additional, excluding OPT. Hits subtract elapsed whole
+seconds from each stored record's TTL. Positive answers with a minimum TTL of
+zero are not cached. SERVFAIL currently has a five-second cache lifetime.
+
+The final rewritten Answer is separately bounded by the remaining address and
+CNAME lifetimes of targets that actually contribute unique addresses. Fallback
+also applies its configured TTL and the original alias chain's applicable
+lifetime; replacement also applies the original address/alias lifetime. Mixed
+targets use the shortest applicable bound. For example, a cached target with
+about 20 seconds left cannot produce a day-long fallback answer.
+
+`lazy_cache_ttl` is total positive-entry retention from storage, not additional
+time after the DNS TTL. During that retention, an expired answer may be returned
+with a temporary TTL of five seconds while refreshing. Set it to zero to stop
+using expired targets. Prefetch is optional and requires a positive remaining
+lifetime below `prefetch_before_expire` and at least `prefetch_min_hits` hits;
+it runs at the configured scan interval, so refresh before expiry is not
+guaranteed. Target-query recursion guards survive both refresh mechanisms.
+
+The cache stores DNS messages and timing, not complete response-snapshot
+`ValidUntil` metadata. A target cache hit is analyzed from its returned TTL;
+the rewrite then preserves applicable absolute deadlines within that execution.
+An outer cache of final user responses can serve its stored answer directly,
+bypassing another lookup, rewrite and speed selection on that hit.
+
+See [the dynamic target guide](dynamic-ip-targets.md) for formulas, a dedicated
+cache chain, ECS limitations and an offline example.
 
 File-backed providers now take a file-state baseline **before** initial load.
 Changes while that load is running are detected at the first poll. File content

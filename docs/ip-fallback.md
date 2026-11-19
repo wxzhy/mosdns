@@ -2,7 +2,7 @@
 
 `ip_fallback` 在 `speedcheck` 后检查当前响应的测速状态，满足配置条件时以指定地址生成新响应。默认处理“全部真实探测失败”和合法 NOERROR/NODATA；关闭测速、队列不足或尚未测完时默认继续采用 DNS 地址。要在这些情况下使用静态地址，显式选择 `no_rtt`。
 
-插件不会发起 DNS 查询或探测，也不会对静态地址执行倍率排序。静态地址按配置顺序返回并去重，`speedcheck.max_num` 不会再次裁剪这份地址列表。请只为明确允许的域名配置回退，并先确认真实目标地址可用。
+纯 IP 配置不会发起 DNS 查询；目标列表也支持 `domain:<域名>`，触发回退后才通过 `ip_source` 解析当前地址族，详见[域名地址来源与专用缓存链](dynamic-ip-targets.md)。插件不会发起探测或对目标执行倍率排序。地址按配置顺序返回并去重，`speedcheck.max_num` 不会再次裁剪这份地址列表。请只为明确允许的域名配置回退，并先确认真实目标地址可用。
 
 ## 本地完整示例
 
@@ -43,13 +43,15 @@ nslookup -port=15353 -type=AAAA nodata.ip-fallback.invalid 127.0.0.1
 | --- | --- |
 | `ipv4` | 空列表；IPv4 目标字符串列表，按顺序返回并稳定去重。 |
 | `ipv6` | 空列表；IPv6 目标字符串列表，按顺序返回并稳定去重。 |
+| `ip_source` | 配置 `domain:` 目标时必填；此前定义的 forward 或 sequence 标签，不带 `$`。 |
+| `timeout` | 默认 `500ms`；一次执行中全部目标解析共享的总预算，同时受父请求剩余时间限制。 |
 | `ttl` | `86400` 秒；整数 `0..4294967295`，显式 `0` 表示即时返回且不缓存。 |
 | `on` | 省略时为 `[all_probes_failed, nodata]`；显式 `[]` 关闭所有触发条件。列表内为 OR，未知条件启动报错。 |
 | `on: all_probes_failed` | speedcheck 采用的合格地址集合全部取得已完成的失败结果时触发。 |
 | `on: nodata` | 当前 A/AAAA 查询有合法 NOERROR 响应，沿 CNAME 链的终点没有同类型地址时触发。 |
 | `on: no_rtt` | 已经过 speedcheck，但合格地址中没有任何成功 RTT 时触发，包含全失败、明确禁测、未匹配探测、未完成及排队受限；未经过 speedcheck 的原始响应不触发。 |
 
-目标列表只接受对应地址族的裸 IP。CIDR、zone（如 `fe80::1%eth0`）、IPv4-mapped IPv6（如 `::ffff:192.0.2.1`）、地址族错误或无效地址会使启动失败。TTL 负值和超范围值也会启动报错。当前查询地址族的目标列表为空时保留原响应。
+目标列表接受对应地址族的裸 IP 与 `domain:<域名>`，可以混用。`ipv4` 域名查询 A，`ipv6` 查询 AAAA。CIDR、zone（如 `fe80::1%eth0`）、IPv4-mapped IPv6（如 `::ffff:192.0.2.1`）、地址族错误或无效地址会使启动失败。TTL 负值和超范围值也会启动报错。当前查询地址族的目标列表为空时保留原响应。动态目标全部失败时同样保留原响应并老化 TTL；成功来源的地址/CNAME 剩余寿命会进一步限制配置 TTL。
 
 ## 探测状态与默认行为
 
@@ -86,6 +88,16 @@ NODATA 是独立条件；若希望它与 `no_rtt` 一起触发，请使用 `on: 
 
 域名和 CNAME 条件由外层 sequence 的 `qname`、`cname` 等 matcher 控制。本插件没有重复的域名映射或 IP 标签配置；原始 DNS 候选的标签、ASN 倍率、过滤及 RTT 排名仍由 speedcheck 完成。静态目标是显式的最终策略，不重新调用来源，也不增加等待全部上游返回的屏障。
 
+### 根域名与子域名的回退结果不同
+
+`domain:google.com` 同时匹配 `google.com` 和它的子域名；`cname` 只检查响应里的 CNAME 目标，不能单独代替 `qname` 覆盖直接地址响应。SmartDNS 迁移示例的 `apply_fallback` 同时检查二者，并先排除 google-cn、googlefcm、NTP 和 STUN。
+
+名称允许回退以后，仍须满足 `on` 条件。不同名称解析出的 IP 可能有不同的测速结果：同一次选择有任一成功 RTT 时保留 DNS 地址；全部完成且失败时才触发 `all_probes_failed`；有未完成或未测量的地址时默认保留 DNS 地址。仅凭最终 IP 和 TTL 无法区分成功与未测量。
+
+如果最终响应缓存包裹了选择与回退链，命中时不会重新测速或判断回退，旧 DNS 地址会保留到过期或刷新；启用 lazy cache 时，过期查询还可能先返回短 TTL 的旧地址。排查时应同时核对实际部署配置、缓存命中和对应查询的测速状态，不能仅由根域名与 `www` 的一次结果差异判断匹配失败。
+
+两份迁移示例的 Google 静态回退仅配置了 IPv6，`ipv4: []` 表示 A 查询即使测速全失败也保留来源地址。`on: [no_rtt, nodata]` 可以覆盖没有成功 RTT 的情况；它仍保留成功 RTT 的地址，也不会绕过域名排除、DNSSEC 或空地址族配置。
+
 ## TTL、响应重建与 DNSSEC
 
 配置 TTL 为静态地址开启新的期限；无 CNAME 时不沿用旧地址 RRset 的短 TTL。存在 CNAME 时，保留同一规范化链和终点 owner，静态响应受链的剩余期限约束；若来源已经重建，还会保守继承其内部期限，因此实际 TTL 可能低于配置值。过期链不能借回退重新获得生存期。真正的 TTL=0 与正 TTL 老化后在线上取整为 0 的情形保持区分。
@@ -101,4 +113,11 @@ NODATA 是独立条件；若希望它与 `no_rtt` 一起触发，请使用 `on: 
 ```powershell
 go test -race -p 2 ./plugin/executable/ip_fallback ./plugin/executable/speedcheck
 go test ./plugin/executable/speedcheck -run 'TestIPFallback|TestOuterFallbackPreservesProbeStatus' -v
+```
+
+已导出 `data/smartdns` 时，可额外使用真实 GeoSite/MMDB 和受控测速结果，检查两份迁移配置中 `google.com`、`www.google.com` 及 `earth.google.com` 的完整处理链（不访问外部 DNS 或执行真实测速）：
+
+```powershell
+$env:MOSDNS_SMARTDNS_LOCAL_DATA = "1"
+go test ./tests/integration -run '^TestSmartdnsRealDataGoogleFallbackNames$' -count=1 -v
 ```

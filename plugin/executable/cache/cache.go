@@ -37,6 +37,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_policy"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/go-chi/chi/v5"
@@ -243,13 +244,13 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		return next.ExecNext(ctx, qCtx)
 	}
 
-	cachedResp, lazyHit := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
+	cachedResp, cachedItem, lazyHit := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
 	// Cache hits intentionally share answers across compatible chains (e.g.
 	// auxiliary A and normal A resolution). Prefetch instead uses the
 	// continuation that actually PRODUCED each entry, never a global first one.
 	if lazyHit {
 		c.lazyHitTotal.Inc()
-		c.doLazyUpdate(msgKey, qCtx, next)
+		c.doLazyUpdate(query_policy.AddressTargetLookup(ctx), msgKey, qCtx, next, cachedItem)
 	}
 	if cachedResp != nil { // cache hit
 		c.hitTotal.Inc()
@@ -257,16 +258,12 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		qCtx.SetResponse(cachedResp)
 		qCtx.UpstreamSelected = nil
 		qCtx.FromHosts, qCtx.FromArbitrary = false, false
-		if v, _, ok := c.backend.Get(key(msgKey)); ok && v != nil {
-			ttl := int(v.expirationTime.Sub(v.storedTime).Seconds())
-			remaining := max(0, int(time.Until(v.expirationTime).Seconds()))
-			qCtx.SetCacheState(true, lazyHit, ttl, remaining)
-			qCtx.CacheState.LocalNegative = v.localNegative
-			if c.args.Prefetch {
-				v.hitCount.Add(1)
-			}
-		} else {
-			qCtx.SetCacheState(true, lazyHit, 0, 0)
+		ttl := int(cachedItem.expirationTime.Sub(cachedItem.storedTime).Seconds())
+		remaining := max(0, int(time.Until(cachedItem.expirationTime).Seconds()))
+		qCtx.SetCacheState(true, lazyHit, ttl, remaining)
+		qCtx.CacheState.LocalNegative = cachedItem.localNegative
+		if c.args.Prefetch {
+			cachedItem.hitCount.Add(1)
 		}
 	} else {
 		qCtx.SetCacheState(false, false, 0, 0)
@@ -285,16 +282,16 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		// A failed chain may leave a partial response behind. Never cache it.
 		// Also reject queries whose EDNS options were changed downstream.
 		localNegative := qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)
-		if saveRespToCacheWithSource(msgKey, r, c.backend, c.args.LazyCacheTTL, nil, &next, localNegative) {
+		if saveRespToCacheWithSource(msgKey, r, c.backend, c.args.LazyCacheTTL, nil, &next, localNegative, query_policy.AddressTargetLookup(ctx)) {
 			c.updatedKey.Add(1)
 		}
 	}
 	return err
 }
 
-// doLazyUpdate starts a new goroutine to execute next node and update the cache in the background.
-// It has an inner singleflight.Group to de-duplicate same msgKey.
-func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next sequence.ChainWalker) {
+// doLazyUpdate coalesces refreshes for the same key and replaces only the
+// entry that triggered the refresh.
+func (c *Cache) doLazyUpdate(targetLookup bool, msgKey string, qCtx *query_context.Context, next sequence.ChainWalker, expected *item) {
 	c.refreshMu.Lock()
 	select {
 	case <-c.closeNotify:
@@ -312,6 +309,9 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 		c.logger.Debug("start lazy cache update", qCtx.InfoField())
 		ctx, cancel := context.WithTimeout(c.lazyCtx, defaultLazyUpdateTimeout)
 		defer cancel()
+		if targetLookup {
+			ctx = query_policy.WithAddressTargetLookup(ctx)
+		}
 
 		err := next.ExecNext(ctx, qCtx)
 		if err != nil {
@@ -323,7 +323,7 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 			c.refreshMu.Lock()
 			if generation == c.refreshGeneration && ctx.Err() == nil {
 				localNegative := qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)
-				if saveRespToCacheWithSource(msgKey, r, c.backend, c.args.LazyCacheTTL, nil, &next, localNegative) {
+				if saveRespToCacheWithSource(msgKey, r, c.backend, c.args.LazyCacheTTL, expected, &next, localNegative, targetLookup) {
 					c.updatedKey.Add(1)
 				}
 			}
@@ -433,6 +433,9 @@ func (c *Cache) doPrefetch(candidate prefetchCandidate) {
 	qCtx := query_context.NewContext(q)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
 	defer cancel()
+	if v.targetLookup {
+		ctx = query_policy.WithAddressTargetLookup(ctx)
+	}
 	if err := candidate.next.ExecNext(ctx, qCtx); err != nil {
 		c.prefetchFailTotal.Inc()
 		c.logger.Debug("proactive prefetch failed", zap.String("qname", qCtx.QQuestion().Name), zap.Error(err))
@@ -445,7 +448,7 @@ func (c *Cache) doPrefetch(candidate prefetchCandidate) {
 	}
 	if r := qCtx.R(); r != nil && c.queryKey(qCtx.Q(), candidate.next) == string(candidate.key) &&
 		saveRespToCacheWithSource(string(candidate.key), r, c.backend, c.args.LazyCacheTTL, v, &candidate.next,
-			qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused)) {
+			qCtx.UpstreamSelected == nil && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused), v.targetLookup) {
 		c.updatedKey.Add(1)
 		c.prefetchTotal.Inc()
 	} else {
@@ -719,6 +722,18 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 			// Without this, SubtractTTL treats the entry as decades old.
 			if entry.GetMsgStoredTime() == 0 {
 				storedTime = msgExpTime.Add(-time.Duration(dnsutils.GetMinimalTTL(resp)) * time.Second)
+			}
+			// Older versions could persist a CNAME followed by NODATA
+			// with the positive cache lifetime.
+			if zone, ttl, ok := negativeSOA(resp); ok {
+				limitNegativeSOA(resp, zone, ttl, false)
+				bound := storedTime.Add(time.Duration(ttl) * time.Second)
+				if msgExpTime.After(bound) {
+					msgExpTime = bound
+				}
+				if cacheExpTime.After(msgExpTime) {
+					cacheExpTime = msgExpTime
+				}
 			}
 
 			i := &item{

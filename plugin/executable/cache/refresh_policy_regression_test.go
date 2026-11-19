@@ -78,7 +78,7 @@ func TestBackgroundRefreshRejectsDownstreamECS(t *testing.T) {
 	if current, _, _ := c.backend.Get(k); current != v {
 		t.Fatal("prefetch cached an ECS-mutated response under ordinary key")
 	}
-	c.doLazyUpdate(string(k), query_context.NewContext(q.Copy()), chain)
+	c.doLazyUpdate(false, string(k), query_context.NewContext(q.Copy()), chain, v)
 	c.lazyWG.Wait()
 	if current, _, _ := c.backend.Get(k); current != v {
 		t.Fatal("lazy refresh cached an ECS-mutated response under ordinary key")

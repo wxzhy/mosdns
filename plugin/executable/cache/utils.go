@@ -165,6 +165,8 @@ type item struct {
 	hitCount       atomic.Uint32
 	next           *sequence.ChainWalker // nil for restored or test-only entries.
 	localNegative  bool
+	// Prefetch inherits only this recursion guard, never client marks or KV.
+	targetLookup bool
 }
 
 // The v2 dump message has no dedicated source-classification field.
@@ -268,11 +270,11 @@ func min[T constraints.Ordered](a, b T) T {
 	return b
 }
 
-// getRespFromCache returns the cached response from cache.
+// getRespFromCache returns the cached response and the item it came from.
 // The ttl of returned msg will be changed properly.
 // Returned bool indicates whether this response is hit by lazy cache.
 // Note: Caller SHOULD change the msg id because it's not same as query's.
-func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCacheEnabled bool, lazyTtl int) (*dns.Msg, bool) {
+func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCacheEnabled bool, lazyTtl int) (*dns.Msg, *item, bool) {
 	// Lookup cache
 	v, _, _ := backend.Get(key(msgKey))
 
@@ -284,7 +286,7 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 		if now.Before(v.expirationTime) {
 			r := v.resp.Copy()
 			dnsutils.SubtractTTL(r, uint32(now.Sub(v.storedTime).Seconds()))
-			return r, false
+			return r, v, false
 		}
 
 		// Msg expired but cache isn't. This is a lazy cache enabled entry.
@@ -292,12 +294,12 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 		if lazyCacheEnabled {
 			r := v.resp.Copy()
 			dnsutils.SetTTL(r, uint32(lazyTtl))
-			return r, true
+			return r, v, true
 		}
 	}
 
 	// cache miss
-	return nil, false
+	return nil, nil, false
 }
 
 // saveRespToCache saves r to cache backend. It returns false if r
@@ -309,48 +311,30 @@ func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item]
 // expected != nil means a background refresh may only replace that exact
 // cache entry. A concurrent update or Flush must not be undone by prefetch.
 func saveRespToCacheIf(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, expected *item) bool {
-	return saveRespToCacheWithSource(msgKey, r, backend, lazyCacheTtl, expected, nil, false)
+	return saveRespToCacheWithSource(msgKey, r, backend, lazyCacheTtl, expected, nil, false, false)
 }
 
 // The continuation and source classification are immutable once published.
-func saveRespToCacheWithSource(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, expected *item, next *sequence.ChainWalker, localNegative bool) bool {
-	if r.Truncated != false {
+func saveRespToCacheWithSource(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, expected *item, next *sequence.ChainWalker, localNegative, targetLookup bool) bool {
+	if r.Truncated {
 		return false
 	}
 
 	var msgTtl time.Duration
 	var cacheTtl time.Duration
-	negativeTTL := func() time.Duration {
-		for _, rr := range r.Ns {
-			if soa, ok := rr.(*dns.SOA); ok {
-				return time.Duration(min(soa.Hdr.Ttl, soa.Minttl)) * time.Second
-			}
-		}
-		return 0
-	}
-	switch r.Rcode {
-	case dns.RcodeNameError:
-		msgTtl = negativeTTL()
+	zone, negativeTTL, negative := negativeSOA(r)
+	switch {
+	case negative:
+		msgTtl = time.Duration(negativeTTL) * time.Second
 		cacheTtl = msgTtl
-	case dns.RcodeServerFailure:
+	case r.Rcode == dns.RcodeServerFailure:
 		msgTtl = time.Second * 5
 		cacheTtl = msgTtl
-	case dns.RcodeSuccess:
-		minTTL := dnsutils.GetMinimalTTL(r)
-		if len(r.Answer) == 0 && negativeTTL() > 0 {
-			msgTtl = negativeTTL()
-			cacheTtl = msgTtl
-		} else if len(r.Answer) == 0 {
-			// Do not cache an indeterminate empty answer without an SOA.
-			msgTtl = 0
-			cacheTtl = msgTtl
-		} else {
-			msgTtl = time.Duration(minTTL) * time.Second
-			if lazyCacheTtl > 0 {
-				cacheTtl = time.Duration(lazyCacheTtl) * time.Second
-			} else {
-				cacheTtl = msgTtl
-			}
+	case r.Rcode == dns.RcodeSuccess && len(r.Answer) != 0:
+		msgTtl = time.Duration(dnsutils.GetMinimalTTL(r)) * time.Second
+		cacheTtl = msgTtl
+		if lazyCacheTtl > 0 {
+			cacheTtl = time.Duration(lazyCacheTtl) * time.Second
 		}
 	}
 	if msgTtl <= 0 || cacheTtl <= 0 {
@@ -359,14 +343,8 @@ func saveRespToCacheWithSource(msgKey string, r *dns.Msg, backend *cache.Cache[k
 
 	now := time.Now()
 	storedResponse := copyNoOpt(r)
-	if r.Rcode == dns.RcodeNameError || (r.Rcode == dns.RcodeSuccess && len(r.Answer) == 0) {
-		// RFC 2308: the SOA in a cached negative reply must advertise no
-		// longer than the negative cache lifetime, not its original RR TTL.
-		for _, rr := range storedResponse.Ns {
-			if soa, ok := rr.(*dns.SOA); ok {
-				soa.Hdr.Ttl = min(soa.Hdr.Ttl, soa.Minttl)
-			}
-		}
+	if negative {
+		limitNegativeSOA(storedResponse, zone, negativeTTL, false)
 	}
 	v := &item{
 		resp:           storedResponse,
@@ -374,6 +352,7 @@ func saveRespToCacheWithSource(msgKey string, r *dns.Msg, backend *cache.Cache[k
 		expirationTime: now.Add(msgTtl),
 		next:           next,
 		localNegative:  localNegative,
+		targetLookup:   targetLookup,
 	}
 	if expected != nil {
 		return backend.StoreIf(key(msgKey), v, now.Add(cacheTtl), func(old *item) bool {
@@ -388,16 +367,62 @@ func saveRespToCacheWithSource(msgKey string, r *dns.Msg, backend *cache.Cache[k
 // TTL correction. The caller must preserve the other QueryContext metadata
 // when committing the copy. Upstream-owned response objects are not mutated.
 func normalizeNegativeSOA(r *dns.Msg) *dns.Msg {
-	if r == nil || (r.Rcode != dns.RcodeNameError && (r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0)) {
+	zone, ttl, ok := negativeSOA(r)
+	if !ok {
 		return r
 	}
+	return limitNegativeSOA(r, zone, ttl, true)
+}
+
+// negativeSOA requires a relevant SOA and, for NOERROR, the absence of the
+// requested RRset at the end of the alias chain. The complete cached reply
+// also depends on the lifetime of that chain.
+func negativeSOA(r *dns.Msg) (zone string, ttl uint32, ok bool) {
+	if r == nil || len(r.Question) != 1 || len(r.Ns) == 0 ||
+		(r.Rcode != dns.RcodeNameError && r.Rcode != dns.RcodeSuccess) {
+		return "", 0, false
+	}
+	q := r.Question[0]
+	terminal, aliasTTL, valid := dnsutils.AnswerChain(q, r.Answer)
+	if !valid {
+		return "", 0, false
+	}
+	if r.Rcode == dns.RcodeSuccess {
+		for _, rr := range r.Answer {
+			h := rr.Header()
+			if h.Class == q.Qclass && (h.Rrtype == q.Qtype || q.Qtype == dns.TypeANY) &&
+				dns.CanonicalName(h.Name) == terminal {
+				return "", 0, false
+			}
+		}
+	}
+	bestLabels := -1
+	for _, rr := range r.Ns {
+		soa, isSOA := rr.(*dns.SOA)
+		if !isSOA || soa.Hdr.Class != q.Qclass || !dns.IsSubDomain(soa.Hdr.Name, terminal) {
+			continue
+		}
+		labels := dns.CountLabel(soa.Hdr.Name)
+		soaTTL := min(min(soa.Hdr.Ttl, soa.Minttl), aliasTTL)
+		if labels > bestLabels || (labels == bestLabels && soaTTL < ttl) {
+			zone, ttl, bestLabels = dns.CanonicalName(soa.Hdr.Name), soaTTL, labels
+		}
+	}
+	return zone, ttl, bestLabels >= 0
+}
+
+func limitNegativeSOA(r *dns.Msg, zone string, ttl uint32, clone bool) *dns.Msg {
 	var normalized *dns.Msg
 	for i, rr := range r.Ns {
-		if soa, ok := rr.(*dns.SOA); ok && soa.Hdr.Ttl > soa.Minttl {
+		if soa, ok := rr.(*dns.SOA); ok && soa.Hdr.Ttl > ttl &&
+			soa.Hdr.Class == r.Question[0].Qclass && dns.CanonicalName(soa.Hdr.Name) == zone {
 			if normalized == nil {
-				normalized = r.Copy()
+				normalized = r
+				if clone {
+					normalized = r.Copy()
+				}
 			}
-			normalized.Ns[i].Header().Ttl = soa.Minttl
+			normalized.Ns[i].Header().Ttl = ttl
 		}
 	}
 	if normalized != nil {

@@ -13,6 +13,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/response"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/internal/iptarget"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 )
@@ -20,7 +21,9 @@ import (
 const PluginType = "ip_replace"
 
 type Args struct {
-	ReplaceMap []Rule `yaml:"replace_map"`
+	IPSource   string        `yaml:"ip_source"`
+	Timeout    time.Duration `yaml:"timeout"`
+	ReplaceMap []Rule        `yaml:"replace_map"`
 }
 
 // Rule uses full-length prefixes by default, producing fixed replacement IPs.
@@ -36,14 +39,15 @@ type Rule struct {
 
 type compiledRule struct {
 	match, exclude netlist.Matcher
-	ipv4, ipv6     []netip.Addr
+	ipv4, ipv6     iptarget.List
 	prefix4        int
 	prefix6        int
 }
 
-// Replacer is immutable after construction and may be shared by query branches.
+// Replacer may be shared by query branches; its target resolver owns lifecycle.
 type Replacer struct {
-	rules []compiledRule
+	rules   []compiledRule
+	targets *iptarget.Resolver
 }
 
 var _ sequence.Executable = (*Replacer)(nil)
@@ -61,12 +65,18 @@ func New(bp *coremain.BP, args *Args) (*Replacer, error) {
 		return nil, fmt.Errorf("ip_replace: args must not be nil")
 	}
 	p := &Replacer{rules: make([]compiledRule, 0, len(args.ReplaceMap))}
+	dynamic := false
 	for i, rule := range args.ReplaceMap {
 		compiled, err := compileRule(bp, rule)
 		if err != nil {
 			return nil, fmt.Errorf("ip_replace: replace_map #%d: %w", i, err)
 		}
 		p.rules = append(p.rules, compiled)
+		dynamic = dynamic || compiled.ipv4.Dynamic() || compiled.ipv6.Dynamic()
+	}
+	var err error
+	if p.targets, err = iptarget.New(bp, args.IPSource, args.Timeout, dynamic); err != nil {
+		return nil, fmt.Errorf("ip_replace: %w", err)
 	}
 	return p, nil
 }
@@ -89,10 +99,10 @@ func compileRule(bp *coremain.BP, rule Rule) (compiledRule, error) {
 	if out.prefix6, err = prefixLength(rule.IPv6PrefixLen, 128); err != nil {
 		return out, fmt.Errorf("ipv6_prefixlen: %w", err)
 	}
-	if out.ipv4, err = compileTargets(rule.IPv4, out.prefix4, true); err != nil {
+	if out.ipv4, err = iptarget.Compile(rule.IPv4, true); err != nil {
 		return out, fmt.Errorf("ipv4: %w", err)
 	}
-	if out.ipv6, err = compileTargets(rule.IPv6, out.prefix6, false); err != nil {
+	if out.ipv6, err = iptarget.Compile(rule.IPv6, false); err != nil {
 		return out, fmt.Errorf("ipv6: %w", err)
 	}
 	return out, nil
@@ -106,23 +116,6 @@ func prefixLength(value *int, bits int) (int, error) {
 		return 0, fmt.Errorf("must be within 0..%d", bits)
 	}
 	return *value, nil
-}
-
-func compileTargets(values []string, prefix int, ipv4 bool) ([]netip.Addr, error) {
-	var out []netip.Addr
-	seen := make(map[netip.Addr]bool)
-	for i, value := range values {
-		ip, err := netip.ParseAddr(value)
-		if err != nil || ip.Zone() != "" || ip.Is4() != ipv4 || ip.Is4In6() {
-			return nil, fmt.Errorf("invalid address #%d %q for this address family", i, value)
-		}
-		base := netip.PrefixFrom(ip, prefix).Masked().Addr()
-		if !seen[base] {
-			out = append(out, base)
-			seen[base] = true
-		}
-	}
-	return out, nil
 }
 
 // replaceIP combines normalized target network bits and original host bits.
@@ -146,9 +139,14 @@ func replaceIP(original, base netip.Addr, prefix int) netip.Addr {
 	return netip.AddrFrom16(network)
 }
 
+func (p *Replacer) Close() error { return p.targets.Close() }
+
 func (p *Replacer) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return context.Cause(ctx)
+	}
+	if iptarget.IsSubquery(ctx) {
+		return nil
 	}
 	if len(p.rules) == 0 || qCtx.R() == nil {
 		return nil
@@ -180,27 +178,58 @@ func (p *Replacer) Exec(ctx context.Context, qCtx *query_context.Context) error 
 			if rule.exclude.Match(address.IP) || !rule.match.Match(address.IP) {
 				continue
 			}
-			targets, prefix := rule.ipv4, rule.prefix4
+			list, prefix := rule.ipv4, rule.prefix4
 			if question.Qtype == dns.TypeAAAA {
-				targets, prefix = rule.ipv6, rule.prefix6
+				list, prefix = rule.ipv6, rule.prefix6
 			}
 			// First matching rule/IP owns the decision, including an empty
 			// target list for this family.
-			if len(targets) == 0 {
+			if len(list) == 0 {
 				return nil
 			}
+			targets, err := p.targets.Resolve(ctx, qCtx, list, question.Qtype)
+			if err != nil {
+				return err
+			}
+			keepOriginal := func() error {
+				if ctx.Err() != nil {
+					return context.Cause(ctx)
+				}
+				if list.Dynamic() {
+					qCtx.CommitResponse(response.Replay(candidate, time.Now()))
+				}
+				return nil
+			}
+			if len(targets) == 0 {
+				return keepOriginal()
+			}
 			ips := make([]netip.Addr, 0, len(targets))
+			var sources []*response.Candidate
+			seen := make(map[netip.Addr]bool)
 			for _, target := range targets {
-				ips = append(ips, replaceIP(address.IP, target, prefix))
+				base := netip.PrefixFrom(target.IP, prefix).Masked().Addr()
+				ip := replaceIP(address.IP, base, prefix)
+				if seen[ip] {
+					continue
+				}
+				seen[ip] = true
+				ips = append(ips, ip)
+				if target.Source != nil {
+					sources = append(sources, target.Source)
+				}
 			}
 			snapshot, err := response.ReplaceAddresses(candidate, ips, time.Now())
 			if err != nil {
 				return fmt.Errorf("ip_replace: %w", err)
 			}
+			snapshot = response.LimitAddressLifetime(snapshot, sources, time.Now())
 			if err := ctx.Err(); err != nil {
 				return context.Cause(ctx)
 			}
 			if until := snapshot.ValidUntil; !until.IsZero() && !time.Now().Before(until) {
+				if list.Dynamic() {
+					return keepOriginal()
+				}
 				return fmt.Errorf("ip_replace: source response expired before replacement")
 			}
 			qCtx.CommitResponse(snapshot)

@@ -1,0 +1,106 @@
+# 纯本地动态目标示例：无需公网 DNS、GeoIP 数据库或真实地址探测。
+# mosdns start -c examples/dynamic-ip-targets.yaml
+log:
+  level: info
+plugins:
+  - tag: target_hosts
+    type: hosts
+    args:
+      entries:
+        - "backup.dynamic-ip.invalid 203.0.113.42 198.51.100.42 2001:db8:ffff::42"
+        - "cdn.dynamic-ip.invalid 203.0.113.99 198.51.100.77 2001:db8:100::99"
+
+  # 专用缓存只保存目标域名的 A/AAAA 查询，两个地址族分别缓存。
+  # 生产中可改用 forward；若启用 ECS，需在 cache 前设置，当前 ECS 查询绕过缓存。
+  # TTL、lazy 和预取均由现有 cache 控制；重写插件没有自己的缓存。
+  - tag: target_cache
+    type: cache
+    args:
+      size: 1024                      # 容量（条目数），底层最少 1024；不是缓存秒数
+      scope: sequence
+      lazy_cache_ttl: 0                # 不返回过期目标；正响应按最小 TTL 缓存
+      prefetch: false                  # 到期后的下一次目标查询重新解析
+  - tag: target_resolve
+    type: sequence
+    args:
+      - exec: $target_cache
+      - matches: [has_resp]
+        exec: accept                  # 命中缓存后结束，避免 hosts/forward 覆盖
+      - exec: $target_hosts
+      - matches: [has_resp]
+        exec: ttl 30                  # 目标 TTL 30 秒，同时限制最终回退/替换 TTL
+      - matches: [has_resp]
+        exec: accept
+      - exec: reject 3
+
+  - tag: user_hosts
+    type: hosts
+    args:
+      entries:
+        - "fallback.dynamic-ip.invalid 192.0.2.1 2001:db8:1::1"
+        - "nodata.dynamic-ip.invalid 192.0.2.2"
+        - "replace.dynamic-ip.invalid 192.0.2.42 2001:db8:20::42"
+  - tag: dynamic_replace
+    type: ip_replace
+    args:
+      ip_source: target_resolve         # 标签不带 $
+      timeout: 500ms
+      replace_map:
+        - match_ip: ["192.0.2.0/24", "2001:db8:20::/48"]
+          ipv4_prefixlen: 24
+          ipv6_prefixlen: 64
+          ipv4: ["domain:cdn.dynamic-ip.invalid"]
+          ipv6: ["domain:cdn.dynamic-ip.invalid"]
+  - tag: user_source
+    type: sequence
+    args:
+      - exec: $user_hosts
+      - matches: ["qname full:replace.dynamic-ip.invalid"]
+        exec: $dynamic_replace        # 必须在来源发布给 speedcheck 前替换
+      - matches: [has_resp]
+        exec: accept
+      - exec: reject 3
+  - tag: select_local
+    type: speedcheck
+    args:
+      sources: [user_source]
+      mode: wait_all
+      total_timeout: 5s
+      probe:
+        tcp_ports: []                 # 文档地址禁止实际探测
+        icmp: false
+      max_num: 16
+  - tag: dynamic_fallback
+    type: ip_fallback
+    args:
+      ip_source: target_resolve
+      timeout: 500ms
+      ipv4: ["203.0.113.42", "domain:backup.dynamic-ip.invalid"]
+      ipv6: ["domain:backup.dynamic-ip.invalid"]
+      ttl: 60
+      # 禁测/未测量不等于全部探测失败，故显式使用 no_rtt。
+      on: [no_rtt, nodata]
+  - tag: main
+    type: sequence
+    args:
+      - exec: $select_local
+      - matches: ["!qname full:replace.dynamic-ip.invalid"]
+        exec: $dynamic_fallback
+      - exec: accept
+  - tag: udp_listener
+    type: udp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+  - tag: tcp_listener
+    type: tcp_server
+    args:
+      entry: main
+      listen: "127.0.0.1:15353"
+      idle_timeout: 10
+
+# nslookup -port=15353 -type=A fallback.dynamic-ip.invalid 127.0.0.1
+# nslookup -port=15353 -type=AAAA nodata.dynamic-ip.invalid 127.0.0.1
+# nslookup -port=15353 -type=A replace.dynamic-ip.invalid 127.0.0.1
+# A 回退/替换都返回 203.0.113.42、198.51.100.42；寿命不超过目标链 TTL 30。
+# AAAA 回退为 2001:db8:ffff::42；替换为 2001:db8:100::42。

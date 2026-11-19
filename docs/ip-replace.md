@@ -1,6 +1,6 @@
 # CDN 地址前缀替换 ip_replace
 
-`ip_replace` 根据响应中的 CDN 地址生成一组替代地址，支持按规则设置 IPv4、IPv6 的目标前缀长度。替换成功后只返回生成地址；不会保留原地址作为额外候选。插件只改写当前 DNS 响应，不发查询或探测。
+`ip_replace` 根据响应中的 CDN 地址生成一组替代地址，支持按规则设置 IPv4、IPv6 的目标前缀长度。替换成功后只返回生成地址；不会保留原地址作为额外候选。纯 IP 配置不发查询；配置 `domain:` 目标后，通过专用 `ip_source` 链解析目标地址。插件不发起探测。
 
 [完整本地演示](../examples/ip-replace.yaml) 使用 hosts 为保留域名生成原地址，再执行替换，无需公网 DNS、数据库或证书。它监听本机 UDP/TCP `15353`，API 监听 `19091`，不调用 speedcheck，不探测示例中的文档地址。在仓库根目录运行：
 
@@ -46,12 +46,16 @@ nslookup -port=15353 -type=AAAA cdn.ip-replace.invalid 127.0.0.1
 | `replace_map[].exclude_ip` | 默认空；逐 IP 排除，优先于该规则的 `match_ip`。排除一个 IP 不会拒绝整份响应或阻止其他 IP 匹配。 |
 | `replace_map[].ipv4_prefixlen` | 默认 `32`；整数 `0..32`，显式 `0` 有效。 |
 | `replace_map[].ipv6_prefixlen` | 默认 `128`；整数 `0..128`，显式 `0` 有效。 |
-| `replace_map[].ipv4` | 默认空；目标 IPv4 地址字符串列表，不带 CIDR；按配置顺序生成并去重。 |
-| `replace_map[].ipv6` | 默认空；目标 IPv6 地址字符串列表，不带 CIDR；按配置顺序生成并去重。 |
+| `replace_map[].ipv4` | 默认空；裸 IPv4 与 `domain:<域名>` 的混合列表，域名查询 A；不带 CIDR，按配置顺序展开去重。 |
+| `replace_map[].ipv6` | 默认空；裸 IPv6 与 `domain:<域名>` 的混合列表，域名查询 AAAA；不带 CIDR，按配置顺序展开去重。 |
+| `ip_source` | 插件级参数；配置 `domain:` 目标时必填，此前定义的 forward 或 sequence 标签，不带 `$`。 |
+| `timeout` | 插件级参数；默认 `500ms`，一次命中规则中全部目标解析共享的总预算，受父请求剩余时间限制。 |
 
 两种匹配列表复用现有 IP matcher，支持裸 IP、CIDR、`$ip_set_tag`、`&./rules/ips.txt`、`geoip:cn`、`asn:AS13335`、`ext:./data/Country.mmdb:CN`、`ext:./data/ASN.mmdb:AS13335`。数据库表达式需要对应文件，详情见[数据集合配置](configuration-reference.md)。不需要数据库时直接使用 CIDR/IPSet。每个列表元素是一条独立表达式，`&` 后的完整字符串作为文件路径，因此可将含空格的路径写在同一个 YAML 字符串内；相对路径从进程工作目录解析。
 
 规则在启动时加载；非法 prefix、无效 IP、目标地址族错误或加载匹配表达式失败都会使初始化报错。目标列表不接受 `203.0.113.0/24` 这样的 CIDR、带 zone 的 IPv6（如 `fe80::1%eth0`）或 IPv4-mapped IPv6（如 `::ffff:192.0.2.1`）；前缀长度由对应的 `prefixlen` 单独指定。
+
+目标列表还支持 `domain:<域名>` 与固定地址混用；规则命中后才查询当前地址族，解析得到的地址执行相同前缀映射。动态来源的地址/CNAME 寿命继续限制最终响应。目标全部失败时老化并保留原响应，首个命中规则仍结束处理。完整配置、来源隔离、超时和专用缓存链见[域名地址来源](dynamic-ip-targets.md)，无需公网的完整示例为 [dynamic-ip-targets.yaml](../examples/dynamic-ip-targets.yaml)。
 
 ## 选择顺序与地址计算
 
@@ -103,7 +107,7 @@ nslookup -port=15353 -type=AAAA cdn.ip-replace.invalid 127.0.0.1
 
 仅合法 IN/A、IN/AAAA 正响应适用；按照当前问题追踪唯一、无环且最多 16 跳的 CNAME 链，只使用终点的同类型、同类别 RRset。无关 Answer 和 Additional 地址不参与匹配或生成。无响应、NXDOMAIN/NODATA、截断及 DNAME、TSIG 等不适合重建的响应保持原样；非法响应返回错误，由外层 fallback 处理。
 
-替换使用独立响应快照，保留 CNAME 链和终点 owner。生成地址的 TTL 受原终点 RRset 与 CNAME 链剩余期限约束；重建会扣除已消耗时间，并在内部保留原非零 TTL 的绝对有效期限。剩余不足一秒时可以即时返回线上的 TTL=0；命中替换的来源在提交前已过期则返回错误，交外层 fallback，进入 speedcheck 后过期的候选会被丢弃。真正原生 TTL=0 不被改成长 TTL。内部期限没有 YAML 配置项，也不会覆盖父查询、marks 或插件 kv。
+替换使用独立响应快照，保留 CNAME 链和终点 owner。生成地址的 TTL 受原终点 RRset 与 CNAME 链剩余期限约束；动态目标进一步限制寿命。重建会扣除已消耗时间，并在内部保留原非零 TTL 的绝对有效期限。剩余不足一秒时可以即时返回线上的 TTL=0；纯 IP 配置的原响应在提交前已过期则返回错误，交外层 fallback；动态查询失败或期间过期时老化并保留原响应。进入 speedcheck 后过期的候选会被丢弃。真正原生 TTL=0 不被改成长 TTL。内部期限没有 YAML 配置项，也不会覆盖父查询、marks 或插件 kv。
 
 客户端或当前查询 DO=1 时跳过替换，保留完整来源响应。DO=0 的合成响应清除 AD/AA，删除失效签名和证明记录，并沿用响应组件的 EDNS 清理策略。插件不改变 ECS 查询视图，也不改写 HTTPS/SVCB 的 `ipv4hint`、`ipv6hint`；这些类型会保留原响应。
 

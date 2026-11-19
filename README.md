@@ -6,7 +6,7 @@
 
 docker 镜像: [docker hub](https://hub.docker.com/r/irinesistiana/mosdns)
 
-源码构建需要 Go 1.27.2 或更新版本，以 [go.mod](go.mod) 为准；参见[依赖更新与验证](docs/dependency-update.md)。
+源码构建需要 Go 1.27.3 或更新版本，以 [go.mod](go.mod) 为准；参见[依赖更新与验证](docs/dependency-update.md)。
 
 ## 配置与部署
 
@@ -16,6 +16,7 @@ docker 镜像: [docker hub](https://hub.docker.com/r/irinesistiana/mosdns)
 | 并行测速选址 | [speedcheck](docs/speedcheck.md) | [基础](examples/speedcheck.yaml) · [全参数](examples/speedcheck-full.yaml) |
 | CDN 地址前缀替换 | [ip_replace](docs/ip-replace.md) | [本地演示](examples/ip-replace.yaml) |
 | 测速失败静态回退 | [ip_fallback](docs/ip-fallback.md) | [本地演示](examples/ip-fallback.yaml) |
+| 回退/替换的域名目标与专用缓存 | [域名地址来源](docs/dynamic-ip-targets.md) | [本地演示](examples/dynamic-ip-targets.yaml) |
 | HTTPS/SVCB 处理 | [ECH、hint 与 ALPN](docs/https-record.md) | [离线演示](examples/https-record.yaml) |
 | Windows | [运行说明](docs/speedcheck-windows.md) | [UDP/TCP 示例](examples/speedcheck-windows.yaml) |
 | SmartDNS 部署迁移 | [配置、数据与行为差异](docs/smartdns-migration.md) | [普通](examples/smartdns/config.yaml) · [CERNET](examples/smartdns/config-cernet.yaml) |

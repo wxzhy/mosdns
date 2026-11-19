@@ -24,7 +24,7 @@ func TestDumpRestorePreservesOriginalTTL(t *testing.T) {
  dst := NewCache(&Args{}, Opts{})
  defer dst.Close()
  if _, err := dst.readDump(&b); err != nil { t.Fatal(err) }
- got, lazy := getRespFromCache(getMsgKey(q), dst.backend, false, 5)
+ got, _, lazy := getRespFromCache(getMsgKey(q), dst.backend, false, 5)
  if lazy || got == nil || len(got.Answer) != 1 || got.Answer[0].Header().Ttl < 55 {
   t.Fatalf("restored response must retain its TTL: %+v, lazy=%v", got, lazy)
  }
@@ -46,7 +46,8 @@ func TestLazyRefreshCannotRestoreFlushedEntry(t *testing.T) {
   return nil
  })
  chain := sequence.NewChainWalker([]*sequence.ChainNode{{E: executor}}, nil)
- c.doLazyUpdate(getMsgKey(q), query_context.NewContext(q.Copy()), chain)
+ stale, _, _ := c.backend.Get(k)
+ c.doLazyUpdate(false, getMsgKey(q), query_context.NewContext(q.Copy()), chain, stale)
  select { case <-started: case <-time.After(time.Second): t.Fatal("refresh did not start") }
  c.Flush()
  close(release)

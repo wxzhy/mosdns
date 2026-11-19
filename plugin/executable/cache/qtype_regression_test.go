@@ -81,7 +81,7 @@ func TestHighQtypeDumpRoundTrip(t *testing.T) {
 			}
 			for _, typ := range []uint16{dns.TypeA, dns.TypeCAA} {
 				q := new(dns.Msg).SetQuestion("types.example.", typ)
-				r, _ := getRespFromCache(scopedCacheKey(getMsgKey(q), scope), dst.backend, false, 5)
+				r, _, _ := getRespFromCache(scopedCacheKey(getMsgKey(q), scope), dst.backend, false, 5)
 				if r == nil || r.Question[0].Qtype != typ || r.Answer[0].Header().Rrtype != typ {
 					t.Fatalf("restored type %d: %v", typ, r)
 				}

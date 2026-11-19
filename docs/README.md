@@ -11,6 +11,8 @@
 | [服务安装](service.md) | Windows、systemd 与 OpenWrt 低权限部署 |
 | [IP 前缀替换](ip-replace.md) | CDN 替换顺序和前缀保留 |
 | [静态回退](ip-fallback.md) | 无地址、测速失败及未测量的处理 |
+| [回退/替换的域名地址来源](dynamic-ip-targets.md) | 动态目标、专用解析链、缓存与最终响应 TTL 的计算 |
+| [缓存行为](cache-behavior.md) | 缓存键、ECS 限制、lazy、预取与策略隔离 |
 | [HTTPS/SVCB 处理](https-record.md) | ECH、hint、ALPN 与辅助查询 |
 
 ## 迁移与开发

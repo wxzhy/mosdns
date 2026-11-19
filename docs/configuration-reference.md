@@ -284,7 +284,7 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
 | `dial_addr` | 空；覆盖实际拨号目标，可带端口，不改变 TLS SNI 或 HTTP Host。 |
 | `http_host` | 空；DoH 默认使用 URL 的 Host。非空单独覆盖 HTTP Host / HTTP2 `:authority`，不改变 URL、TLS SNI 或证书验证名称。 |
 | `http_method` | `GET`；DoH 可选 `GET` / `POST`，大小写不敏感。POST 使用 `application/dns-message` 请求体；GET 使用 `dns` 查询参数。 |
-| `idle_timeout` | 整数秒；TCP/DoT 默认 10，DoH/HTTP3/DoQ 默认 30；UDP transport 固定 300 秒。当前 DoT 非 pipeline 路径采用底层默认 10 秒，填写该值并不改变其复用超时。 |
+| `idle_timeout` | 整数秒；TCP/DoT 默认 10，DoH/HTTP3/DoQ 默认 30。明文 UDP 每次交换单独打开 socket，无连接空闲超时。当前 DoT 非 pipeline 路径采用底层默认 10 秒，填写该值并不改变其复用超时。 |
 | `max_conns` | 兼容旧配置但已弃用，**无效果**。 |
 | `enable_pipeline` | `false`；仅 TCP/DoT，要求上游支持同一连接并发，不做不兼容回退。 |
 | `enable_http3` | `false`；DoH 改用 HTTP/3，无自动回退。 |
@@ -381,8 +381,10 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
 | `replace_map[].exclude_ip` | 默认空；逐 IP 排除，优先于当前规则的 match。 |
 | `replace_map[].ipv4_prefixlen` | 默认 `32`，整数 `0..32`；显式 `0` 保留原地址全部位。 |
 | `replace_map[].ipv6_prefixlen` | 默认 `128`，整数 `0..128`；显式 `0` 保留原地址全部位。 |
-| `replace_map[].ipv4` | 默认空；不带 CIDR 的 IPv4 目标列表，按配置顺序生成并去重。 |
-| `replace_map[].ipv6` | 默认空；不带 CIDR 的 IPv6 目标列表，按配置顺序生成并去重。 |
+| `replace_map[].ipv4` | 默认空；裸 IPv4 与 `domain:<域名>` 的混合列表，域名查询 A；按配置顺序展开去重，不带 CIDR。 |
+| `replace_map[].ipv6` | 默认空；裸 IPv6 与 `domain:<域名>` 的混合列表，域名查询 AAAA；按配置顺序展开去重，不带 CIDR。 |
+| `ip_source` | 插件级，配置 `domain:` 目标时必填；此前定义的 forward 或 sequence 标签，不带 `$`。 |
+| `timeout` | 插件级，默认 `500ms`；命中规则后全部目标解析共享预算，受父请求剩余时间限制。 |
 
 ```yaml
 - tag: replace_cdn
@@ -401,13 +403,17 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
 
 在 speedcheck 的每个来源中，放在 forward 和必需过滤之后、来源 sequence 返回之前，保证测速的是替换地址。DO=1 跳过；重建保留 CNAME 和剩余 TTL，清理 AD/AA 及失效证明记录。HTTPS/SVCB hint 与 ECS 不改写。示例使用文档地址，不应对它们运行真实探测；实际使用需换成目标 CDN 网段。
 
+`ipv4`、`ipv6` 均可混合裸 IP 与 `domain:<域名>`；分别查询 A/AAAA，结果继续执行同一前缀映射。首个命中规则的动态目标全部失败时保留原响应并老化 TTL，不尝试后续规则。详见[共享目标解析与专用缓存链](dynamic-ip-targets.md)及[离线完整配置](../examples/dynamic-ip-targets.yaml)。
+
 ### ip_fallback：无地址或测速失败后的静态 IP
 
 此插件处理当前合法 A/AAAA 响应，与主次查询链的 `fallback` 分工不同。放在 speedcheck 之后、`accept` 之前，域名/CNAME 范围继续由 sequence 的 `matches` 控制。
 
 | `args` 字段 | 默认值与行为 |
 | --- | --- |
-| `ipv4`、`ipv6` | 默认空；对应地址族的静态地址列表，按配置顺序去重；不带 CIDR。 |
+| `ipv4`、`ipv6` | 默认空；对应地址族的裸 IP 与 `domain:<域名>` 列表，按配置顺序展开去重；不带 CIDR。 |
+| `ip_source` | 有域名条目时必填；此前定义的 forward 或 sequence 标签，不带 `$`。 |
+| `timeout` | 默认 `500ms`；回退触发后全部目标解析共享预算，受父请求剩余时间限制。 |
 | `ttl` | 默认 `86400` 整数秒；允许 `0..4294967295`，显式 `0` 有效。 |
 | `on` | 默认 `[all_probes_failed, nodata]`；显式 `[]` 关闭。`all_probes_failed` 要求全部合格地址真实探测失败；`nodata` 为 NOERROR 无终点地址；可选 `no_rtt` 还包含已执行选择但未测量、禁测或尚未完成的情况。 |
 
@@ -426,6 +432,8 @@ IP 类 matcher 接受裸 IP、CIDR、`geoip:`、`asn:`、`ext:`，以及 `$ip_se
 ```
 
 默认不把缺少测速统计或关闭测速判为失败；若明确希望禁测时也静态回退，配置 `no_rtt`。已有成功 RTT（包括 0）不触发。无响应、NXDOMAIN/SERVFAIL、截断、opaque 或 DO=1 保留，不做静态伪造。重建只输出配置地址及必要 CNAME；静态 TTL 可重设地址期限，有链时保守受其既存有效期限约束。完整说明与无公网演示见 [ip_fallback](ip-fallback.md)。
+
+域名目标在触发回退后才解析，动态来源的地址/CNAME 剩余寿命进一步限制输出 TTL 与绝对期限。两插件共用顺序合并、最多 8 个并发查询和递归保护；不增加内部缓存，缓存、预取和 lazy 由用户配置的目标解析链控制。目标全部失败则保留并老化原响应，父请求取消向上传播。完整行为与配置见[域名地址来源](dynamic-ip-targets.md)。
 
 ### https_record：HTTPS/SVCB 的 ECH、hint 与 ALPN
 
@@ -523,8 +531,13 @@ hint/ALPN 清理先执行；名称/IP 条件只控制 ECH 注入和辅助查询�
 
 | 全部 `args` 字段 | 默认值与单位 |
 | --- | --- |
-| `size` | 默认 1024 项；小于等于 0 回到默认。底层固定 64 个分片，每片容量为 `floor(size/64)`，实际总容量向下取整到 64 的倍数。建议使用至少 1024 且为 64 倍数的值；1–63 会产生零容量阈值，当前实现反而不限制分片容量。 |
+| `size` | 默认 1024 项；底层将小于 1024 的配置统一提升至 1024。固定 64 个分片，每片容量为 `floor(size/64)`，更大的配置向下取整到 64 的倍数。建议使用至少 1024 且为 64 倍数的值。 |
+| `scope` | 默认 `shared`；可选 `sequence`，以调用 sequence 及继续执行位置隔离缓存。两者都不按客户端 IP 分区。 |
 | `lazy_cache_ttl` | 默认 0，关闭过期缓存；正整数秒是从写入起的总缓存保留时间，不是在原 DNS TTL 到期后再额外增加该时长。小于正常 TTL 时会提前淘汰；保留期内的过期命中暂以 TTL=5 秒返回并后台更新。 |
+| `prefetch` | 默认 `false`；启用后主动刷新满足命中次数和剩余寿命条件的条目。 |
+| `prefetch_before_expire` | 默认 10，整数秒；仅在剩余寿命大于 0 且小于该值时触发预取。 |
+| `prefetch_min_hits` | 默认 3；条目至少累计该次数缓存命中才可预取。 |
+| `prefetch_scan_interval` | 默认 5，整数秒；扫描可预取条目的间隔。 |
 | `dump_file` | 空表示不落盘；非空时启动加载并定期导出。 |
 | `dump_interval` | 默认 600，整数秒；周期写出还要求自上次写出至少 1024 次键更新。 |
 
@@ -547,7 +560,11 @@ hint/ALPN 清理先执行；名称/IP 条件只控制 ECH 注入和辅助查询�
 # 快速、独立匿名实例：exec: cache 4096；不支持完整配置/命名指标/API。
 ```
 
-API：`GET /plugins/response_cache/flush` 清空、`GET /plugins/response_cache/dump` 下载、`POST /plugins/response_cache/load_dump` 导入。缓存键不是所有可能查询视图的完整隔离机制；不同 ECS/策略视图应使用独立缓存实例或独立链。speedcheck 首版示例不包最终响应缓存，确保每次进入选择器都重新评估。
+缓存 API 使用 `POST /plugins/response_cache/flush` 清空、`GET /plugins/response_cache/dump` 下载以及 `POST /plugins/response_cache/load_dump` 导入。不同 ECS 或策略视图可以使用独立缓存实例或独立链。
+
+正常正响应的缓存寿命是 Answer、Authority、Additional 中除 OPT 外的最小 TTL；命中时各记录扣除写入以来经过的整秒。TTL=0 的正响应不写入缓存。NXDOMAIN/NODATA 使用查询终点所属区域的 `min(SOA TTL, SOA.MINIMUM)`，有 CNAME 链时还受各别名记录的 TTL 约束。当前 SERVFAIL 缓存 5 秒。含 ECS 等非 Padding EDNS 选项的查询直接绕过共享缓存，当前不支持按 ECS 子网分区缓存。
+
+`ip_fallback`、`ip_replace` 不维护内部 IP 缓存；`ip_source` 链中的 cache 保存目标域名及 A/AAAA 查询，最终合成响应再受目标地址、目标 CNAME 和原响应适用寿命的限制。`timeout: 500ms` 是查询预算，`size` 是容量，均不是缓存时长。公式、混合目标示例与 lazy/预取边界见[域名地址来源的缓存计算](dynamic-ip-targets.md#缓存键与有效期计算)，一般缓存隔离规则见[缓存行为](cache-behavior.md)。
 
 ## fallback：主备执行链
 
@@ -815,7 +832,7 @@ IPv6 用 `[::1]:15353`；对外服务可填实际本机地址。没有 TLS、buf
 
 ### quic_server：DoQ
 
-全部参数：`entry`、`listen`、`cert`、`key`、`idle_timeout`（整数秒；建议显式 30）。证书和密钥必填；使用 UDP socket 和 ALPN `doq`。不提供 HTTP/3 服务，0-RTT 未启用，无可配置开关。
+参数为 `entry`、`listen`、`cert`、`key` 和 `idle_timeout`。证书和密钥必填，监听使用 UDP 与 ALPN `doq`。`idle_timeout` 默认为 30 秒，从最后一条查询流结束时开始计算。连接建立后等待第一条流的时限为 2 秒。QUIC 本端的网络空闲超时至少为 30 秒，实际协商值也受对端限制。
 
 ```yaml
 - tag: dns_quic
